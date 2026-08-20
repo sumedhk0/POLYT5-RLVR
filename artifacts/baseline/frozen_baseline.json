@@ -1,0 +1,100 @@
+{
+  "frozen_utc": "2026-08-20T23:02:41.879198+00:00",
+  "purpose": "Immutable supervised baseline. Every Phase-3 (GRPO/RLVR) result is reported against this record. Nothing here may be retrained or overwritten.",
+  "artifacts": {
+    "pretrain_medium_92m": {
+      "path": "results\\pretrain_medium_polyone_92m\\checkpoints\\best.pt",
+      "bytes": 89687923,
+      "sha256": "9e328372792c797d3ad334465632649318e10f000202cf9450310969a24ea139"
+    },
+    "generation": {
+      "path": "results\\finetune_tg_generation_medium92m\\checkpoints\\best.pt",
+      "bytes": 89687347,
+      "sha256": "d4d7fd34c738dd727455c6ac1c41514487e8f7192e438e0b71c53210318527a9"
+    },
+    "tokenizer": {
+      "path": "artifacts\\tokenizer\\polyt5_vocab.json",
+      "bytes": 11875,
+      "sha256": "489835730dd7da1dd95db5153d2e8686d9d17e6196c90fe2fdce0f3cb07af1be"
+    },
+    "tg_predictor_split0": {
+      "path": "results\\tg_prediction_5splits_medium92m\\split_0\\checkpoints\\best.pt",
+      "bytes": 89687347,
+      "sha256": "a5c4c028780e22c5029ffc173ab227ca2eb21fbc4fe3c1ac00de6efd7764fde6"
+    },
+    "tg_predictor_split1": {
+      "path": "results\\tg_prediction_5splits_medium92m\\split_1\\checkpoints\\best.pt",
+      "bytes": 89687411,
+      "sha256": "434348ecc02b43872f0d38cc53e54c702ded69f5246bf219a121c623aacdfd8b"
+    },
+    "tg_predictor_split2": {
+      "path": "results\\tg_prediction_5splits_medium92m\\split_2\\checkpoints\\best.pt",
+      "bytes": 89687411,
+      "sha256": "d23fd91e2ccb294dd2f03b629e33754449b718233f435acf9bc679901d04445e"
+    },
+    "tg_predictor_split3": {
+      "path": "results\\tg_prediction_5splits_medium92m\\split_3\\checkpoints\\best.pt",
+      "bytes": 89687411,
+      "sha256": "9872629a5d9eee391e21f940f390525400ca9f5f708e3de729cae0df67267716"
+    },
+    "tg_predictor_split4": {
+      "path": "results\\tg_prediction_5splits_medium92m\\split_4\\checkpoints\\best.pt",
+      "bytes": 89687411,
+      "sha256": "61ce2facd71f1f29a070a9b9c45d36cd99a64c17836991d32ad221c901cf42ee"
+    }
+  },
+  "reward_ensemble": [
+    "tg_predictor_split0",
+    "tg_predictor_split1",
+    "tg_predictor_split2",
+    "tg_predictor_split3"
+  ],
+  "auditor": "tg_predictor_split4",
+  "auditor_note": "Never used in any reward. Scores final candidates only, so that a reported improvement cannot be an artifact of the reward model itself.",
+  "tg_prediction_5split": {
+    "mae": {
+      "mean": 28.6733,
+      "std": 0.7591,
+      "n": 5
+    },
+    "rmse": {
+      "mean": 44.4485,
+      "std": 2.5199,
+      "n": 5
+    },
+    "r2": {
+      "mean": 0.8451,
+      "std": 0.0178,
+      "n": 5
+    },
+    "pearson_r": {
+      "mean": 0.9235,
+      "std": 0.0083,
+      "n": 5
+    }
+  },
+  "arm_a_default_sampling": {
+    "temperature": 1.1,
+    "top_p": 0.75,
+    "property_mae": 50.921,
+    "pv_rate": 0.562,
+    "tp_rate": 0.5801
+  },
+  "arm_b_tuned_sampling": {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "property_mae": 47.316,
+    "pv_rate": 0.558,
+    "tp_rate": 0.5878
+  },
+  "evaluation_protocol": {
+    "targets_k": [
+      300,
+      400,
+      500
+    ],
+    "n_per_target": 500,
+    "note": "Phase-3 arms must be evaluated identically."
+  },
+  "success_criterion": "An RLVR arm succeeds only if it beats arm_b on the metric it optimized AND the gain survives scoring by the auditor."
+}
