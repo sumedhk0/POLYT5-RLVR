@@ -1,0 +1,69 @@
+# polyT5-small span-corruption pretraining on the PI1M proxy corpus.
+#
+# PROVENANCE OF EVERY VALUE:
+#   [PAPER]  stated in Sahu et al., npj Artificial Intelligence 2, 30 (2026)
+#   [OURS]   not stated by the paper — see docs/ambiguity_register.md
+#   [PROXY]  a substitute for something the authors withheld — see docs/data.md
+#
+# The paper pretrained on 100,145,883 polymers with batch size 450 on a single
+# NVIDIA L40S (48 GB). That corpus is not public ("not publicly available due to
+# IP protection"), and this machine has an RTX 4080 Laptop with 12 GB. So the
+# corpus is substituted and the batch size is reached by gradient accumulation
+# rather than assumed to fit.
+
+experiment_name: pretrain_polyt5_small_pi1m
+seed: 0                                        # [OURS] the paper reports no seeds
+
+data_mode: proxy                               # [PROXY] exact/proxy/dev — see docs/data.md
+
+data:
+  source: pi1m
+  csv_path: data/external/PI1M_v2.csv          # [PROXY] 995,799 polymers, MIT licensed
+  output_dir: data/processed/pi1m              # read back by scripts/pretrain.py
+  processed_dir: data/processed/pi1m
+  limit: null                                  # null = use the whole corpus
+  max_length: 200                              # [PAPER] covers 99.91% of their corpus (Fig. S1)
+  deduplicate: true                            # [OURS] the paper does not describe dedup
+
+splits:
+  train: 0.90                                  # [PAPER] 90% training
+  val: 0.05                                    # [OURS] the paper only says the remaining 10%
+  test: 0.05                                   #        is "validation and testing"
+
+tokenizer:
+  path: artifacts/tokenizer/polyt5_vocab.json  # [PROXY] structure is the paper's, contents are ours
+
+model:
+  config: configs/model/polyt5_small.yaml      # [PAPER] Table S2: d_model 128, 3+3 layers, 1.44M params
+
+span_corruption:                               # [PAPER] every value below is stated in the paper
+  max_spans: 8
+  max_span_length: 3
+  corruption_rate: 0.15
+  min_gap: 1                                   # "at least one unmasked token between them"
+  add_final_sentinel: true                     # trailing sentinel, per Figure 2C
+  mask_eos: false                              # [OURS] the paper does not say whether EOS is maskable
+
+train:
+  max_epochs: 2                                # [PAPER] contradictory: SI says "up to 5", but the main
+                                               #         text and Fig. S2 show 2. See register E-02.
+  physical_batch_size: 18                      # [OURS] chosen for 12 GB; tune to your VRAM
+  gradient_accumulation_steps: 25              # [OURS] 18 x 25 = 450
+  target_effective_batch_size: 450             # [PAPER] asserted, never hard-coded in Python
+  learning_rate: 0.001                         # [OURS] the paper never states a pretraining LR;
+                                               #        1e-3 is the original T5 pretraining value
+  weight_decay: 0.0                            # [OURS] not stated for pretraining
+  scheduler: inverse_sqrt                      # [OURS] not stated; T5's own pretraining schedule
+  warmup_steps: 2000                           # [OURS] not stated
+  max_grad_norm: 1.0                           # [OURS] not stated
+  amp: true                                    # [OURS] not stated; needed for 12 GB
+  amp_dtype: bf16                              # [OURS] Ada supports bf16, no loss scaling needed
+  num_workers: 4
+  log_every: 50
+  eval_every_epochs: 1
+  save_every_epochs: 1                         # [PAPER] "checkpoints saved after each epoch"
+  keep_last_checkpoints: 3
+  device: auto
+
+output:
+  results_root: results

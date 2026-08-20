@@ -1,0 +1,31 @@
+# polyT5-large — architecture values from Table S2 of Sahu et al.
+# (npj Artificial Intelligence 2026). Paper-reported total: 58.98M parameters.
+#
+# Paper-specified (Table S2): d_model, num_layers (encoder AND decoder),
+#   d_ff, num_heads, d_kv, n_positions.
+# NOT stated in the paper (our defaults, matching HuggingFace T5Config):
+#   vocab_size (tokenizer track supplies the real value),
+#   relative_attention_num_buckets / _max_distance (NB: with n_positions=200
+#   and max_distance=128, distances beyond 128 saturate into the final
+#   bucket — the paper does not address this), dropout_rate,
+#   layer_norm_epsilon, initializer_factor, feed_forward_proj (relu = T5
+#   v1.0; reproduces the Table S2 counts), tie_word_embeddings,
+#   pad/eos/decoder_start token ids.
+vocab_size: 458
+d_model: 512
+d_kv: 64
+num_heads: 8
+d_ff: 2048
+num_layers: 8
+num_decoder_layers: null
+n_positions: 200
+relative_attention_num_buckets: 32
+relative_attention_max_distance: 128
+dropout_rate: 0.1
+layer_norm_epsilon: 1.0e-6
+initializer_factor: 1.0
+feed_forward_proj: relu
+tie_word_embeddings: true
+pad_token_id: 0
+eos_token_id: 1
+decoder_start_token_id: 0

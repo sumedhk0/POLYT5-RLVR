@@ -1,0 +1,103 @@
+# polyT5-medium span-corruption pretraining on the polyOne corpus.
+#
+# PROVENANCE OF EVERY VALUE:
+#   [PAPER]  stated in Sahu et al., npj Artificial Intelligence 2, 30 (2026)
+#   [OURS]   not stated by the paper — see docs/ambiguity_register.md
+#   [PROXY]  a substitute for something the authors withheld — see docs/data.md
+#
+# The paper pretrained on 100,145,883 polymers with an effective batch size of
+# 450 on one NVIDIA L40S (48 GB). That corpus is "not publicly available due to
+# IP protection". polyOne (Zenodo 7766806, ~100M hypothetical polymers from the
+# same polyBERT generator) is the closest public stand-in, which is why this
+# config is [PROXY] at the corpus level even though the polymer count matches.
+# GTRC non-commercial academic licence — do not use commercially.
+#
+# CORPUS BACKEND. This config uses `data.corpus_prefix`, the pre-tokenized
+# memory-mapped corpus built by scripts/prepare_large_corpus.py, NOT the
+# text `data.processed_dir` path. That is not an optimisation detail:
+#   * measured 6,334 rows/s single-threaded for PSMILES -> PSELFIES; 100M rows
+#     is 4.4 h on one core, and the parallel builder is the only way through it;
+#   * 100M PSELFIES strings do not fit in RAM, and PSelfiesCorpus holds them
+#     all plus re-tokenizes on every __getitem__ (measured: epoch 0 5,215 s vs
+#     epoch 1 270 s in the polyT5-small run — a 19x per-item Python tax).
+# The corpus files live OUTSIDE the repo on purpose: the repo is in a
+# OneDrive-synced folder and multi-GB derived artifacts would thrash the sync.
+#
+# BEFORE RUNNING, build the corpus:
+#   python scripts/prepare_large_corpus.py \
+#     --input  C:/Users/sumedh/polyt5-data/external/generated_polymer_smiles_train.txt \
+#     --input  C:/Users/sumedh/polyt5-data/external/generated_polymer_smiles_dev.txt \
+#     --output-prefix C:/Users/sumedh/polyt5-data/processed/polyone/corpus \
+#     --tokenizer artifacts/tokenizer/polyt5_vocab.json --workers 18
+
+experiment_name: pretrain_polyt5_medium_polyone
+seed: 0                                        # [OURS] the paper reports no seeds
+
+data_mode: proxy                               # [PROXY] exact/proxy/dev — see docs/data.md
+
+data:
+  source: polyone
+  # [OURS] Points at the ~20M-polymer polyOne DEV corpus, which is built and
+  # verified. Switch to the combined ~100M corpus below once the 8.14 GB train
+  # file has been downloaded and prepared — nothing else in this file changes.
+  corpus_prefix: C:/Users/sumedh/polyt5-data/processed/polyone_dev/corpus
+  # corpus_prefix: C:/Users/sumedh/polyt5-data/processed/polyone/corpus
+  splits_path: null                            # null = <corpus dir>/splits.json
+  max_length: 200                              # [PAPER] covers 99.91% of their corpus (Fig. S1)
+  deduplicate: true                            # [OURS] the paper does not describe dedup;
+                                               #        the builder ran with --dedup exact
+
+splits:                                        # recorded for provenance; the actual index
+  train: 0.90                                  # arrays come from the corpus's splits.json,
+  val: 0.05                                    # written at build time with this same seed.
+  test: 0.05                                   # [PAPER] 90% train; the 5/5 sub-split is [OURS]
+
+tokenizer:
+  path: artifacts/tokenizer/polyt5_vocab.json  # [PROXY] structure is the paper's, contents are ours
+                                               # Its sha256 is checked against the corpus at startup
+                                               # and a mismatch aborts the run.
+
+model:
+  config: configs/model/polyt5_medium.yaml     # [PAPER] Table S2: d_model 256, 4+4 layers, 7.46M params
+
+span_corruption:                               # [PAPER] every value below is stated in the paper
+  max_spans: 8
+  max_span_length: 3
+  corruption_rate: 0.15
+  min_gap: 1                                   # "at least one unmasked token between them"
+  add_final_sentinel: true                     # trailing sentinel, per Figure 2C
+  mask_eos: false                              # [OURS] the paper does not say whether EOS is maskable
+
+train:
+  max_epochs: 2                                # [PAPER] contradictory: the SI says "up to 5", but the
+                                               #         main text and Fig. S2 show 2. See register E-02.
+  # [OURS] Batch factorisation. Only the PRODUCT is the paper's. Measured
+  # reference point: polyT5-small (1.44M params) ran physical 90 x accum 5 at a
+  # 1.0 GB peak on this 12 GB card. Medium doubles d_model (128->256) and adds a
+  # layer per stack (3->4), so activations cost roughly 2.7x per sample; polyOne
+  # sequences are also longer than PI1M's (mean ~84 tokens, budget 200), and
+  # attention memory grows with the padded width squared. 45 x 10 keeps the
+  # estimated peak near 4 GB with headroom for the display. TUNE THIS: raise
+  # physical_batch_size and lower gradient_accumulation_steps together on a
+  # bigger card — 90 x 5, 150 x 3 and 450 x 1 are all the same experiment.
+  physical_batch_size: 45
+  gradient_accumulation_steps: 10
+  target_effective_batch_size: 450             # [PAPER] asserted by TrainerConfig, never assumed
+  learning_rate: 0.001                         # [OURS] the paper never states a pretraining LR;
+                                               #        1e-3 is the original T5 pretraining value
+  weight_decay: 0.0                            # [OURS] not stated for pretraining
+  scheduler: inverse_sqrt                      # [OURS] not stated; T5's own pretraining schedule
+  warmup_steps: 2000                           # [OURS] not stated
+  max_grad_norm: 1.0                           # [OURS] not stated
+  amp: true                                    # [OURS] not stated; needed for 12 GB
+  amp_dtype: bf16                              # [OURS] Ada supports bf16, no loss scaling needed
+  num_workers: 6                               # [OURS] the memmap corpus makes workers nearly free:
+                                               #        they mmap the same file instead of copying it
+  log_every: 100
+  eval_every_epochs: 1
+  save_every_epochs: 1                         # [PAPER] "checkpoints saved after each epoch"
+  keep_last_checkpoints: 3
+  device: auto
+
+output:
+  results_root: results

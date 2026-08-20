@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>polyT5 local demo</title>
+<style>
+/* ------------------------------------------------------------------
+   Design tokens. Light is the base; the dark block below redefines only
+   the colours, so nothing is ever defined solely inside a media query.
+   No web fonts, no external stylesheets: the page must work offline.
+   ------------------------------------------------------------------ */
+:root {
+  --bg: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-sunken: #eef0f4;
+  --bg-structure: #ffffff;
+  --fg: #16191d;
+  --fg-muted: #5c6570;
+  --border: #d8dce3;
+  --accent: #1f5fa9;
+  --accent-fg: #ffffff;
+  --pass: #1c7a45;
+  --pass-bg: #e2f4ea;
+  --fail: #a03225;
+  --fail-bg: #fbe7e4;
+  --skip-bg: #e9ebef;
+  --skip-fg: #6b7280;
+  --shadow: 0 1px 2px rgba(16, 20, 26, 0.08), 0 4px 12px rgba(16, 20, 26, 0.05);
+  --radius: 10px;
+  --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", "Consolas", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b;
+    --bg-panel: #1c2026;
+    --bg-sunken: #23282f;
+    --bg-structure: #f2f4f7;
+    --fg: #e7eaee;
+    --fg-muted: #9aa3ad;
+    --border: #333a43;
+    --accent: #5a9bea;
+    --accent-fg: #0d1116;
+    --pass: #63d69a;
+    --pass-bg: #16311f;
+    --fail: #f08a7c;
+    --fail-bg: #3a1d19;
+    --skip-bg: #2a2f36;
+    --skip-fg: #8a929c;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.35);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+header {
+  padding: 18px 24px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+header h1 { margin: 0; font-size: 18px; letter-spacing: -0.01em; }
+header p { margin: 4px 0 0; color: var(--fg-muted); font-size: 13px; max-width: 76ch; }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(320px, 30rem) 1fr;
+  gap: 18px;
+  padding: 18px 24px 8px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel > h2 {
+  margin: 0;
+  padding: 12px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---- chat column ---- */
+#log {
+  height: 46vh;
+  min-height: 260px;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.msg {
+  padding: 9px 12px;
+  border-radius: 9px;
+  max-width: 92%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-fg); }
+.msg.bot { align-self: flex-start; background: var(--bg-sunken); }
+.msg.err { align-self: flex-start; background: var(--fail-bg); color: var(--fail); }
+.msg .tag {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.72;
+  margin-bottom: 3px;
+}
+
+form.composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
+form.composer input[type="text"] { flex: 1; }
+
+input, button, select {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+}
+input:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+button {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: transparent;
+  cursor: pointer;
+  font-weight: 600;
+}
+button:disabled { opacity: 0.55; cursor: progress; }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  padding: 12px 16px;
+  align-items: flex-end;
+  border-top: 1px solid var(--border);
+  background: var(--bg-sunken);
+}
+.field { display: flex; flex-direction: column; gap: 3px; }
+.field label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); }
+.field input { width: 6.5rem; }
+.hint { font-size: 12px; color: var(--fg-muted); padding: 0 16px 12px; margin: 0; }
+
+/* ---- results ---- */
+#summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.stat {
+  background: var(--bg-sunken);
+  border-radius: 7px;
+  padding: 6px 10px;
+  min-width: 5.5rem;
+}
+.stat .k { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); }
+.stat .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+#cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 14px;
+  padding: 14px 16px 18px;
+}
+.card {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+}
+.card .draw {
+  background: var(--bg-structure);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 150px;
+  padding: 4px;
+}
+.card .draw svg { width: 100%; height: auto; max-height: 190px; display: block; }
+.card .draw .none { color: #6b7280; font-size: 12px; padding: 24px 8px; text-align: center; }
+.card .body { padding: 9px 11px; display: flex; flex-direction: column; gap: 7px; }
+.card code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--bg-sunken);
+  border-radius: 5px;
+  padding: 4px 6px;
+  display: block;
+  max-height: 5.4em;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--skip-bg);
+  color: var(--skip-fg);
+}
+.badge.ok { background: var(--pass-bg); color: var(--pass); }
+.badge.no { background: var(--fail-bg); color: var(--fail); }
+.meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--fg-muted); }
+.meta b { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+footer {
+  margin: 8px 24px 24px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+footer h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 6px; }
+footer dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; }
+footer dt { font-weight: 600; color: var(--fg); }
+footer dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.warn { color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>polyT5 &mdash; local reproduction console</h1>
+  <p>Drives the two fine-tuned checkpoints in this repository: target Tg &rarr; polymer
+     (sampling) and polymer &rarr; Tg (beam search, width 4). Generated candidates are screened
+     through the paper's nested SV &rarr; TSD &rarr; DD &rarr; PV cascade, scored for synthetic
+     accessibility, and predicted back with the property model. Everything runs locally; the page
+     makes no outside requests. Temperatures are Kelvin unless you write a unit.</p>
+</header>
+
+<main>
+  <section class="panel" aria-labelledby="chat-heading">
+    <h2 id="chat-heading">Conversation</h2>
+    <div id="log" role="log" aria-live="polite"></div>
+    <form class="composer" id="chat-form">
+      <input type="text" id="chat-input" autocomplete="off" spellcheck="false"
+             placeholder="generate 20 polymers with Tg near 450 K" aria-label="Message">
+      <button type="submit" id="chat-send">Send</button>
+    </form>
+    <div class="controls">
+      <div class="field">
+        <label for="target">Target Tg (K)</label>
+        <input type="number" id="target" value="450" min="1" max="2000" step="1">
+      </div>
+      <div class="field">
+        <label for="count">Candidates</label>
+        <input type="number" id="count" value="20" min="1" step="1">
+      </div>
+      <div class="field">
+        <label for="temperature">Temperature</label>
+        <input type="number" id="temperature" value="1.1" min="0.1" max="5" step="0.1">
+      </div>
+      <div class="field">
+        <label for="topp">top_p</label>
+        <input type="number" id="topp" value="0.75" min="0.05" max="1" step="0.05">
+      </div>
+      <div class="field">
+        <label for="seed">Seed (optional)</label>
+        <input type="number" id="seed" min="0" step="1" placeholder="none">
+      </div>
+      <button type="button" id="run">Generate</button>
+    </div>
+    <p class="hint" id="hint">Defaults are the paper's best medium setting: temperature 1.1, top_p 0.75.</p>
+  </section>
+
+  <section class="panel" aria-labelledby="results-heading">
+    <h2 id="results-heading">Candidates</h2>
+    <div id="summary"></div>
+    <div id="cards"></div>
+  </section>
+</main>
+
+<footer>
+  <h2>Provenance</h2>
+  <dl id="provenance">
+    <dt>Tokenizer sha256</dt><dd id="p-sha">&mdash;</dd>
+    <dt>Generation checkpoint</dt><dd id="p-gen">&mdash;</dd>
+    <dt>Prediction checkpoint</dt><dd id="p-pred">&mdash;</dd>
+    <dt>Training corpus (TSD)</dt><dd id="p-corpus">&mdash;</dd>
+    <dt>Device</dt><dd id="p-device">&mdash;</dd>
+    <dt>Structure drawing</dt><dd id="p-render">&mdash;</dd>
+  </dl>
+</footer>
+
+<script>
+"use strict";
+
+var chatHistory = [];
+var lastTarget = null;
+
+function el(tag, cls, text) {
+  var node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined && text !== null) { node.textContent = String(text); }
+  return node;
+}
+
+function say(role, text, isError) {
+  var log = document.getElementById("log");
+  var node = el("div", "msg " + (isError ? "err" : role));
+  node.appendChild(el("span", "tag", isError ? "error" : (role === "user" ? "you" : "polyT5")));
+  node.appendChild(document.createTextNode(text));
+  log.appendChild(node);
+  log.scrollTop = log.scrollHeight;
+}
+
+function num(value, digits) {
+  if (value === null || value === undefined || isNaN(value)) { return "—"; }
+  return Number(value).toFixed(digits === undefined ? 1 : digits);
+}
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(function (response) {
+    return response.json().catch(function () { return {}; }).then(function (payload) {
+      if (!response.ok) {
+        throw new Error(payload.error || ("request failed with status " + response.status));
+      }
+      return payload;
+    });
+  });
+}
+
+function badge(label, state) {
+  // state: true = passed, false = failed here, null = never reached (nested cascade)
+  var cls = state === true ? "badge ok" : (state === false ? "badge no" : "badge");
+  return el("span", cls, label);
+}
+
+function renderCandidate(candidate, target) {
+  var card = el("div", "card");
+
+  var draw = el("div", "draw");
+  if (candidate.svg) {
+    draw.innerHTML = candidate.svg;
+  } else {
+    draw.appendChild(el("div", "none", candidate.passed_sv ? "no drawing" : "not a valid structure"));
+  }
+  card.appendChild(draw);
+
+  var body = el("div", "body");
+  body.appendChild(el("code", null, candidate.canonical_psmiles || candidate.psmiles || candidate.pselfies));
+
+  var stages = ["sv", "tsd", "dd", "pv"];
+  var flags = [candidate.passed_sv, candidate.passed_tsd, candidate.passed_dd, candidate.passed_pv];
+  var badges = el("div", "badges");
+  var failed = false;
+  for (var i = 0; i < stages.length; i++) {
+    var state;
+    if (flags[i]) { state = true; }
+    else if (failed) { state = null; }
+    else { state = false; failed = true; }
+    badges.appendChild(badge(stages[i].toUpperCase(), state));
+  }
+  body.appendChild(badges);
+
+  var meta = el("div", "meta");
+  var sa = el("span", null, "SA ");
+  sa.appendChild(el("b", null, num(candidate.sa_score, 2)));
+  meta.appendChild(sa);
+
+  var tg = el("span", null, "Tg ");
+  tg.appendChild(el("b", null, candidate.predicted_tg === null ? "—" : num(candidate.predicted_tg, 0) + " K"));
+  meta.appendChild(tg);
+
+  if (candidate.tg_error !== null && candidate.tg_error !== undefined) {
+    var delta = el("span", null, "Δ vs " + num(target, 0) + " K ");
+    delta.appendChild(el("b", null, (candidate.tg_error >= 0 ? "+" : "") + num(candidate.tg_error, 0) + " K"));
+    meta.appendChild(delta);
+  }
+  body.appendChild(meta);
+  card.appendChild(body);
+  return card;
+}
+
+function stat(key, value) {
+  var node = el("div", "stat");
+  node.appendChild(el("span", "k", key));
+  node.appendChild(el("span", "v", value));
+  return node;
+}
+
+function renderGeneration(data) {
+  var summary = document.getElementById("summary");
+  var cards = document.getElementById("cards");
+  summary.textContent = "";
+  cards.textContent = "";
+
+  var agg = data.aggregate || {};
+  var counts = agg.counts || {};
+  var rates = agg.rates || {};
+  summary.appendChild(stat("target", num(data.target_tg, 0) + " K"));
+  summary.appendChild(stat("sampled", counts.n_input));
+  summary.appendChild(stat("SV", counts.n_sv + " (" + num(rates.sv_rate * 100, 0) + "%)"));
+  summary.appendChild(stat("TSD", counts.n_tsd + " (" + num(rates.tsd_rate * 100, 0) + "%)"));
+  summary.appendChild(stat("DD", counts.n_dd + " (" + num(rates.dd_rate * 100, 0) + "%)"));
+  summary.appendChild(stat("PV", counts.n_pv + " (" + num(rates.pv_rate * 100, 0) + "%)"));
+  summary.appendChild(stat("SR", num(agg.sr_rate * 100, 0) + "%"));
+  summary.appendChild(stat("SA mean", num(agg.sa_mean, 2)));
+  summary.appendChild(stat("mean Tg", agg.mean_predicted_tg === null ? "—" : num(agg.mean_predicted_tg, 0) + " K"));
+  summary.appendChild(stat("TP ±" + num(agg.tp_tolerance, 0) + " K",
+                           agg.tp_rate === null ? "—" : num(agg.tp_rate * 100, 0) + "%"));
+
+  var list = (data.candidates || []).slice().sort(function (a, b) {
+    if (a.passed_pv !== b.passed_pv) { return a.passed_pv ? -1 : 1; }
+    return a.index - b.index;
+  });
+  for (var i = 0; i < list.length; i++) {
+    cards.appendChild(renderCandidate(list[i], data.target_tg));
+  }
+}
+
+function renderPrediction(data) {
+  var summary = document.getElementById("summary");
+  var cards = document.getElementById("cards");
+  summary.textContent = "";
+  cards.textContent = "";
+  summary.appendChild(stat("predicted Tg", data.predicted_tg === null ? "—" : num(data.predicted_tg, 1) + " K"));
+  summary.appendChild(stat("termini", data.n_termini));
+  summary.appendChild(stat("PV", data.passes_pv ? "pass" : "fail"));
+  summary.appendChild(stat("SA", num(data.sa_score, 2)));
+  cards.appendChild(renderCandidate({
+    svg: data.svg,
+    canonical_psmiles: data.canonical_psmiles,
+    psmiles: data.psmiles,
+    pselfies: data.pselfies,
+    passed_sv: data.valid,
+    passed_tsd: data.valid,
+    passed_dd: data.valid,
+    passed_pv: data.passes_pv,
+    sa_score: data.sa_score,
+    predicted_tg: data.predicted_tg,
+    tg_error: null
+  }, null));
+}
+
+function busy(state) {
+  document.getElementById("run").disabled = state;
+  document.getElementById("chat-send").disabled = state;
+}
+
+function runGeneration() {
+  var body = {
+    target_tg: parseFloat(document.getElementById("target").value),
+    n: parseInt(document.getElementById("count").value, 10),
+    temperature: parseFloat(document.getElementById("temperature").value),
+    top_p: parseFloat(document.getElementById("topp").value)
+  };
+  var seed = document.getElementById("seed").value;
+  if (seed !== "") { body.seed = parseInt(seed, 10); }
+
+  busy(true);
+  say("bot", "Sampling " + body.n + " candidates at Tg = " + body.target_tg + " K…");
+  post("/api/generate", body).then(function (data) {
+    lastTarget = data.target_tg;
+    renderGeneration(data);
+    var counts = data.aggregate.counts;
+    say("bot", "Screened " + counts.n_input + " candidates: " + counts.n_sv + " SV, " +
+        counts.n_tsd + " TSD, " + counts.n_dd + " DD, " + counts.n_pv +
+        " PV. Took " + num(data.elapsed_s, 2) + " s.");
+  }).catch(function (error) {
+    say("bot", error.message, true);
+  }).then(function () { busy(false); });
+}
+
+function sendMessage(event) {
+  event.preventDefault();
+  var input = document.getElementById("chat-input");
+  var message = input.value.trim();
+  if (!message) { return; }
+  input.value = "";
+  say("user", message);
+  busy(true);
+  post("/api/chat", { message: message, history: chatHistory }).then(function (payload) {
+    chatHistory.push({ role: "user", content: message });
+    chatHistory.push({ role: "assistant", content: payload.reply });
+    say("bot", payload.reply);
+    if (payload.intent === "generate" && payload.data) {
+      lastTarget = payload.data.target_tg;
+      renderGeneration(payload.data);
+    } else if (payload.intent === "predict" && payload.data) {
+      renderPrediction(payload.data);
+    }
+  }).catch(function (error) {
+    say("bot", error.message, true);
+  }).then(function () { busy(false); });
+}
+
+function describePath(slot) {
+  if (!slot || !slot.configured) { return "not configured"; }
+  return slot.path + (slot.exists ? "" : "  (missing)");
+}
+
+function loadHealth() {
+  fetch("/api/health").then(function (r) { return r.json(); }).then(function (health) {
+    document.getElementById("p-sha").textContent = health.tokenizer_sha256 || "unavailable";
+    document.getElementById("p-gen").textContent = describePath(health.checkpoints.generation);
+    document.getElementById("p-pred").textContent = describePath(health.checkpoints.prediction);
+    document.getElementById("p-corpus").textContent = describePath(health.checkpoints.training_corpus);
+    document.getElementById("p-device").textContent = health.device;
+    document.getElementById("p-render").textContent = health.rendering_available
+      ? "rdkit MolDraw2DSVG"
+      : ("unavailable — " + (health.rendering_unavailable_reason || "rdkit.Chem.Draw did not import"));
+
+    document.getElementById("count").max = health.max_candidates;
+    document.getElementById("temperature").value = health.defaults.temperature;
+    document.getElementById("topp").value = health.defaults.top_p;
+    document.getElementById("count").value = health.defaults.n;
+
+    var notes = ["Defaults are the paper's best medium setting: temperature " +
+                 health.defaults.temperature + ", top_p " + health.defaults.top_p +
+                 ". At most " + health.max_candidates + " candidates per request."];
+    if (!health.features.generation) { notes.push("Generation is disabled: no checkpoint found."); }
+    if (!health.features.prediction) { notes.push("Tg prediction is disabled: no checkpoint found."); }
+    if (!health.features.training_deduplication) { notes.push("No training corpus: the TSD filter is a no-op."); }
+    if (!health.features.synthetic_accessibility) { notes.push("SA scoring unavailable."); }
+    var hint = document.getElementById("hint");
+    hint.textContent = notes.join(" ");
+    if (notes.length > 1) { hint.className = "hint warn"; }
+
+    say("bot", "Ready on " + health.device + ". Ask me to generate polymers for a target Tg, " +
+        "or to predict Tg for a structure. Type 'help' for the exact phrasings I understand.");
+  }).catch(function () {
+    say("bot", "Could not reach the local API. Is the server still running?", true);
+  });
+}
+
+document.getElementById("chat-form").addEventListener("submit", sendMessage);
+document.getElementById("run").addEventListener("click", runGeneration);
+loadHealth();
+</script>
+
+</body>
+</html>

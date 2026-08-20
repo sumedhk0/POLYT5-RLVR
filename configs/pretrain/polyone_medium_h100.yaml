@@ -1,0 +1,65 @@
+# polyT5-medium pretraining on the full ~100M polyOne corpus, sized for one H100 80GB.
+#
+# PROVENANCE OF EVERY VALUE:
+#   [PAPER]  stated in Sahu et al., npj Artificial Intelligence 2, 30 (2026)
+#   [OURS]   not stated by the paper — see docs/ambiguity_register.md
+#   [PROXY]  a substitute for something the authors withheld — see docs/data.md
+#
+# This is the closest we can get to the paper's own setup. They trained on
+# 100,145,883 polymers with batch size 450 on a single NVIDIA L40S (48 GB).
+# polyOne's two shards total ~100M polymers, and an H100's 80 GB holds the
+# paper's batch of 450 as a SINGLE physical batch — no gradient accumulation,
+# unlike the 12 GB laptop configs where 450 must be factored.
+
+experiment_name: pretrain_medium_polyone_100m
+seed: 0                                        # [OURS] the paper reports no seeds
+data_mode: proxy                               # [PROXY] polyOne substitutes for the withheld corpus
+
+data:
+  source: polyone
+  # Overridden by the sbatch script to the node-local $SCRATCH path.
+  corpus_prefix: /scratch/polyt5-data/processed/polyone_full/corpus
+  splits_path: null                            # null = <corpus dir>/splits.json
+  max_length: 200                              # [PAPER] covers 99.91% of their corpus (Fig. S1)
+
+splits:                                        # recorded for provenance; the real index arrays
+  train: 0.90                                  # come from the corpus's splits.json
+  val: 0.05                                    # [PAPER] 90% train; the 5/5 sub-split is [OURS]
+  test: 0.05
+
+tokenizer:
+  path: artifacts/tokenizer/polyt5_vocab.json  # [PROXY] paper's structure, our token identities
+
+model:
+  config: configs/model/polyt5_medium.yaml     # [PAPER] Table S2: d_model 256, 4+4 layers, 7.46M
+
+span_corruption:                               # [PAPER] every value below is stated in the paper
+  max_spans: 8
+  max_span_length: 3
+  corruption_rate: 0.15
+  min_gap: 1
+  add_final_sentinel: true
+  mask_eos: false                              # [OURS] the paper does not say whether EOS is maskable
+
+train:
+  max_epochs: 2                                # [PAPER] the SI says "up to 5" but the main text and
+                                               #         Figure S2 both show 2 — register E-02
+  physical_batch_size: 450                     # [PAPER] their exact batch, unfactored, thanks to 80 GB
+  gradient_accumulation_steps: 1
+  target_effective_batch_size: 450             # [PAPER] asserted by TrainerConfig, never assumed
+  learning_rate: 0.001                         # [OURS] no pretraining LR is stated anywhere
+  weight_decay: 0.0                            # [OURS] not stated for pretraining
+  scheduler: inverse_sqrt                      # [OURS] not stated; T5's own pretraining schedule
+  warmup_steps: 2000                           # [OURS] not stated
+  max_grad_norm: 1.0                           # [OURS] not stated
+  amp: true                                    # [OURS] not stated; H100 bf16 is nearly free
+  amp_dtype: bf16
+  num_workers: 14                              # [OURS] overridden by the sbatch script
+  log_every: 200
+  eval_every_epochs: 1
+  save_every_epochs: 1                         # [PAPER] "checkpoints saved after each epoch"
+  keep_last_checkpoints: 3
+  device: auto
+
+output:
+  results_root: results

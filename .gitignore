@@ -1,0 +1,41 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# data + experiment outputs (regenerate via scripts/)
+data/raw/*
+data/interim/*
+data/processed/*
+data/external/*
+!data/**/.gitkeep
+!data/**/README.md
+results/*
+!results/.gitkeep
+artifacts/**/*.model
+artifacts/**/*.vocab
+*.ckpt
+*.pt
+*.safetensors
+runs/
+notebooks/*.ipynb_checkpoints
+
+# os / editors
+.DS_Store
+Thumbs.db
+
+# the paper itself — copyrighted, and 22 MB. Fetch it from arxiv.org/abs/2510.18860
+polyt5.pdf
+polyt5.txt
+
+# local agent/tooling state, not part of the project
+.claude-flow/
+pv_tree.json
+
+# derived novelty indices are rebuilt by scripts/build_novelty_index.py
+artifacts/novelty/*.u64

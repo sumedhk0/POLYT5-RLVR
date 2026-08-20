@@ -1,0 +1,40 @@
+# Pretraining dev config — small bring-up run, NOT a paper configuration.
+#
+# PAPER values (Sahu et al., npj AI 2026):
+#   max_length 200 · span-corruption objective · splits.train 0.9 ·
+#   effective batch size 450 (full-scale runs only)
+# OUR values (this file):
+#   PI1M limited to 50k polymers · tiny model · physical_batch_size 32 x
+#   gradient_accumulation_steps 4 (effective 128) · the held-out 10% is split
+#   5%/5% into val/test (the paper leaves it unsplit — register E-03)
+# Data mode: proxy (PI1M substitutes for the withheld corpus, see docs/data.md).
+#
+# Batch-size note for paper-scale runs: express 450 as
+# physical_batch_size x gradient_accumulation_steps with
+# target_effective_batch_size: 450 — e.g. 18 x 25 fits an RTX 4080 Laptop
+# (12 GB). Both factors are tunable per GPU; only the product is the paper's.
+
+name: dev
+seed: 0
+data_mode: proxy
+
+data:
+  source: pi1m
+  csv_path: data/external/PI1M_v2.csv
+  limit: 50000              # OURS: dev subset; null reads all 995,799 rows
+  max_length: 200           # PAPER
+  deduplicate: true
+  output_dir: data/processed/dev
+
+splits:
+  train: 0.90               # PAPER
+  val: 0.05                 # OURS  [AMBIGUITY] paper holds out 10% unsplit
+  test: 0.05                # OURS
+
+model_config: configs/model/polyt5_tiny.yaml   # OURS: tiny debug model
+
+training:
+  physical_batch_size: 32            # OURS — tune to your GPU
+  gradient_accumulation_steps: 4     # OURS — tune to your GPU
+  target_effective_batch_size: 128   # OURS (dev); PAPER full-scale: 450
+  max_length: 200                    # PAPER

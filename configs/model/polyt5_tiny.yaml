@@ -1,0 +1,23 @@
+# polyt5-tiny — NOT a paper configuration. Deliberately tiny debug model for
+# fast CPU tests (see Table S2 of Sahu et al. for the real small/medium/large
+# sizes). Field semantics match the real configs: architecture fields here
+# are arbitrary small values; the remaining fields keep the same
+# HuggingFace-T5 defaults used by the paper-sized configs.
+vocab_size: 458
+d_model: 64
+d_kv: 32
+num_heads: 2
+d_ff: 128
+num_layers: 2
+num_decoder_layers: null
+n_positions: 64
+relative_attention_num_buckets: 32
+relative_attention_max_distance: 128
+dropout_rate: 0.1
+layer_norm_epsilon: 1.0e-6
+initializer_factor: 1.0
+feed_forward_proj: relu
+tie_word_embeddings: true
+pad_token_id: 0
+eos_token_id: 1
+decoder_start_token_id: 0

@@ -1,0 +1,41 @@
+# Tg-conditioned generation fine-tuning (Sahu et al., npj AI 2026).
+#
+# PAPER values: 15 epochs · batch 16 · AdamW · lr 3e-4 · weight decay 0.01 ·
+#   90/10 train/validation split · no masking · max length 200 ·
+#   input = bare number "236.0" · output = PSELFIES ·
+#   sampling top_p 0.75, temperature 1.1 (best setting for polyT5-medium)
+# OUR values: the data source (LamaLab curated Tg, CC-BY-4.0 — the paper's
+#   Tg set is withheld). The paper defines NO test split for generation
+#   (final evaluation samples the model and scores with the predictor), so
+#   test.jsonl is written empty — register entry in stats.json.
+
+task: tg_generation
+seed: 0
+data_mode: proxy
+
+data:
+  source: lamalab_tg
+  csv_path: data/external/LAMALAB_CURATED_Tg.csv
+  output_dir: data/processed/tg
+  property_name: Tg
+  decimals: 1               # PAPER: conditioning values like "236.0"
+  max_length: 200           # PAPER
+  deduplicate: true
+
+splits:
+  train: 0.9                # PAPER
+  val: 0.1                  # PAPER
+
+training:
+  epochs: 15                # PAPER
+  batch_size: 16            # PAPER
+  optimizer: adamw          # PAPER
+  learning_rate: 3.0e-4     # PAPER
+  weight_decay: 0.01        # PAPER
+  masking: none             # PAPER: "no masking" during generation fine-tuning
+  max_source_length: 200    # PAPER cap; numeric sources are far shorter
+  max_target_length: 200    # PAPER
+
+sampling:
+  top_p: 0.75               # PAPER: best medium setting
+  temperature: 1.1          # PAPER

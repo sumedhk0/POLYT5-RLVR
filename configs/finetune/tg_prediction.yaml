@@ -1,0 +1,41 @@
+# Tg property prediction fine-tuning (Sahu et al., npj AI 2026).
+#
+# PAPER values: 30 epochs · batch 16 · AdamW · lr 3e-4 · weight decay 0.01 ·
+#   beam width 4 · 80/20 train/test over FIVE random splits · max length 200 ·
+#   input = bare PSELFIES (no task prefix) · target = "236.0" (one decimal)
+# OUR values: the data source (LamaLab curated Tg, CC-BY-4.0 — the paper's
+#   5,130-polymer Tg set is withheld), split_index, and val_fraction (the
+#   paper reports test scores without naming a validation protocol —
+#   register F-01: we carve validation from the training portion).
+
+task: tg_prediction
+seed: 0
+data_mode: proxy
+
+data:
+  source: lamalab_tg
+  csv_path: data/external/LAMALAB_CURATED_Tg.csv
+  output_dir: data/processed/tg
+  property_name: Tg
+  decimals: 1               # PAPER: targets like "236.0"
+  max_length: 200           # PAPER
+  deduplicate: true
+
+splits:
+  n_splits: 5               # PAPER: five random splits
+  train_fraction: 0.8       # PAPER
+  split_index: 0            # OURS: which of the 5 splits the jsonl files use
+  val_fraction: 0.1         # OURS  [AMBIGUITY] fraction of the TRAIN portion
+                            # held out for checkpoint selection (register F-01)
+
+training:
+  epochs: 30                # PAPER
+  batch_size: 16            # PAPER
+  optimizer: adamw          # PAPER
+  learning_rate: 3.0e-4     # PAPER
+  weight_decay: 0.01        # PAPER
+  max_source_length: 200    # PAPER
+  max_target_length: 200    # PAPER cap; numeric targets are far shorter
+
+evaluation:
+  beam_width: 4             # PAPER

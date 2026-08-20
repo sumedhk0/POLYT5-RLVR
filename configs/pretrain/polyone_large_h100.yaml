@@ -1,0 +1,67 @@
+# polyT5-large pretraining on the full ~100M polyOne corpus, sized for one H100 80GB.
+#
+# READ THIS BEFORE SPENDING THE COMPUTE. The paper's own finding is that large
+# is NOT meaningfully better than medium, verbatim: the large models "showed
+# marginal improvements over the medium variant", and "considering the balance
+# between predictive accuracy and computational cost, the polyT5-medium model
+# was selected for subsequent analyses". Every headline number in the paper —
+# Tg RMSE 40.82, the generation sweep, the dielectric screening cascade — is
+# medium. Run this only to test that claim, not because it is the default path.
+#
+#   [PAPER] stated in the paper · [OURS] our choice · [PROXY] substitute data
+
+experiment_name: pretrain_large_polyone_100m
+seed: 0                                        # [OURS]
+data_mode: proxy                               # [PROXY] see docs/data.md
+
+data:
+  source: polyone
+  corpus_prefix: /scratch/polyt5-data/processed/polyone_full/corpus
+  splits_path: null
+  max_length: 200                              # [PAPER]
+
+splits:
+  train: 0.90                                  # [PAPER]
+  val: 0.05                                    # [OURS]
+  test: 0.05                                   # [OURS]
+
+tokenizer:
+  path: artifacts/tokenizer/polyt5_vocab.json  # [PROXY]
+
+model:
+  config: configs/model/polyt5_large.yaml      # [PAPER] Table S2: d_model 512, 8+8 layers, 58.98M
+
+span_corruption:                               # [PAPER] all values stated in the paper
+  max_spans: 8
+  max_span_length: 3
+  corruption_rate: 0.15
+  min_gap: 1
+  add_final_sentinel: true
+  mask_eos: false                              # [OURS]
+
+train:
+  max_epochs: 2                                # [PAPER] register E-02
+  # Large is ~7.9x the parameters of medium. 450 in one batch is likely to fit
+  # in 80 GB at sequence length 200, but 225 x 2 leaves headroom for worst-case
+  # all-200-token batches and costs little. Raise to 450 x 1 if a probe run
+  # shows comfortable memory; both give the paper's effective batch.
+  physical_batch_size: 225                     # [OURS] tune to the node
+  gradient_accumulation_steps: 2               # [OURS]
+  target_effective_batch_size: 450             # [PAPER] asserted, never assumed
+  learning_rate: 0.0007                        # [OURS] scaled down from medium's 1e-3 for the
+                                               #        larger model; the paper states no LR at all
+  weight_decay: 0.0                            # [OURS]
+  scheduler: inverse_sqrt                      # [OURS]
+  warmup_steps: 4000                           # [OURS] longer warmup for the deeper stack
+  max_grad_norm: 1.0                           # [OURS]
+  amp: true                                    # [OURS]
+  amp_dtype: bf16
+  num_workers: 14                              # [OURS] overridden by the sbatch script
+  log_every: 200
+  eval_every_epochs: 1
+  save_every_epochs: 1                         # [PAPER]
+  keep_last_checkpoints: 3
+  device: auto
+
+output:
+  results_root: results

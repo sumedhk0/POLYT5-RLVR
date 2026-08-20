@@ -1,0 +1,8 @@
+{
+  "n_entries": 6619,
+  "hash_space": "canonical_psmiles",
+  "hash_name": "blake2b-64",
+  "source": "C:\\Users\\sumedh\\OneDrive - Georgia Institute of Technology\\Python\\PolyT5-RLVR\\data\\processed\\tg\\generation\\train.jsonl",
+  "created_utc": "2026-08-18T23:14:41.191200+00:00",
+  "dtype": "uint64"
+}
