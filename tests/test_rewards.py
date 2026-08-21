@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from polyt5.rewards import RewardResult, TgRewardConfig, tg_reward, validity_gate
+from polyt5.rewards import RewardResult, TgRewardConfig, build_arm, tg_reward, validity_gate
 
 
 def test_valid_polymer_passes_the_gate():
@@ -73,3 +73,70 @@ def test_tg_reward_records_unweighted_value_for_logging():
 def test_non_finite_prediction_is_gated():
     r = tg_reward(float("nan"), 5.0, 500.0, config=TgRewardConfig())
     assert r.gated is True and r.value == 0.0
+
+
+VALID = "[At][C][C][O][At]"
+INVALID = "[Zz][Qq]"
+
+
+class _FakeIndex:
+    """Stands in for ScalableNoveltyIndex; 'known' PSELFIES are not novel."""
+
+    def __init__(self, known):
+        self._known = set(known)
+
+    def is_novel(self, psmiles):
+        return psmiles not in self._known
+
+
+def test_accuracy_arm_uses_only_the_tg_term():
+    arm = build_arm("accuracy")
+    out = arm([VALID], [500.0], [(505.0, 5.0, 4)])
+    assert 0.0 < out[0].value <= 1.0
+    assert "closeness" in out[0].components
+
+
+def test_every_arm_zeroes_an_invalid_candidate():
+    for name in ("accuracy", "validity", "composite", "constraint"):
+        arm = build_arm(name, novelty_index=_FakeIndex([]))
+        out = arm([INVALID], [500.0], [(500.0, 1.0, 4)])
+        assert out[0].value == 0.0, name
+        assert out[0].gated is True, name
+
+
+def test_validity_arm_is_binary():
+    arm = build_arm("validity", novelty_index=_FakeIndex([]))
+    out = arm([VALID], [500.0], [(999.0, 99.0, 4)])
+    assert out[0].value == 1.0, "validity arm must ignore how wrong Tg is"
+
+
+def test_constraint_arm_requires_every_condition():
+    arm = build_arm("constraint", novelty_index=_FakeIndex([]),
+                    tolerance=50.0, sa_max=6.0)
+    on_target = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0].value
+    off_target = arm([VALID], [500.0], [(700.0, 2.0, 4)])[0].value
+    assert on_target == 1.0
+    assert off_target == 0.0, "conjunction: missing one condition scores zero"
+
+
+def test_composite_arm_weights_are_configurable_not_hardcoded():
+    idx = _FakeIndex([])
+    a = build_arm("composite", novelty_index=idx, weights={"tg": 1.0, "pv": 0.0, "novelty": 0.0})
+    b = build_arm("composite", novelty_index=idx, weights={"tg": 0.0, "pv": 1.0, "novelty": 0.0})
+    va = a([VALID], [500.0], [(600.0, 2.0, 4)])[0].value
+    vb = b([VALID], [500.0], [(600.0, 2.0, 4)])[0].value
+    assert va != vb
+
+
+def test_rewards_package_imports_without_torch():
+    """Reward workers must run CPU-only, with no model in the process."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; import polyt5.rewards; "
+         "sys.exit(1 if 'torch' in sys.modules else 0)"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
