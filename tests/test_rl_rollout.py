@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 
+from polyt5.data.prepare import format_property_value
 from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration
 from polyt5.rl.reference_policy import ReferencePolicy
 from polyt5.rl.rollout import RolloutBatch, sample_groups
@@ -86,16 +87,38 @@ def test_generation_is_chunked_at_128(monkeypatch):
     """Requirement 2: chunk at 128 regardless of how many candidates are asked
     for. Spies on the module-level `generate` call so this stays fast (no need
     to actually run 260 sequences through a model to prove the batching rule).
+
+    Also the only test that reaches the multi-chunk reassembly path at all
+    (every other test uses <= 8 rows and hits `_pad_and_cat`'s single-chunk
+    early return), so it additionally checks that row order survives
+    reassembly across both chunk boundaries (127|128 and 255|256): a chunk
+    boundary that reordered results would break group contiguity in a way no
+    shape assertion catches.
+
+    IMPORTANT: `prompt_ids` / `prompt_mask` / `targets` are built ONCE before
+    the chunk loop and never re-chunked (verified by inspection and by the
+    reassembly-mutant check in task-6-report.md), so checking THOSE fields
+    against each other cannot catch a chunk-list reorder -- it would pass
+    unchanged even if `sequences`/`logprobs`/`mask` reassembly reordered rows,
+    since nothing ties those three back to the true per-chunk call order. The
+    spy therefore also records each chunk's raw `output.sequences` so the test
+    can reconstruct the expected concatenation in the TRUE call order and
+    compare it directly against `batch.sequences`.
     """
     import polyt5.rl.rollout as rollout_mod
 
     model, tok = _tiny()
     seen_sizes: list[int] = []
+    seen_sequences: list[torch.Tensor] = []
     real_generate = rollout_mod.generate
 
     def spy(model_, input_ids, attention_mask=None, *, config, generator=None):
         seen_sizes.append(input_ids.shape[0])
-        return real_generate(model_, input_ids, attention_mask, config=config, generator=generator)
+        output = real_generate(
+            model_, input_ids, attention_mask, config=config, generator=generator
+        )
+        seen_sequences.append(output.sequences)
+        return output
 
     monkeypatch.setattr(rollout_mod, "generate", spy)
 
@@ -107,6 +130,31 @@ def test_generation_is_chunked_at_128(monkeypatch):
     assert seen_sizes, "generate() was never called"
     assert all(size <= 128 for size in seen_sizes), seen_sizes
     assert sum(seen_sizes) == 260
+
+    # Reconstruct the expected concatenation directly from what each chunk
+    # call actually returned, in the TRUE call order -- this is what catches
+    # a reordered/rotated chunk-list reassembly; targets/prompt_ids cannot
+    # (see the docstring note above).
+    width = batch.sequences.shape[1]
+    expected_rows = []
+    for chunk in seen_sequences:
+        gap = width - chunk.shape[1]
+        if gap:
+            filler = torch.full((chunk.shape[0], gap), tok.pad_id, dtype=chunk.dtype)
+            chunk = torch.cat([chunk, filler], dim=1)
+        expected_rows.append(chunk)
+    expected_sequences = torch.cat(expected_rows, dim=0)
+    assert torch.equal(batch.sequences, expected_sequences)
+
+    # Order must also survive reassembly across BOTH chunk boundaries (128,
+    # 256) for the fields built before the chunk loop. With group_size=4, row
+    # r belongs to group r // 4, whose target is float(r // 4). Indices
+    # checked: first row, both sides of each boundary, last row.
+    decoded_prompts = tok.batch_decode(batch.prompt_ids.tolist())
+    for row in (0, 127, 128, 255, 256, 259):
+        expected_target = float(row // 4)
+        assert batch.targets[row] == expected_target, row
+        assert decoded_prompts[row] == format_property_value(expected_target), row
 
 
 def test_logprobs_are_from_unmodified_distribution_not_filtered():
