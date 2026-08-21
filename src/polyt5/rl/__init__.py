@@ -4,5 +4,16 @@ from __future__ import annotations
 
 from polyt5.rl.advantages import group_advantages
 from polyt5.rl.grpo import GRPOConfig, grpo_loss, k3_kl
+from polyt5.rl.reference_policy import ReferencePolicy
+from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE, RolloutBatch, sample_groups
 
-__all__ = ["GRPOConfig", "grpo_loss", "group_advantages", "k3_kl"]
+__all__ = [
+    "GRPOConfig",
+    "ROLLOUT_CHUNK_SIZE",
+    "ReferencePolicy",
+    "RolloutBatch",
+    "grpo_loss",
+    "group_advantages",
+    "k3_kl",
+    "sample_groups",
+]
