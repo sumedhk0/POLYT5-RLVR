@@ -7,10 +7,11 @@ from polyt5.chemistry.canonicalization import canonical_psmiles
 from polyt5.chemistry.conversion import pselfies_to_psmiles
 from polyt5.chemistry.metrics import synthetic_accessibility
 from polyt5.rewards import (
+    DEFAULT_SIGMA_UNKNOWN,
     RewardResult,
     TgRewardConfig,
     build_arm,
-    sa_reward,
+    effective_sigma,
     tg_reward,
     validity_gate,
 )
@@ -58,31 +59,128 @@ def test_tg_reward_worked_example_from_the_spec():
     cases = [(10, 5, 0.695), (10, 17, 0.450), (10, 45, 0.247),
              (80, 5, 0.155), (80, 45, 0.055)]
     for err, std, expected in cases:
-        got = tg_reward(500.0 + err, std, 500.0, config=cfg).value
+        got = tg_reward(500.0 + err, std, 500.0, n_contributing=1, n_total=1, config=cfg).value
         assert got == pytest.approx(expected, abs=0.002), f"err={err} std={std}"
 
 
 def test_confidence_weighting_penalises_disagreement_not_novelty():
     cfg = TgRewardConfig()
-    agree = tg_reward(505.0, 2.0, 500.0, config=cfg).value
-    disagree = tg_reward(505.0, 45.0, 500.0, config=cfg).value
+    agree = tg_reward(505.0, 2.0, 500.0, n_contributing=1, n_total=1, config=cfg).value
+    disagree = tg_reward(505.0, 45.0, 500.0, n_contributing=1, n_total=1, config=cfg).value
     assert agree > disagree
     assert disagree > 0.0, "soft weighting must never zero out exploration"
 
 
 def test_tg_reward_is_zero_beyond_tolerance():
-    assert tg_reward(700.0, 1.0, 500.0, config=TgRewardConfig(tolerance=100.0)).value == 0.0
+    assert tg_reward(700.0, 1.0, 500.0, n_contributing=1, n_total=1,
+                     config=TgRewardConfig(tolerance=100.0)).value == 0.0
 
 
 def test_tg_reward_records_unweighted_value_for_logging():
-    r = tg_reward(510.0, 45.0, 500.0, config=TgRewardConfig())
+    r = tg_reward(510.0, 45.0, 500.0, n_contributing=1, n_total=1, config=TgRewardConfig())
     assert "closeness" in r.components and "confidence" in r.components
     assert r.components["closeness"] == pytest.approx(0.9, abs=1e-6)
 
 
 def test_non_finite_prediction_is_gated():
-    r = tg_reward(float("nan"), 5.0, 500.0, config=TgRewardConfig())
+    r = tg_reward(float("nan"), 5.0, 500.0, n_contributing=1, n_total=1,
+                   config=TgRewardConfig())
     assert r.gated is True and r.value == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Ruling F / review finding B1: the confidence weight must not INVERT on
+# candidates the reward ensemble cannot score.
+#
+# `EnsemblePropertyPredictor.predict_with_uncertainty` drops members that
+# returned no number, so `std == 0.0` means EITHER "every member agreed" OR
+# "only one member answered, and a spread over one number is undefined". The
+# old weight `1/(1 + std/sigma0)` read both as maximal confidence, so a
+# molecule three of four reward models could not parse scored 1.0000 while one
+# all four agreed on scored 0.8095 -- an ASCENDING gradient toward chemistry
+# that breaks the reward models' decoders, which is precisely what the weight
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+def test_one_of_four_scores_far_below_four_of_four_at_equal_closeness():
+    """The whole finding, as one numeric assertion.
+
+    Both candidates are EXACTLY on target (closeness 1.0) and both report
+    ``std`` values that the old formula treated as high confidence. The only
+    difference is how much of the ensemble could actually read them.
+    """
+    cfg = TgRewardConfig()
+    all_four = tg_reward(400.0, 4.0, 400.0, n_contributing=4, n_total=4, config=cfg)
+    one_of_four = tg_reward(400.0, 0.0, 400.0, n_contributing=1, n_total=4, config=cfg)
+
+    assert all_four.components["closeness"] == pytest.approx(1.0)
+    assert one_of_four.components["closeness"] == pytest.approx(1.0)
+
+    # The exact numbers from the review's reproduction, now the right way up.
+    assert all_four.value == pytest.approx(0.8095, abs=1e-4)
+    assert one_of_four.value == pytest.approx(0.0683, abs=1e-4)
+    assert one_of_four.value < all_four.value, (
+        "a candidate three quarters of the reward ensemble could not parse must NEVER "
+        "outscore one all four agreed on"
+    )
+
+
+def test_confidence_is_monotone_in_how_much_of_the_ensemble_answered():
+    """Mutant (a): a confidence weight that ignores ``n_contributing``.
+
+    Holding the reported spread fixed, more contributing members must never
+    score lower. Dropping the coverage factor makes 1-of-4, 2-of-4, 3-of-4 and
+    4-of-4 all identical and this fails.
+    """
+    cfg = TgRewardConfig()
+    values = [
+        tg_reward(400.0, 4.0, 400.0, n_contributing=n, n_total=4, config=cfg).value
+        for n in (2, 3, 4)
+    ]
+    assert values == sorted(values), values
+    assert len(set(values)) == 3, "coverage is not affecting the reward at all"
+
+
+def test_zero_contributing_members_scores_zero_and_is_gated():
+    result = tg_reward(float("nan"), float("nan"), 400.0, n_contributing=0, n_total=4)
+    assert result.value == 0.0
+    assert result.gated is True
+    assert result.reason == "no_contributing_members"
+
+
+def test_a_single_member_of_a_real_ensemble_uses_the_pessimistic_sigma():
+    """``std`` is UNDEFINED there, not zero, so the maximum observed
+    disagreement is substituted -- never the reported ``0.0``.
+    """
+    assert effective_sigma(0.0, 1, 4) == pytest.approx(DEFAULT_SIGMA_UNKNOWN)
+    assert effective_sigma(4.0, 4, 4) == pytest.approx(4.0)
+
+
+def test_a_single_model_predictor_is_not_the_undefined_case():
+    """Ruling C must survive Ruling F.
+
+    ``compare_arms``'s auditor is ONE model reporting ``(mean, 0.0, 1)``. It
+    has no members that could have failed, so its coverage is 1/1 and its
+    spread really is 0.0: the auditor-side score stays unweighted closeness.
+    Conflating it with "1 of 4" would silently multiply every auditor column
+    by 0.068.
+    """
+    auditor = tg_reward(400.0, 0.0, 400.0, n_contributing=1, n_total=1)
+    assert auditor.value == pytest.approx(1.0)
+    assert auditor.components["confidence"] == pytest.approx(1.0)
+
+
+def test_declaring_the_wrong_ensemble_size_raises_rather_than_understating():
+    with pytest.raises(ValueError, match="n_contributing"):
+        tg_reward(400.0, 0.0, 400.0, n_contributing=4, n_total=1)
+
+
+def test_partial_ensemble_is_visible_in_the_components_for_step_logging():
+    result = tg_reward(400.0, 0.0, 400.0, n_contributing=1, n_total=4)
+    assert result.components["n_contributing"] == 1.0
+    assert result.components["coverage"] == pytest.approx(0.25)
+    assert result.components["sigma_effective"] == pytest.approx(DEFAULT_SIGMA_UNKNOWN)
 
 
 VALID = "[At][C][C][O][At]"
@@ -105,26 +203,8 @@ class _FakeIndex:
         return psmiles not in self._known
 
 
-def test_sa_reward_normalises_and_fails_closed():
-    # SA=1 (easiest possible) -> full credit.
-    assert sa_reward(1.0, sa_max=6.0).value == pytest.approx(1.0)
-    # SA at the threshold -> zero credit, not partial credit.
-    assert sa_reward(6.0, sa_max=6.0).value == pytest.approx(0.0)
-    # SA past the threshold -> clamped to zero, not negative.
-    assert sa_reward(8.0, sa_max=6.0).value == 0.0
-    # No scorer available -> 0.0, NOT a pass: a missing capability must never
-    # inflate a reward.
-    r = sa_reward(None, sa_max=6.0)
-    assert r.value == 0.0
-    assert r.components == {"sa": 0.0}
-    # Hand-computed midpoint: (sa_max - score) / (sa_max - 1) = (6 - 3.5) / 5 = 0.5.
-    mid = sa_reward(3.5, sa_max=6.0)
-    assert mid.value == pytest.approx(0.5)
-    assert mid.components["sa_score"] == 3.5
-
-
 def test_accuracy_arm_uses_only_the_tg_term():
-    arm = build_arm("accuracy")
+    arm = build_arm("accuracy", ensemble_size=4)
     out = arm([VALID], [500.0], [(505.0, 5.0, 4)])
     assert 0.0 < out[0].value <= 1.0
     assert "closeness" in out[0].components
@@ -132,7 +212,7 @@ def test_accuracy_arm_uses_only_the_tg_term():
 
 def test_every_arm_zeroes_an_invalid_candidate():
     for name in ("accuracy", "validity", "composite", "constraint"):
-        arm = build_arm(name, novelty_index=_FakeIndex([]))
+        arm = build_arm(name, novelty_index=_FakeIndex([]), ensemble_size=4)
         out = arm([INVALID], [500.0], [(500.0, 1.0, 4)])
         assert out[0].value == 0.0, name
         assert out[0].gated is True, name
@@ -215,7 +295,7 @@ def test_validity_arm_opt_out_still_enforces_sv_dd_pv():
 
 def test_constraint_arm_requires_every_condition():
     arm = build_arm("constraint", novelty_index=_FakeIndex([]),
-                    tolerance=50.0, sa_max=6.0)
+                    tolerance=50.0, sa_max=6.0, ensemble_size=4)
     on_target = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0].value
     off_target = arm([VALID], [500.0], [(700.0, 2.0, 4)])[0].value
     assert on_target == 1.0
@@ -229,7 +309,7 @@ def test_constraint_arm_sa_leg_can_fail_alone():
     actual_sa = synthetic_accessibility(VALID_CANONICAL)
     assert actual_sa is not None, "SA scorer must be available for this test to mean anything"
     arm = build_arm("constraint", novelty_index=_FakeIndex([]),
-                    tolerance=50.0, sa_max=actual_sa - 0.5)
+                    tolerance=50.0, sa_max=actual_sa - 0.5, ensemble_size=4)
     out = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0]
     assert out.value == 0.0
     assert out.components["in_window"] == 1.0
@@ -242,7 +322,7 @@ def test_constraint_arm_novelty_leg_can_fail_alone():
     still score zero - otherwise an implementation could drop the novelty leg
     and this suite would not notice."""
     arm = build_arm("constraint", novelty_index=_FakeIndex([VALID_CANONICAL]),
-                    tolerance=50.0, sa_max=6.0)
+                    tolerance=50.0, sa_max=6.0, ensemble_size=4)
     out = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0]
     assert out.value == 0.0
     assert out.components["in_window"] == 1.0
@@ -252,8 +332,10 @@ def test_constraint_arm_novelty_leg_can_fail_alone():
 
 def test_composite_arm_weights_are_configurable_not_hardcoded():
     idx = _FakeIndex([])
-    a = build_arm("composite", novelty_index=idx, weights={"tg": 1.0, "pv": 0.0, "novelty": 0.0})
-    b = build_arm("composite", novelty_index=idx, weights={"tg": 0.0, "pv": 1.0, "novelty": 0.0})
+    a = build_arm("composite", novelty_index=idx, ensemble_size=4,
+                  weights={"tg": 1.0, "pv": 0.0, "novelty": 0.0})
+    b = build_arm("composite", novelty_index=idx, ensemble_size=4,
+                  weights={"tg": 0.0, "pv": 1.0, "novelty": 0.0})
     va = a([VALID], [500.0], [(600.0, 2.0, 4)])[0].value
     vb = b([VALID], [500.0], [(600.0, 2.0, 4)])[0].value
     assert va != vb
@@ -271,3 +353,75 @@ def test_rewards_package_imports_without_torch():
         capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, result.stderr[:500]
+
+
+# ------------------------------------------------------- arms thread n_contributing
+
+
+def test_every_tg_reading_arm_penalises_a_partial_ensemble():
+    """Ruling F: ``n_contributing`` must reach C1, C3 AND C4, not just
+    ``tg_reward``. Each arm is scored twice on the SAME candidate at the SAME
+    target -- once with all four members agreeing, once with a single member's
+    unopposed guess.
+    """
+    idx = _FakeIndex([])
+    cases = {
+        "accuracy": build_arm("accuracy", ensemble_size=4),
+        "composite": build_arm("composite", novelty_index=idx, ensemble_size=4),
+        "constraint": build_arm("constraint", novelty_index=idx, ensemble_size=4,
+                                tolerance=50.0, sa_max=6.0),
+    }
+    for name, arm in cases.items():
+        consensus = arm([VALID], [400.0], [(400.0, 4.0, 4)])[0].value
+        partial = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0].value
+        assert partial < consensus, (
+            f"{name}: a one-of-four prediction scored {partial} against a full-consensus "
+            f"{consensus} -- this arm is still reading a single member's guess as a consensus"
+        )
+
+
+def test_constraint_arm_requires_the_ensemble_to_have_actually_scored_it():
+    """C4 carries no continuous confidence weight by spec, so coverage enters
+    as a fourth conjunct instead. One member of four is below ``min_coverage``
+    and the conjunction fails even though Tg, SA and novelty all pass.
+    """
+    arm = build_arm("constraint", novelty_index=_FakeIndex([]), ensemble_size=4,
+                    tolerance=50.0, sa_max=6.0)
+    out = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0]
+    assert out.value == 0.0
+    assert out.components["in_window"] == 1.0
+    assert out.components["synthesisable"] == 1.0
+    assert out.components["novel"] == 1.0
+    assert out.components["ensemble_backed"] == 0.0
+    assert out.components["coverage"] == pytest.approx(0.25)
+
+
+def test_constraint_arm_accepts_a_single_model_predictor():
+    """Ruling C again: the auditor is one model, so 1 of 1 is full coverage."""
+    arm = build_arm("constraint", novelty_index=_FakeIndex([]), ensemble_size=1,
+                    tolerance=50.0, sa_max=6.0)
+    out = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0]
+    assert out.value == 1.0
+    assert out.components["ensemble_backed"] == 1.0
+
+
+def test_validity_arm_rejects_misaligned_inputs_like_every_other_arm():
+    """Minor 12: ``ValidityArm`` reads neither targets nor predictions, but it
+    must still refuse three sequences of different lengths rather than
+    silently scoring the shortest.
+    """
+    arm = build_arm("validity", novelty_index=_FakeIndex([]))
+    with pytest.raises(ValueError):
+        arm([VALID, VALID], [500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+
+
+def test_sa_reward_is_no_longer_a_public_symbol():
+    """Minor 13: the branch's one unwired public symbol. No arm called it --
+    ``ConstraintArm`` reads the raw SA score and ``constraint_reward`` applies
+    the threshold -- and wiring it would have changed C4's reward at the
+    boundary, which is a spec change, not a review fix.
+    """
+    import polyt5.rewards as rewards
+
+    assert not hasattr(rewards, "sa_reward")
+    assert "sa_reward" not in rewards.__all__
