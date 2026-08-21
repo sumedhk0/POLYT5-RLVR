@@ -157,6 +157,45 @@ def test_generation_is_chunked_at_128(monkeypatch):
         assert decoded_prompts[row] == format_property_value(expected_target), row
 
 
+def test_chunk_size_is_configurable(monkeypatch):
+    """Task-7-review.md finding 6: a caller-supplied `chunk_size` must actually
+    change how many `generate()` calls happen -- not be silently ignored.
+    Compares the default (one call, everything fits in 128) against an
+    explicit smaller override on the SAME total candidate count.
+    """
+    import polyt5.rl.rollout as rollout_mod
+
+    model, tok = _tiny()
+    targets = [float(i) for i in range(20)]  # 20 prompts x group_size 4 = 80
+
+    def count_calls():
+        calls = []
+        real_generate = rollout_mod.generate
+
+        def spy(model_, input_ids, attention_mask=None, *, config, generator=None):
+            calls.append(input_ids.shape[0])
+            return real_generate(model_, input_ids, attention_mask, config=config,
+                                 generator=generator)
+
+        monkeypatch.setattr(rollout_mod, "generate", spy)
+        return calls
+
+    calls_default = count_calls()
+    batch_default = sample_groups(model, tok, targets=targets, group_size=4, max_length=4,
+                                  temperature=1.0, top_p=0.95, seed=0, device="cpu")
+    assert len(calls_default) == 1, calls_default
+    assert sum(calls_default) == 80
+
+    calls_small = count_calls()
+    batch_small = sample_groups(model, tok, targets=targets, group_size=4, max_length=4,
+                                temperature=1.0, top_p=0.95, seed=0, device="cpu",
+                                chunk_size=32)
+    assert len(calls_small) == 3, calls_small  # ceil(80 / 32)
+    assert sum(calls_small) == 80
+    assert all(size <= 32 for size in calls_small), calls_small
+    assert batch_small.sequences.shape[0] == batch_default.sequences.shape[0] == 80
+
+
 def test_logprobs_are_from_unmodified_distribution_not_filtered():
     """Requirement 5, and mutant (c): token_logprobs must be the raw
     log_softmax of the model's logits, computed BEFORE temperature scaling and

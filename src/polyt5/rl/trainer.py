@@ -17,13 +17,20 @@ candidates.
 Dropout and module mode: :func:`~polyt5.rl.rollout.sample_groups` and
 :meth:`~polyt5.rl.reference_policy.ReferencePolicy.score` both document that
 they do not change the model's train/eval mode themselves -- callers decide.
-This trainer puts the policy in ``eval()`` for rollout sampling, so sampling
-is governed entirely by the explicit seeded generator rather than an
-uncontrolled dropout draw from the global RNG (the reference policy is always
-``eval()`` for its whole lifetime; see :class:`~polyt5.rl.reference_policy.
-ReferencePolicy`). It puts the policy back in ``train()`` for the log-prob
-recompute that feeds the loss -- the ordinary training-mode forward pass the
-gradient flows through.
+This trainer keeps the policy in ``eval()`` for BOTH the rollout sampling
+AND the log-prob recompute that feeds the loss (the reference policy is
+always ``eval()`` for its whole lifetime regardless; see
+:class:`~polyt5.rl.reference_policy.ReferencePolicy`). There is exactly one
+gradient step per rollout, so ``pi_theta`` and ``pi_theta_old`` are evaluated
+at IDENTICAL parameters; running the recompute in ``train()`` mode would make
+them differ only by dropout noise between two passes over the same weights,
+which is not policy drift -- it corrupts the importance ratio (spurious
+clipping at step 0, before any update has happened) and the KL anchor (a
+permanent positive floor from comparing a dropped-out pass against the
+reference's always-clean one, fighting the KL term's own purpose). Keeping
+both passes in ``eval()`` makes the ratio exactly ``1.0`` at step 0 and the
+surrogate reduce to the vanilla policy-gradient update, which is correct here
+precisely because training is on-policy for exactly one step.
 """
 
 from __future__ import annotations
@@ -40,9 +47,9 @@ from polyt5.rewards import ArmReward, RewardResult
 from polyt5.rl.advantages import group_advantages
 from polyt5.rl.grpo import GRPOConfig, grpo_loss
 from polyt5.rl.reference_policy import ReferencePolicy
-from polyt5.rl.rollout import sample_groups
+from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE, sample_groups
 from polyt5.tokenization import PolyT5Tokenizer
-from polyt5.training import save_checkpoint
+from polyt5.training import build_optimizer, save_checkpoint
 from polyt5.utils import RunDirectory
 from polyt5.utils.device import select_device
 
@@ -78,6 +85,14 @@ class GRPOTrainerConfig:
         temperature: Sampling temperature for rollout generation.
         top_p: Nucleus mass for rollout generation.
         learning_rate: AdamW learning rate for the policy.
+        weight_decay: Decoupled weight decay, passed to
+            :func:`~polyt5.training.optim.build_optimizer` (which excludes
+            embeddings, biases and LayerNorm/T5LayerNorm scales from decay --
+            see its docstring). Defaults to ``0.0``: for a policy-gradient
+            recompute, zero decay means a parameter moves only when it
+            actually received a non-zero gradient, which is what makes
+            "did training happen" testable by inspecting gradients rather
+            than by asserting on decay-induced parameter drift.
         clip_eps: GRPO ratio clipping half-width (see
             :class:`~polyt5.rl.grpo.GRPOConfig`).
         kl_coef: Weight on the KL anchor to the frozen reference policy.
@@ -88,15 +103,15 @@ class GRPOTrainerConfig:
             ``np.random.default_rng`` for that step alone (see the module
             docstring).
         log_every: Log metrics every this many steps in :meth:`GRPOTrainer.train`.
-        save_every: Checkpoint every this many steps in :meth:`GRPOTrainer.train`.
-        rollout_batch_size: Reserved for future use. Rollout generation is
-            always chunked internally at
-            :data:`polyt5.rl.rollout.ROLLOUT_CHUNK_SIZE`, a fixed
-            hardware-measured constant that :func:`~polyt5.rl.rollout.
-            sample_groups` does not expose as a caller-tunable parameter (see
-            its module docstring), so this value is not passed through to it
-            today; it exists here so the trainer's config schema already has
-            a place for a future async/chunked rollout path to read from.
+        save_every: Checkpoint every this many steps in :meth:`GRPOTrainer.train`
+            (the final step always checkpoints too, regardless of this value).
+        rollout_batch_size: Candidates per :func:`~polyt5.generation.generate`
+            call during rollout, forwarded to :func:`~polyt5.rl.rollout.
+            sample_groups` as its ``chunk_size`` argument. Defaults to
+            :data:`polyt5.rl.rollout.ROLLOUT_CHUNK_SIZE` (128), the measured
+            hardware optimum documented on that module -- lowering this trades
+            throughput (measured ~4x worse at 512) for peak memory; it does
+            not change what gets generated, only how it is batched.
     """
 
     group_size: int = 16
@@ -108,6 +123,7 @@ class GRPOTrainerConfig:
     temperature: float = 0.7
     top_p: float = 0.95
     learning_rate: float = 1e-6
+    weight_decay: float = 0.0
     clip_eps: float = 0.2
     kl_coef: float = 0.02
     max_grad_norm: float = 1.0
@@ -115,7 +131,7 @@ class GRPOTrainerConfig:
     seed: int = 0
     log_every: int = 10
     save_every: int = 250
-    rollout_batch_size: int = 128
+    rollout_batch_size: int = ROLLOUT_CHUNK_SIZE
 
     def __post_init__(self) -> None:
         if self.group_size < 1:
@@ -128,6 +144,8 @@ class GRPOTrainerConfig:
             raise ValueError(
                 f"target_min ({self.target_min}) must be < target_max ({self.target_max})"
             )
+        if self.rollout_batch_size < 1:
+            raise ValueError(f"rollout_batch_size must be >= 1, got {self.rollout_batch_size}")
 
 
 class GRPOTrainer:
@@ -166,7 +184,24 @@ class GRPOTrainer:
             run_dir: Optional :class:`~polyt5.utils.RunDirectory` for metric
                 logging and checkpointing in :meth:`train`. ``step`` alone
                 never touches it.
+
+        Raises:
+            ValueError: If ``reference is policy`` -- see the ``reference``
+                argument above. Without this guard the failure is not silent
+                (``ReferencePolicy`` clearing ``requires_grad`` on the shared
+                object makes ``loss.backward()`` raise), but that indirect
+                failure mode is exactly the shape of bug that could otherwise
+                burn hours of a real run before surfacing, so it gets a named
+                error instead.
         """
+        if reference is policy:
+            raise ValueError(
+                "GRPOTrainer.reference must be a SEPARATE model instance from `policy`: "
+                "ReferencePolicy freezes the object it is given in place "
+                "(.eval(), requires_grad_(False)), so handing it `policy` itself would "
+                "silently freeze the policy too. Load a separate checkpoint or construct a "
+                "second model instance instead."
+            )
         self.config = config
         self.device = torch.device(select_device(config.device))
         self.policy = policy.to(self.device)
@@ -179,7 +214,9 @@ class GRPOTrainer:
         # `reference` must already be a model instance distinct from `policy`;
         # this class never constructs one from the live policy object.
         self.reference = ReferencePolicy(reference, device=self.device)
-        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=config.learning_rate)
+        self.optimizer = build_optimizer(
+            self.policy, lr=config.learning_rate, weight_decay=config.weight_decay
+        )
 
     def step(self, step_index: int) -> dict[str, float]:
         """Run one GRPO step and return its logging stats.
@@ -212,6 +249,7 @@ class GRPOTrainer:
             top_p=cfg.top_p,
             seed=rollout_seed,
             device=self.device,
+            chunk_size=cfg.rollout_batch_size,
         )
 
         predictions = self.predictor.predict_with_uncertainty(batch.texts)
@@ -221,9 +259,13 @@ class GRPOTrainer:
         advantages = group_advantages(rewards, cfg.group_size)
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
 
-        # Training-mode forward pass: dropout on, gradient flows. Distinct
-        # from the eval-mode, no-grad rollout above -- see module docstring.
-        self.policy.train()
+        # Still eval() -- see module docstring for why the recompute must NOT
+        # switch to train() mode: exactly one gradient step per rollout means
+        # pi_theta and pi_theta_old are the same distribution at recompute
+        # time, and only eval() keeps that true (dropout would inject noise
+        # unrelated to any actual policy update). Gradients still flow in
+        # eval mode -- eval()/train() governs dropout and batchnorm, not
+        # autograd.
         logprobs = self._policy_logprobs(batch.sequences, batch.prompt_ids, batch.prompt_mask)
         # ReferencePolicy.score() returns UNMASKED log-probs; grpo_loss applies
         # `mask` itself, so no separate masking step is needed here.
@@ -280,10 +322,31 @@ class GRPOTrainer:
             under the CURRENT policy, unmasked (mirrors
             :meth:`ReferencePolicy.score`'s own contract; :func:`~polyt5.rl.
             grpo.grpo_loss` applies the mask).
+
+        Raises:
+            ValueError: If the tokenizer's ``decoder_start_token_id`` (the id
+                :func:`~polyt5.rl.rollout.sample_groups` actually shifted in
+                when it built ``sequences``) disagrees with the policy's own
+                ``config.decoder_start_token_id``. A silent mismatch here
+                would desynchronise every position of ``logprobs`` from
+                ``old_logprobs`` by one token without raising anywhere.
         """
-        decoder_start = self.policy.config.decoder_start_token_id
+        if self.tokenizer.decoder_start_token_id != self.policy.config.decoder_start_token_id:
+            raise ValueError(
+                "tokenizer.decoder_start_token_id "
+                f"({self.tokenizer.decoder_start_token_id}) != "
+                f"policy.config.decoder_start_token_id "
+                f"({self.policy.config.decoder_start_token_id}): sample_groups() shifted in "
+                "the tokenizer's start token when it built `sequences`, so recomputing "
+                "log-probs with a different one would silently desynchronise every position."
+            )
+        sequences = sequences.to(self.device)
+        prompt_ids = prompt_ids.to(self.device)
+        prompt_mask = prompt_mask.to(self.device)
+
+        decoder_start = self.tokenizer.decoder_start_token_id
         start = torch.full(
-            (sequences.shape[0], 1), decoder_start, dtype=sequences.dtype, device=sequences.device
+            (sequences.shape[0], 1), decoder_start, dtype=sequences.dtype, device=self.device
         )
         decoder_input_ids = torch.cat([start, sequences[:, :-1]], dim=1)
         output = self.policy(
@@ -295,6 +358,13 @@ class GRPOTrainer:
     def train(self) -> dict[str, Any]:
         """Run ``config.max_steps`` steps, logging and checkpointing when a run dir is given.
 
+        Logging and checkpointing cadence are both keyed off the number of
+        COMPLETED steps (``step_index + 1``), so ``log_every`` and
+        ``save_every`` mean the same thing, and both ALWAYS fire on the final
+        step regardless of whether ``max_steps`` is a multiple of the cadence
+        -- a run that stops mid-cadence still logs and checkpoints its last
+        weights rather than silently dropping them.
+
         Returns:
             ``{"num_steps": int, "history": list[dict]}`` -- every step's stats,
             in order.
@@ -304,16 +374,18 @@ class GRPOTrainer:
             stats = self.step(step_index)
             history.append(stats)
 
+            completed = step_index + 1
+            is_final = completed == self.config.max_steps
             if self.run_dir is not None:
-                if step_index % self.config.log_every == 0:
-                    self.run_dir.log_metrics({"step": step_index, **stats})
-                if (step_index + 1) % self.config.save_every == 0:
+                if completed % self.config.log_every == 0 or is_final:
+                    self.run_dir.log_metrics({"step": completed, **stats})
+                if completed % self.config.save_every == 0 or is_final:
                     save_checkpoint(
-                        self.run_dir.checkpoints / f"step_{step_index + 1:06d}.pt",
+                        self.run_dir.checkpoints / f"step_{completed:06d}.pt",
                         model=self.policy,
                         optimizer=self.optimizer,
                         epoch=0,
-                        global_step=step_index + 1,
+                        global_step=completed,
                         config={"grpo": asdict(self.config)},
                         model_config=self.policy.config.to_dict(),
                         tokenizer_sha256=self.tokenizer.sha256,

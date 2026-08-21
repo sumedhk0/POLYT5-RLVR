@@ -14,9 +14,13 @@ Two things this module is careful about:
    unrelated prompts and silently corrupt the whole algorithm.
 2. Rollout batch size. Measured on this hardware, generating in batches of
    128 gives ~125 candidates/second; batching 512 at once drops to
-   ~36/second -- nearly 4x worse. Generation is therefore always chunked at
-   :data:`ROLLOUT_CHUNK_SIZE`, regardless of how many candidates the caller
-   asks for.
+   ~36/second -- nearly 4x worse. Generation is therefore always chunked, at
+   :data:`ROLLOUT_CHUNK_SIZE` by default regardless of how many candidates
+   the caller asks for. A caller may override the chunk size via
+   :func:`sample_groups`'s ``chunk_size`` argument (e.g. to trade throughput
+   for peak memory on a smaller card); it does not change what gets
+   generated, only how many rows go through one :func:`~polyt5.generation.
+   generate` call at a time.
 """
 
 from __future__ import annotations
@@ -33,8 +37,9 @@ from polyt5.tokenization import PolyT5Tokenizer
 
 __all__ = ["ROLLOUT_CHUNK_SIZE", "RolloutBatch", "sample_groups"]
 
-#: Candidates per `generate()` call. See the module docstring -- this is a
-#: measured hardware optimum, not a tunable knob.
+#: Default candidates per `generate()` call. See the module docstring -- this
+#: is a measured hardware optimum; :func:`sample_groups` accepts a
+#: ``chunk_size`` override for callers who need a different tradeoff.
 ROLLOUT_CHUNK_SIZE = 128
 
 
@@ -120,6 +125,7 @@ def sample_groups(
     repetition_penalty: float = 1.0,
     seed: int | None = None,
     device: str | torch.device = "cpu",
+    chunk_size: int = ROLLOUT_CHUNK_SIZE,
 ) -> RolloutBatch:
     """Sample a contiguous group of candidates per target Tg value.
 
@@ -144,18 +150,28 @@ def sample_groups(
             restarting per chunk, while two calls with the same seed still
             reproduce bit-identical output.
         device: Device to encode prompts on and run generation on.
+        chunk_size: Candidates per :func:`~polyt5.generation.generate` call.
+            Defaults to :data:`ROLLOUT_CHUNK_SIZE`, the measured hardware
+            optimum (see the module docstring); a caller may override it to
+            trade throughput for lower peak memory. Purely a batching
+            parameter -- it does not change what gets generated or the RNG
+            stream (the shared ``generator`` above already makes chunk
+            boundaries invisible to the sampled output).
 
     Returns:
         A :class:`RolloutBatch` with ``group_size * len(targets)`` rows,
         grouped contiguously per prompt in the order ``targets`` was given.
 
     Raises:
-        ValueError: If ``targets`` is empty or ``group_size < 1``.
+        ValueError: If ``targets`` is empty, ``group_size < 1``, or
+            ``chunk_size < 1``.
     """
     if not targets:
         raise ValueError("targets must not be empty.")
     if group_size < 1:
         raise ValueError(f"group_size must be >= 1, got {group_size}.")
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
 
     device_t = torch.device(device)
 
@@ -188,8 +204,8 @@ def sample_groups(
     sequence_chunks: list[Tensor] = []
     logprob_chunks: list[Tensor] = []
     length_chunks: list[Tensor] = []
-    for start in range(0, n, ROLLOUT_CHUNK_SIZE):
-        end = start + ROLLOUT_CHUNK_SIZE
+    for start in range(0, n, chunk_size):
+        end = start + chunk_size
         output = generate(
             model,
             prompt_ids[start:end],
