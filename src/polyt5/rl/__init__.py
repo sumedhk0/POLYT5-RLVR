@@ -6,9 +6,12 @@ from polyt5.rl.advantages import group_advantages
 from polyt5.rl.grpo import GRPOConfig, grpo_loss, k3_kl
 from polyt5.rl.reference_policy import ReferencePolicy
 from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE, RolloutBatch, sample_groups
+from polyt5.rl.trainer import GRPOTrainer, GRPOTrainerConfig
 
 __all__ = [
     "GRPOConfig",
+    "GRPOTrainer",
+    "GRPOTrainerConfig",
     "ROLLOUT_CHUNK_SIZE",
     "ReferencePolicy",
     "RolloutBatch",
