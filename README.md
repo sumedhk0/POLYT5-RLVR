@@ -184,20 +184,51 @@ satisfied — the supervised baseline is frozen (`artifacts/baseline/frozen_base
 SHA-256) and Arm A / Arm B are measured against it. What is built on top of that baseline:
 
 - **Reward components** (`src/polyt5/rewards/`) — validity gate, Tg closeness with confidence weighting,
-  novelty, synthetic accessibility, and the four reward arms (`accuracy`, `validity`, `composite`,
-  `constraint`). Deliberately torch-free, so reward workers run CPU-only.
+  novelty, and the four reward arms (`accuracy`, `validity`, `composite`, `constraint`). Deliberately
+  torch-free, so reward workers run CPU-only. The confidence weight scales by how much of the ensemble
+  could actually score a candidate (`n_contributing / n_total`) and substitutes the maximum observed
+  disagreement, not zero, when only one member of several answered — without that, a candidate three of
+  four reward models cannot parse outscores one all four agree on.
 - **RL core** (`src/polyt5/rl/`) — group rollout, group-relative advantages, the clipped GRPO surrogate
   with a k3 KL anchor to a frozen reference policy, and `GRPOTrainer`, the synchronous training loop.
 - **Training CLI** (`scripts/train_grpo.py`) and **four arm configs** (`configs/rl/*.yaml`) — one GRPO run
   per arm, differing only in reward.
+- **Drift monitoring** (`src/polyt5/rl/drift.py`) — spec §4.4's auditor gap and max-Tanimoto-to-training
+  distribution, logged every 50 steps. The auditor is loaded for logging only and never reaches a reward
+  arm; the containment is enforced by construction and pinned by a test that the step's rewards,
+  advantages and loss are identical with and without it.
 - **Arm-comparison matrix** (`scripts/compare_arms.py`) — samples fresh candidates from every trained arm
   under the frozen evaluation protocol and scores them twice: once by the reward ensemble (splits 0–3,
-  "the metric it optimized") and once by a held-out auditor (split 4, never used in any reward path).
+  "the metric it optimized") and once by the held-out auditor (split 4, never used in any reward path).
 
-**Pre-registered success criterion** (`frozen_baseline.json`'s `success_criterion`, unchanged since the
-freeze): an RLVR arm succeeds only if it beats Arm B on the metric it optimized under the reward ensemble
-*and* that gain survives independent scoring by the auditor. This is `[OURS]` — the paper defines no such
-criterion, ensembles nothing, and never audits with a held-out model.
+**Pre-registered success criterion** (`frozen_baseline.json`'s `success_criterion` and
+`pre_registered_metrics`): an RLVR arm succeeds only if it beats Arm B on **the metric it actually
+optimized** — `accuracy_score`, `pv_rate`, `composite_score`, `constraint_satisfaction_rate`, each pinned
+in the frozen record with a minimum effect size — under the reward ensemble, *and* that gain survives
+scoring by the auditor, *and* it was sampled at Arm B's temperature/top-p. "Beats" requires both an
+improvement of at least the pre-registered `min_margin` and a 95% bootstrap CI over candidates that
+excludes zero; a bare inequality on one generation seed cannot separate an 0.1 K win from noise.
+`compare_arms` refuses to run if its code and the frozen record disagree. This is `[OURS]` — the paper
+defines no such criterion, ensembles nothing, and never audits with a held-out model.
+
+> **What the auditor can and cannot establish.** `[OURS]` `scripts/run_splits.py` builds **five
+> independent random 80/20 splits of the same corpus**, explicitly not a partitioning k-fold. Split 4
+> therefore trains on a random 80% of the same LamaLab Tg data and shares ~80% of its training set with
+> each reward model in expectation, and its own held-out 20% is *not* held out from the reward ensemble.
+> The auditor tests **"is this gain an artifact of *these four particular models'* idiosyncrasies?"** — a
+> real and worthwhile test. It cannot test "is the Tg claim true": a reward hack exploiting a genuinely
+> data-sparse region of chemical space fools all five models identically, because all five are sparse
+> there. The auditor is held out of the reward **path**, not statistically independent of the reward
+> models.
+
+> **Known limitation: novelty is exact-canonical-match.** `[OURS]` The novelty term C3 rewards and C4
+> requires is the absence of the candidate's exact canonical PSMILES from the training index. **A
+> one-atom edit of a memorised training polymer therefore scores `novel = 1.0`.** No reward term anywhere
+> can distinguish that from genuinely new chemistry. This is not fixed — changing the reward now would
+> change what the arms optimize — but it is measured: the drift monitor reports max-Tanimoto to the
+> labelled set and the fraction of candidates whose nearest known neighbour is at Tanimoto ≥ 0.9, so a
+> C3/C4 arm rediscovering the training set is visible during the run rather than assumed away. Read the
+> C3 and C4 columns of the matrix with this in mind.
 
 **No outcome is claimed here.** No arm has been trained; this section describes the apparatus and the
 criterion it will be measured against, not a result. See `docs/rlvr_plan.md` for the original design

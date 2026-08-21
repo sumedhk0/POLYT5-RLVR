@@ -158,7 +158,11 @@ quantified below with real numbers from `docs/baseline.md`.
      disagreement is roughly half the error magnitude and varies threefold across candidates, which is
      exactly the spread a gate needs. Candidates where five independently trained models disagree by 45 K
      are the ones a policy would otherwise farm.
-   - **A held-out auditor** — one split's model never used in any reward, only for final scoring.
+   - **A held-out auditor** — one split's model never used in any reward, only for final scoring. It is
+     held out of the reward *path*, not statistically independent of the reward models: the five splits
+     are independent random 80/20 draws from the same corpus, so the auditor shares ~80% of its training
+     data with each reward model in expectation. It can tell us a gain is not an artifact of *these four
+     particular models*; it cannot tell us the Tg claim is true.
    - **A novelty ceiling**, so the policy cannot escape the predictor's support entirely.
    - **Log the predicted-value histogram every RL epoch.** Collapse onto modal values is the signature of
      this failure, and it is visible immediately if plotted.
@@ -168,7 +172,8 @@ quantified below with real numbers from `docs/baseline.md`.
    high-Tg polymers are aromatic. Either condition it on structure class or keep its weight near zero.
 3. **The circularity between generator and predictor.** Both were fine-tuned on the same LamaLab Tg data,
    so the predictor scoring the generator is partly self-referential *before* RL even starts. The auditor
-   split is the only clean measurement; quote it separately in every result.
+   split is the *cleanest* measurement available, not a clean one — it is drawn from the same corpus — so
+   quote it separately in every result, with that caveat attached.
 2. **Mode collapse.** Group-relative advantages plus a validity-heavy reward push toward a handful of
    trivially valid polymers. The diversity term and within-group duplicate penalties exist for this.
 3. **Degenerate short sequences.** Short PSELFIES are easier to keep valid. Length-aware normalization is

@@ -382,9 +382,18 @@ same task".
 | Llama-3, fine-tuned | 39.5 |
 | polyBART embeddings + Gaussian process regression | 39.9 |
 
-**Our reproduction beats fine-tuned GPT-3.5 and sits within ~4 K of polyT5, polyBART+GPR and Llama-3** —
-on substitute data, a substitute tokenizer, and a laptop GPU. That is a more useful statement of where we
-landed than "9% short of the paper".
+**Our reproduction lands in the same band as these published models — within ~4 K of polyT5,
+polyBART+GPR and Llama-3, and indistinguishable from fine-tuned GPT-3.5** — on substitute data, a
+substitute tokenizer, and a laptop GPU. That is a more useful statement of where we landed than "9% short
+of the paper".
+
+> **This table is not a leaderboard, and the GPT-3.5 row in particular is not a win.** `[OURS]` 44.45 ±
+> 2.52 K is measured on 7,367 LamaLab experimental values; `[PAPER]` 47.2 K is measured on the paper's own
+> withheld 5,130. Different test sets are not comparable by subtraction at all, and even setting that
+> aside the 2.75 K nominal difference is smaller than our own ±2.52 K spread across the five splits. The
+> honest reading is "same band, different data", not "beats". The other three rows carry the identical
+> caveat; they are quoted because they say where this class of model sits, not because our number can be
+> ranked against them.
 
 > **Label-noise floor, from the published Methods.** The thermal datasets "should be interpreted as
 > literature-reported values under varying conditions" — molecular weight, dispersity and measurement
@@ -518,8 +527,12 @@ predictor error.
 > ⚠️ **Circularity caveat.** The predictor and the generator were fine-tuned on the same LamaLab Tg data, so
 > using one to score the other is partly self-referential. This is the exact failure mode the RLVR phase
 > must defend against, since the policy would be free to farm the predictor's blind spots. The mitigation —
-> an ensemble of five independently-split Tg models plus one held-out auditor never used in any reward — is
-> being built now (see `docs/rlvr_plan.md` §7).
+> an ensemble of four independently-split Tg models plus one held-out auditor never used in any reward — is
+> built (see `docs/rlvr_plan.md` §7). It *reduces* the circularity; it does not remove it. The five splits
+> are independent random 80/20 draws from the same corpus, so the auditor shares ~80% of its training data
+> with each reward model in expectation. It can establish that a gain is not an artifact of those four
+> particular models. It cannot establish that the Tg claim is true, because a hack exploiting a genuinely
+> data-sparse region of chemical space fools all five identically.
 
 Reported at a fixed 500 K target instead, for comparability with the paper's Figure S10 protocol:
 **TP = 31.5%** within 500 ± 50 K. That figure answers a different question than the table above, and the
