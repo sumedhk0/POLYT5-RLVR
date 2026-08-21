@@ -366,6 +366,30 @@ batch 16, lr 3e-4, wd 0.01, beam width 4), identical evaluation. Only the initia
 | **pretrained** | **medium** | **polyOne, 92.3 M** | **28.67 ± 0.76** | **44.45 ± 2.52** | **0.845 ± 0.018** | **0.923 ± 0.008** |
 | *paper reports* | *medium* | *withheld, 100.1 M* | *—* | *40.82 ± 1.33* | *0.86* | *0.93 ± 0.01* |
 
+#### Against the published external baselines
+
+The npj version adds model comparisons the preprint did not carry. They reframe our result: the question
+is not only "how close to polyT5" but "where does this sit among published chemical language models on the
+same task".
+
+| Model | Tg RMSE (K) |
+|---|---|
+| GPT-3.5, fine-tuned on PSMILES | 47.2 |
+| **our reproduction, medium @ 92.3 M** | **44.45 ± 2.52** |
+| polyT5-medium (the paper) | 40.82 ± 1.33 |
+| Llama-3, fine-tuned | 39.5 |
+| polyBART embeddings + Gaussian process regression | 39.9 |
+
+**Our reproduction beats fine-tuned GPT-3.5 and sits within ~4 K of polyT5, polyBART+GPR and Llama-3** —
+on substitute data, a substitute tokenizer, and a laptop GPU. That is a more useful statement of where we
+landed than "9% short of the paper".
+
+> **Label-noise floor, from the published Methods.** The thermal datasets "should be interpreted as
+> literature-reported values under varying conditions" — molecular weight, dispersity and measurement
+> protocol are not held constant. That is an irreducible error floor beneath every RMSE in this table, and
+> it bounds how much any method can improve. It also matters for Phase 3: it is noise the RLVR reward
+> inherits directly.
+
 **At matched scale we land close to the paper.** Our final configuration — polyT5-medium pretrained on
 92.3 M polymers, 92% of their corpus size — reaches RMSE **44.45** against their **40.82**, R² **0.845**
 against **0.860**, and Pearson r **0.923** against **0.930**. The residual gap is ~9% in RMSE, on
@@ -455,6 +479,21 @@ The paper's four nested filters, applied in order (SV ⊇ TSD ⊇ DD ⊇ PV), ov
 An earlier version of this table reported TSD at 100%; that run supplied **no novelty index**, so nothing
 could fail the filter. With the real training corpus indexed, 27 of 735 candidates (3.7%) turn out to be
 training-set members. Measuring novelty without a reference set measures nothing.
+
+> **PV pass rate is our clearest shortfall against the paper.** The published version reports **~80.6%**
+> of candidates passing PV at its medium optimum (6 epochs, T = 1.1, top_p = 0.75). Our best is **58.6%** —
+> a 22-point gap. This is the one place we fall short of a *published number* rather than merely differing
+> on substitute data, so it is worth naming plainly.
+>
+> The most likely cause is an axis we never swept. The paper tunes `(epochs, temperature, top_p)` jointly
+> and its optimum sits at **6 fine-tuning epochs**; our generation models were fine-tuned for 15, and the
+> sampling sweep varied only temperature and top_p against a single checkpoint. The paper also reports that
+> validity *improves* with fine-tuning epochs up to a point and then degrades into duplication — so 15
+> epochs may sit past that peak. Re-running the generation fine-tune with every-epoch checkpoint retention,
+> then sweeping the epoch axis, is the experiment that would close or explain this gap.
+>
+> For context the published version also reports polyBART at **86.7%** on analogous filters, so ~80% is
+> achievable rather than exceptional.
 
 #### Conditioning fidelity — the number RLVR has to beat
 

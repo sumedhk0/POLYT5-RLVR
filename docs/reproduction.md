@@ -394,11 +394,20 @@ enabled.
 | **medium** | **6** | **1.1** | **0.75** |
 | large | 8 | 1.1 | 0.95 |
 
-> ⚠️ **Correction to the project brief.** The brief cites "approximately 80.6% of candidates passing the
-> reported PV filter" for the medium configuration. The medium configuration `(6 epochs, T = 1.1,
-> top_p = 0.75)` **is** confirmed, but **no per-configuration pass-rate table is published** — those results
-> exist only as unlabeled heatmaps (Figures 4A, S7, S9, S10). We could not verify the 80.6% figure from the
-> paper text and therefore do not treat it as a reproduction target. See ambiguity register E-03.
+> ✅ **80.6% is real — and it is a reproduction target.** An earlier version of this document recorded the
+> brief's "approximately 80.6% of candidates passing the PV filter" as unverifiable. That was correct for
+> the **arXiv preprint**, which publishes per-configuration results only as unlabeled heatmaps (Figures 4A,
+> S7, S9, S10). The **published npj version states it outright**:
+>
+> > "the best balance we observed for POLYT5-medium was obtained at 6 fine-tuning epochs with top_p=0.75
+> > and a sampling temperature of T = 1.1, yielding **~80.6% of generated candidates passing the PV filter**."
+>
+> So PV pass rate is a quotable target after all. **Ours is 58.6%** at our best configuration — a 22-point
+> gap, and the first place our reproduction falls clearly short of a published number rather than merely
+> differing on substitute data. The most likely cause is the axis we never swept: the paper tunes
+> `(epochs, temperature, top_p)` jointly and its optimum sits at **6 fine-tuning epochs**, while our
+> generation models were fine-tuned for 15 and only a few epoch checkpoints were retained. See
+> `docs/baseline.md`.
 
 `[PAPER]` Qualitative trade-offs the paper does state: more fine-tuning epochs first reduces invalid
 candidates but eventually increases duplicates (pronounced for medium/large); higher temperature increases
