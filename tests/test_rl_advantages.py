@@ -38,3 +38,22 @@ def test_better_than_average_is_positive():
 def test_rejects_ragged_input():
     with pytest.raises(ValueError, match="multiple"):
         group_advantages(np.zeros(7), group_size=4)
+
+
+def test_advantages_are_scaled_by_group_spread():
+    """A mean-centring-only implementation passes every other test in this file.
+
+    Groups [0,1,0,1] and [0,10,0,10] have the same shape but 10x different
+    spread. Dividing by the group standard deviation maps both to the same
+    +/-1 magnitudes; merely subtracting the group mean would leave them 10x
+    apart. This is what makes these advantages rather than raw deviations.
+    """
+    narrow = group_advantages(np.array([0.0, 1.0, 0.0, 1.0]), group_size=4)
+    wide = group_advantages(np.array([0.0, 10.0, 0.0, 10.0]), group_size=4)
+    assert np.allclose(narrow, wide, atol=1e-6)
+    assert np.allclose(np.abs(narrow), 1.0, atol=1e-6)
+
+
+def test_rejects_non_positive_group_size():
+    with pytest.raises(ValueError, match="group_size"):
+        group_advantages(np.zeros(4), group_size=0)
