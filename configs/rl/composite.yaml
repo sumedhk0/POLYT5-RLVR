@@ -10,6 +10,7 @@ reward:
   tolerance: 100.0        # Kelvin at which the tg term's closeness reaches zero
   sigma0: 17.0            # observed mean ensemble disagreement
   sa_max: 6.0             # unused by this arm; kept so configs stay comparable
+  window_tolerance: 50.0  # unused by this arm; kept so configs stay comparable
   novelty_index: artifacts/novelty/tg_generation_train  # required: novelty term needs it
   weights:                # CompositeArm.weights; DEFAULT_COMPOSITE_WEIGHTS
     tg: 1.0

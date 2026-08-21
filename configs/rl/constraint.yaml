@@ -7,9 +7,10 @@ seed: 0
 baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
 
 reward:
-  tolerance: 50.0         # Tg window half-width, Kelvin (constraint_reward's in_window test)
+  tolerance: 100.0        # unused by this arm (ConstraintArm never calls tg_reward); kept so configs stay comparable
   sigma0: 17.0            # unused by this arm; kept so configs stay comparable
   sa_max: 6.0             # maximum acceptable SA score (constraint_reward's synthesisable test)
+  window_tolerance: 50.0  # Tg window half-width, Kelvin (constraint_reward's in_window test)
   novelty_index: artifacts/novelty/tg_generation_train  # required: novel test needs it
 
 train:

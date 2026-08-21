@@ -11,6 +11,7 @@ reward:
   tolerance: 100.0        # unused by this arm; kept so configs stay comparable
   sigma0: 17.0            # unused by this arm; kept so configs stay comparable
   sa_max: 6.0             # unused by this arm; kept so configs stay comparable
+  window_tolerance: 50.0  # unused by this arm; kept so configs stay comparable
   novelty_index: artifacts/novelty/tg_generation_train  # required: TSD stage needs it
 
 train:

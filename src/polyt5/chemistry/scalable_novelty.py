@@ -109,6 +109,7 @@ __all__ = [
     "hash64",
     "hash64_for_space",
     "hash64_many",
+    "index_paths",
 ]
 
 #: The three string spaces an index may be built in. ``canonical_psmiles`` is
@@ -327,7 +328,7 @@ def _sort_unique(hashes: np.ndarray) -> np.ndarray:
     return array[keep]
 
 
-def _index_paths(path: str | Path) -> tuple[Path, Path]:
+def index_paths(path: str | Path) -> tuple[Path, Path]:
     """Return the ``(data, metadata)`` paths for an index location.
 
     Accepts the stem (``.../train_index``) or either component file, so a
@@ -619,7 +620,7 @@ class ScalableNoveltyIndex:
             ValueError: If the file size is not a whole number of entries or
                 disagrees with the metadata.
         """
-        data_path, meta_path = _index_paths(path)
+        data_path, meta_path = index_paths(path)
         if not data_path.exists():
             raise FileNotFoundError(f"no novelty index array at {data_path}")
         if not meta_path.exists():
@@ -656,7 +657,7 @@ class ScalableNoveltyIndex:
         Returns:
             The path of the written ``.u64`` array.
         """
-        data_path, meta_path = _index_paths(path)
+        data_path, meta_path = index_paths(path)
         data_path.parent.mkdir(parents=True, exist_ok=True)
         array = self._array()
 

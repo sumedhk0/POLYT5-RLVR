@@ -65,6 +65,7 @@ from .scalable_novelty import (
     ScalableNoveltyIndex,
     hash64,
     hash64_many,
+    index_paths,
 )
 from .validity import ValidityResult, selfies_reproducible, validate_pselfies, validate_psmiles
 
@@ -90,6 +91,7 @@ __all__ = [
     "evaluate_generations",
     "hash64",
     "hash64_many",
+    "index_paths",
     "is_same_polymer",
     "novelty_rate",
     "pselfies_to_psmiles",

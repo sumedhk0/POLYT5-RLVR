@@ -589,3 +589,80 @@ def test_train_grpo_cli_help_runs():
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0
     assert "--arm" in result.stdout
+
+
+def test_compare_arms_cli_help_runs():
+    result = subprocess.run([sys.executable, str(REPO / "scripts/compare_arms.py"), "--help"],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0
+    assert "--allow-missing-novelty-index" in result.stdout
+
+
+def test_train_resumes_from_start_step(tmp_path, monkeypatch):
+    """``train(start_step=N)`` must run steps N..max_steps-1, not 0..max_steps-1
+    -- a step's RNG is derived from ``(seed, step_index)`` alone (see the
+    module docstring), so restarting at ``step_index 0`` would silently
+    replay the exact rollouts a resumed checkpoint already trained on.
+
+    This is the mechanism ``scripts/train_grpo.py --resume`` relies on
+    (finding 13: the script no longer duplicates ``GRPOTrainer.train``'s
+    cadence in its own ``run_remaining_steps``; it calls
+    ``trainer.train(start_step=...)`` directly), so this test is also the
+    coverage for "resume's step offset".
+    """
+    from polyt5.utils import RunDirectory
+
+    policy, tok = _tiny()
+    reference, _ = _tiny()
+    reference.load_state_dict(policy.state_dict())
+    run_dir = RunDirectory.create(tmp_path, "grpo_resume")
+
+    trainer = GRPOTrainer(
+        policy=policy, reference=reference, tokenizer=tok,
+        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        config=GRPOTrainerConfig(group_size=2, prompts_per_step=2, max_length=16,
+                                 device="cpu", seed=0, max_steps=3, log_every=1,
+                                 save_every=1),
+        run_dir=run_dir,
+    )
+
+    seen_step_indices: list[int] = []
+    real_step = trainer.step
+
+    def spy(step_index):
+        seen_step_indices.append(step_index)
+        return real_step(step_index)
+
+    monkeypatch.setattr(trainer, "step", spy)
+    result = trainer.train(start_step=2)
+
+    assert seen_step_indices == [2]
+    assert result["num_steps"] == 1
+    checkpoints = list(run_dir.checkpoints.glob("*.pt"))
+    assert len(checkpoints) == 1, checkpoints
+    assert checkpoints[0].name == "step_000003.pt", checkpoints[0].name
+
+
+def test_train_start_step_zero_is_unchanged_from_before_the_parameter_existed(tmp_path):
+    """``start_step`` defaults to 0 and must run every step, exactly the
+    behaviour ``.train()`` had before this parameter was added.
+    """
+    from polyt5.utils import RunDirectory
+
+    policy, tok = _tiny()
+    reference, _ = _tiny()
+    reference.load_state_dict(policy.state_dict())
+    run_dir = RunDirectory.create(tmp_path, "grpo_default_start")
+
+    trainer = GRPOTrainer(
+        policy=policy, reference=reference, tokenizer=tok,
+        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        config=GRPOTrainerConfig(group_size=2, prompts_per_step=2, max_length=16,
+                                 device="cpu", seed=0, max_steps=2, log_every=1,
+                                 save_every=1),
+        run_dir=run_dir,
+    )
+    result = trainer.train()
+    assert result["num_steps"] == 2
+    checkpoints = list(run_dir.checkpoints.glob("*.pt"))
+    assert len(checkpoints) == 2, checkpoints

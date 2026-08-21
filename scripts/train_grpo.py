@@ -39,7 +39,7 @@ from polyt5.rewards import DEFAULT_SIGMA0, TgRewardConfig, build_arm  # noqa: E4
 from polyt5.rl import GRPOTrainer, GRPOTrainerConfig  # noqa: E402
 from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE  # noqa: E402
 from polyt5.tokenization import PolyT5Tokenizer  # noqa: E402
-from polyt5.training import load_checkpoint, save_checkpoint  # noqa: E402
+from polyt5.training import load_checkpoint  # noqa: E402
 from polyt5.utils import (  # noqa: E402
     RunDirectory,
     get_logger,
@@ -129,7 +129,8 @@ def load_frozen_baseline(path: Path) -> dict[str, Any]:
             "unrecorded baseline; run the Phase 1/2 pipeline and freeze it first."
         )
     frozen = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("artifacts", "reward_ensemble", "auditor"):
+    for key in ("artifacts", "reward_ensemble", "auditor", "evaluation_protocol",
+                "success_criterion"):
         if key not in frozen:
             raise KeyError(f"frozen baseline at {path} is missing required key {key!r}")
     if frozen["auditor"] in frozen["reward_ensemble"]:
@@ -225,15 +226,47 @@ def build_reward_ensemble(
     )
 
 
-def build_reward_arm(arm_name: str, cfg: dict[str, Any]):
+#: Sentinel distinguishing "no override was given" (resolve the index from
+#: ``cfg`` as before) from "the override IS None" (use no index at all, e.g.
+#: ``scripts/compare_arms.py --allow-missing-novelty-index``). Plain ``None``
+#: cannot serve as that sentinel because it is also the deliberate override
+#: value in the second case -- using it for both would make the second case
+#: fall through to re-opening ``cfg``'s path, which is exactly the file the
+#: caller already established is missing.
+_NO_NOVELTY_INDEX_OVERRIDE = object()
+
+
+def build_reward_arm(
+    arm_name: str, cfg: dict[str, Any], *, novelty_index: Any = _NO_NOVELTY_INDEX_OVERRIDE
+):
     """Construct the reward arm from a resolved config's ``reward`` block.
 
     Args:
         arm_name: One of :data:`ARMS`.
         cfg: The fully-resolved run config.
+        novelty_index: Pre-opened novelty index to use instead of opening one
+            from ``cfg["reward"]["novelty_index"]``. Passed by
+            ``scripts/compare_arms.py`` so that every arm it scores shares
+            the exact same (already SHA-256-recorded) index object rather
+            than each opening its own file handle on the same path. Pass
+            ``None`` explicitly (not the default) to force "no index" without
+            attempting to open ``cfg``'s path at all -- see
+            :data:`_NO_NOVELTY_INDEX_OVERRIDE`.
 
     Returns:
         An :class:`~polyt5.rewards.ArmReward`.
+
+    Note:
+        ``reward.tolerance`` and ``reward.window_tolerance`` are deliberately
+        SEPARATE keys, not one key doing double duty: ``tolerance`` feeds
+        :class:`~polyt5.rewards.TgRewardConfig` (the Kelvin at which the tg
+        term's continuous closeness reaches zero, spec Sec 4.2, default
+        100.0), while ``window_tolerance`` feeds ``_BaseArm.tolerance`` --
+        concretely, only :class:`~polyt5.rewards.composite.ConstraintArm`
+        reads it, as C4's in-window half-width (spec Sec 4.3, default 50.0).
+        The two were previously the same key with two different defaults,
+        which could not be set independently and read as a mistake even
+        though no arm actually consumed both meanings at once.
     """
     reward_cfg = cfg.get("reward", {})
     tg_config = TgRewardConfig(
@@ -241,13 +274,17 @@ def build_reward_arm(arm_name: str, cfg: dict[str, Any]):
         sigma0=float(reward_cfg.get("sigma0", DEFAULT_SIGMA0)),
     )
     kwargs: dict[str, Any] = {
-        "tolerance": float(reward_cfg.get("tolerance", 50.0)),
+        "tolerance": float(reward_cfg.get("window_tolerance", 50.0)),
         "sa_max": float(reward_cfg.get("sa_max", 6.0)),
         "tg_config": tg_config,
     }
     if arm_name in ARMS_NEEDING_NOVELTY_INDEX:
-        index_path = _resolve(reward_cfg.get("novelty_index", DEFAULT_NOVELTY_INDEX))
-        kwargs["novelty_index"] = ScalableNoveltyIndex.open(index_path)
+        if novelty_index is not _NO_NOVELTY_INDEX_OVERRIDE:
+            # Explicit override, including None -- never re-derive from cfg.
+            kwargs["novelty_index"] = novelty_index
+        else:
+            index_path = _resolve(reward_cfg.get("novelty_index", DEFAULT_NOVELTY_INDEX))
+            kwargs["novelty_index"] = ScalableNoveltyIndex.open(index_path)
     if arm_name == "composite":
         weights = reward_cfg.get("weights")
         if weights is not None:
@@ -255,16 +292,20 @@ def build_reward_arm(arm_name: str, cfg: dict[str, Any]):
     return build_arm(arm_name, **kwargs)
 
 
-def build_trainer_config(cfg: dict[str, Any], *, seed: int, device_override: str | None,
-                          max_steps_override: int | None) -> GRPOTrainerConfig:
-    """Build a :class:`GRPOTrainerConfig` from a resolved config's ``train`` block."""
+def build_trainer_config(cfg: dict[str, Any], *, seed: int,
+                          device_override: str | None) -> GRPOTrainerConfig:
+    """Build a :class:`GRPOTrainerConfig` from a resolved config's ``train`` block.
+
+    ``--max-steps`` has no separate parameter here: it is folded into
+    ``cfg["train"]["max_steps"]`` by :func:`main` before this is called (via
+    the same ``overrides`` dict ``--set`` uses), so there is exactly one
+    mechanism for overriding it, not two.
+    """
     train_cfg = cfg.get("train", {})
-    max_steps = max_steps_override if max_steps_override is not None else \
-        int(train_cfg.get("max_steps", 2000))
     return GRPOTrainerConfig(
         group_size=int(train_cfg.get("group_size", 16)),
         prompts_per_step=int(train_cfg.get("prompts_per_step", 32)),
-        max_steps=max_steps,
+        max_steps=int(train_cfg.get("max_steps", 2000)),
         max_length=int(train_cfg.get("max_length", 200)),
         target_min=float(train_cfg.get("target_min", 250.0)),
         target_max=float(train_cfg.get("target_max", 600.0)),
@@ -300,57 +341,10 @@ def _latest_checkpoint(path: Path) -> Path:
     if path.is_file():
         return path
     checkpoints_dir = path / "checkpoints" if (path / "checkpoints").is_dir() else path
-    candidates = sorted(checkpoints_dir.glob("*.pt"))
+    candidates = sorted(checkpoints_dir.glob("step_*.pt"))
     if not candidates:
         raise FileNotFoundError(f"--resume {path}: no checkpoints found under {checkpoints_dir}")
     return candidates[-1]
-
-
-def run_remaining_steps(
-    trainer: GRPOTrainer, start_step: int, logger
-) -> dict[str, Any]:
-    """Run ``trainer.step`` from ``start_step`` through ``config.max_steps - 1``.
-
-    Mirrors :meth:`GRPOTrainer.train`'s logging/checkpointing cadence exactly
-    (see its docstring), the only difference being the starting step index --
-    :meth:`GRPOTrainer.train` always starts at 0, which would replay the same
-    rollouts a resumed run already trained on (a step's RNG is seeded from
-    ``(config.seed, step_index)`` alone).
-
-    Args:
-        trainer: A constructed trainer, already loaded with resumed weights.
-        start_step: 0-based step index to resume at (i.e. the number of steps
-            already completed).
-        logger: Logger for per-step progress.
-
-    Returns:
-        ``{"num_steps": int, "history": list[dict]}`` for the steps actually run.
-    """
-    cfg = trainer.config
-    history: list[dict[str, float]] = []
-    for step_index in range(start_step, cfg.max_steps):
-        stats = trainer.step(step_index)
-        history.append(stats)
-        completed = step_index + 1
-        is_final = completed == cfg.max_steps
-        logger.info("step %d/%d reward=%.4f kl=%.4f loss=%.4f", completed, cfg.max_steps,
-                    stats["reward_mean"], stats["kl"], stats["loss"])
-        if trainer.run_dir is not None:
-            if completed % cfg.log_every == 0 or is_final:
-                trainer.run_dir.log_metrics({"step": completed, **stats})
-            if completed % cfg.save_every == 0 or is_final:
-                save_checkpoint(
-                    trainer.run_dir.checkpoints / f"step_{completed:06d}.pt",
-                    model=trainer.policy,
-                    optimizer=trainer.optimizer,
-                    epoch=0,
-                    global_step=completed,
-                    config={"grpo": asdict(cfg)},
-                    model_config=trainer.policy.config.to_dict(),
-                    tokenizer_sha256=trainer.tokenizer.sha256,
-                    train_metrics=stats,
-                )
-    return {"num_steps": max(0, cfg.max_steps - start_step), "history": history}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -428,9 +422,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
-    trainer_config = build_trainer_config(
-        cfg, seed=seed, device_override=str(device), max_steps_override=None
-    )
+    trainer_config = build_trainer_config(cfg, seed=seed, device_override=str(device))
 
     save_config(cfg, run_dir.config_path)
     run_dir.write_manifest({
@@ -469,10 +461,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("nothing to do: already at step %d >= max_steps %d",
                     start_step, trainer_config.max_steps)
         result = {"num_steps": 0, "history": []}
-    elif start_step > 0:
-        result = run_remaining_steps(trainer, start_step, logger)
     else:
-        result = trainer.train()
+        # start_step=0 (the common, non-resumed case) behaves exactly as
+        # before this parameter existed -- see GRPOTrainer.train's docstring.
+        result = trainer.train(start_step=start_step)
 
     logger.info("done: %d steps run, results in %s", result["num_steps"], run_dir.root)
     return 0

@@ -355,8 +355,8 @@ class GRPOTrainer:
         logprobs = torch.log_softmax(output.logits.float(), dim=-1)
         return logprobs.gather(2, sequences.unsqueeze(-1)).squeeze(-1)
 
-    def train(self) -> dict[str, Any]:
-        """Run ``config.max_steps`` steps, logging and checkpointing when a run dir is given.
+    def train(self, start_step: int = 0) -> dict[str, Any]:
+        """Run steps ``start_step .. config.max_steps - 1``, logging/checkpointing along the way.
 
         Logging and checkpointing cadence are both keyed off the number of
         COMPLETED steps (``step_index + 1``), so ``log_every`` and
@@ -365,12 +365,24 @@ class GRPOTrainer:
         -- a run that stops mid-cadence still logs and checkpoints its last
         weights rather than silently dropping them.
 
+        Args:
+            start_step: 0-based step index to start at. ``0`` (the default)
+                runs every step from the beginning, exactly as before this
+                parameter existed. A caller resuming from a checkpoint whose
+                ``global_step`` is ``N`` should pass ``start_step=N``: a
+                step's RNG is seeded from ``(config.seed, step_index)`` alone
+                (see the module docstring), so restarting at ``step_index 0``
+                would silently replay the exact rollouts the checkpoint
+                already trained on instead of continuing past them.
+
         Returns:
-            ``{"num_steps": int, "history": list[dict]}`` -- every step's stats,
-            in order.
+            ``{"num_steps": int, "history": list[dict]}`` -- ``num_steps`` is
+            the number of steps actually run (``max_steps - start_step``,
+            floored at 0), and ``history`` holds every one of those steps'
+            stats, in order.
         """
         history: list[dict[str, float]] = []
-        for step_index in range(self.config.max_steps):
+        for step_index in range(start_step, self.config.max_steps):
             stats = self.step(step_index)
             history.append(stats)
 
@@ -392,4 +404,4 @@ class GRPOTrainer:
                         train_metrics=stats,
                     )
 
-        return {"num_steps": self.config.max_steps, "history": history}
+        return {"num_steps": max(0, self.config.max_steps - start_step), "history": history}
