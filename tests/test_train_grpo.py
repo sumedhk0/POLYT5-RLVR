@@ -20,12 +20,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import train_grpo  # noqa: E402
 from train_grpo import (  # noqa: E402
     _latest_checkpoint,
     build_reward_arm,
     build_reward_ensemble,
+    check_reward_overrides,
     load_frozen_baseline,
     sha256_of_file,
+    summarize_reward_overrides,
     verify_artifact,
 )
 
@@ -323,3 +326,114 @@ def test_every_shipped_arm_config_declares_a_drift_block():
         assert "drift" in cfg, arm
         assert cfg["drift"]["enabled"] is True, arm
         assert int(cfg["drift"]["every"]) >= 1, arm
+
+
+# ------------------------------------------------- pinned reward overrides (item 2)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("sigma_unknown", 0.0),
+    ("sigma0", 1.0),
+    ("min_coverage", 0.0),
+])
+def test_check_reward_overrides_refuses_ruling_f_constants(key, value):
+    """The exact scenario the review named: ``--set reward.sigma_unknown=0.0``
+    would silently revert Ruling F (measured: a 1-of-4 candidate scores
+    1.0000 with sigma_unknown=0.0 vs 0.0683 at the pinned value). Must be
+    refused, not merely logged.
+    """
+    problems = check_reward_overrides({"reward": {key: value}})
+    assert problems, (key, value)
+    assert any(key in problem for problem in problems), problems
+
+
+def test_check_reward_overrides_allows_unpinned_reward_keys():
+    """tolerance/sa_max/window_tolerance/weights are design choices a
+    legitimate ablation might sweep -- not refused, only the three Ruling F
+    constants are.
+    """
+    overrides = {"reward": {"tolerance": 50.0, "sa_max": 4.0, "window_tolerance": 25.0,
+                            "weights": {"tg": 2.0}}}
+    assert check_reward_overrides(overrides) == []
+
+
+def test_check_reward_overrides_allows_no_reward_block():
+    assert check_reward_overrides({}) == []
+    assert check_reward_overrides({"train": {"max_steps": 10}}) == []
+
+
+def test_check_reward_overrides_reports_every_pinned_key_touched():
+    problems = check_reward_overrides(
+        {"reward": {"sigma0": 1.0, "sigma_unknown": 0.0, "min_coverage": 1.0}})
+    assert len(problems) == 3
+
+
+def test_summarize_reward_overrides_records_canonical_and_overridden_values():
+    overrides = {"reward": {"tolerance": 50.0}}
+    canonical_cfg = {"reward": {"tolerance": 100.0, "sa_max": 6.0}}
+    record = summarize_reward_overrides(overrides, canonical_cfg)
+    assert record == {"tolerance": {"canonical": 100.0, "overridden_to": 50.0}}
+
+
+def test_summarize_reward_overrides_empty_when_no_reward_overrides():
+    assert summarize_reward_overrides({"train": {"max_steps": 10}}, {}) == {}
+    assert summarize_reward_overrides({}, {}) == {}
+
+
+def test_summarize_reward_overrides_never_includes_a_pinned_key_in_practice():
+    """Documents the invariant the two functions together maintain: by the
+    time summarize_reward_overrides would run in main(), check_reward_overrides
+    has already refused any pinned key, so main() never logs one as an
+    ordinary override. This test only pins summarize_reward_overrides' own
+    behaviour if it were ever called on a pinned key (it still records it --
+    the refusal is main()'s job, not this function's).
+    """
+    overrides = {"reward": {"sigma_unknown": 0.0}}
+    canonical_cfg = {"reward": {"sigma_unknown": 45.2}}
+    record = summarize_reward_overrides(overrides, canonical_cfg)
+    assert record == {"sigma_unknown": {"canonical": 45.2, "overridden_to": 0.0}}
+
+
+def test_main_refuses_a_set_that_would_revert_ruling_f(capsys, monkeypatch, tmp_path):
+    """Proves the exact scenario named in the review: an attempted
+    ``--set reward.sigma_unknown=0.0`` must exit 1 before anything is loaded
+    -- not even the config itself. ``load_config`` is replaced with a stub
+    that raises if called at all, so this fails loudly (not just quietly
+    returns the wrong thing) if the refusal gate is ever moved after it.
+    """
+    def _must_not_be_called(*_args, **_kwargs):
+        raise AssertionError("main() proceeded past the refusal -- load_config was called")
+
+    monkeypatch.setattr(train_grpo, "load_config", _must_not_be_called)
+
+    exit_code = train_grpo.main(["--arm", "accuracy", "--set", "reward.sigma_unknown=0.0"])
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "sigma_unknown" in captured.err
+    assert "Ruling F" in captured.err
+    assert not (tmp_path / "results").exists()
+
+
+def test_main_allows_a_set_on_an_unpinned_reward_key(monkeypatch, tmp_path):
+    """The non-refused half of item 2: an unpinned ``reward.*`` override must
+    still be allowed to proceed past the refusal gate, all the way to
+    building the run (config load, run-dir creation, manifest logging). This
+    stops the run right at ``load_frozen_baseline`` with a sentinel
+    exception that main()'s own error handling does NOT catch (only
+    ``FileNotFoundError``/``ValueError``/``KeyError`` are), so seeing it
+    propagate proves execution reached that far -- i.e. the unpinned
+    override was never refused.
+    """
+    sentinel = RuntimeError("stopped after load_frozen_baseline (by design)")
+
+    def _raise(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(train_grpo, "load_frozen_baseline", _raise)
+
+    with pytest.raises(RuntimeError, match="stopped after load_frozen_baseline"):
+        train_grpo.main([
+            "--arm", "accuracy", "--set", "reward.tolerance=50.0",
+            "--set", f"output.results_root={tmp_path}",
+        ])

@@ -431,6 +431,82 @@ def build_reward_arm(
     return build_arm(arm_name, **kwargs)
 
 
+#: ``reward.*`` keys Ruling F fixed to one correct, safety-critical value (see
+#: ``polyt5.rewards.tg``'s module docstring): together they are the
+#: substitution and coverage-fraction machinery that stops candidates the
+#: reward ensemble cannot parse from out-scoring candidates it agrees on
+#: (measured: a 1-of-4 candidate scored 1.0000 before the fix, 0.0683 after,
+#: at equal closeness). A ``--set reward.sigma_unknown=0.0`` silently reverts
+#: that fix -- nothing in a resolved ``config.yaml`` flags a value as
+#: "the one Ruling F picked" versus "an ordinary tuning knob". These three are
+#: refused outright rather than merely logged: unlike ``tolerance``/``sa_max``/
+#: ``window_tolerance``/``weights``, which are design choices a legitimate
+#: ablation might sweep, these three have one correct value, matched by every
+#: shipped ``configs/rl/*.yaml`` to ``polyt5.rewards.tg.DEFAULT_SIGMA0`` /
+#: ``DEFAULT_SIGMA_UNKNOWN`` / ``DEFAULT_MIN_COVERAGE``, and the entire point
+#: of fixing them was that they cannot be quietly changed back per-run.
+PINNED_REWARD_PARAMS: frozenset[str] = frozenset({"sigma0", "sigma_unknown", "min_coverage"})
+
+
+def check_reward_overrides(overrides: dict[str, Any]) -> list[str]:
+    """Refuse a ``--set`` that would touch one of Ruling F's pinned reward constants.
+
+    Args:
+        overrides: The parsed ``--set`` / ``--max-steps`` overrides dict,
+            BEFORE merging into the resolved config -- this must run before
+            ``load_config`` so a refusal happens before anything is loaded.
+
+    Returns:
+        Human-readable refusal reasons, one per pinned parameter touched.
+        Empty means none of :data:`PINNED_REWARD_PARAMS` were touched.
+    """
+    reward_overrides = overrides.get("reward")
+    if not isinstance(reward_overrides, dict):
+        return []
+    problems: list[str] = []
+    for key in sorted(PINNED_REWARD_PARAMS & set(reward_overrides)):
+        problems.append(
+            f"reward.{key}={reward_overrides[key]!r} is refused -- {key} is one of Ruling F's "
+            "pinned reward constants and overriding it would silently change what the reward "
+            "ensemble optimizes (see PINNED_REWARD_PARAMS)."
+        )
+    return problems
+
+
+def summarize_reward_overrides(
+    overrides: dict[str, Any], canonical_cfg: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Build an explicit before/after record of any ``--set reward.*`` override actually applied.
+
+    Not refused (see :func:`check_reward_overrides` for the three that are),
+    but a pre-registered reward's whole value is that a reader cannot miss
+    when one of its knobs was moved for this particular run -- so every
+    ``reward.*`` override this run applies is recorded here, not only the
+    pinned ones, and the caller writes the result into both the run manifest
+    and a log line.
+
+    Args:
+        overrides: The parsed ``--set`` overrides dict.
+        canonical_cfg: The SAME config file loaded with no overrides, i.e.
+            what this run would have used had ``--set`` said nothing about
+            ``reward``. The comparison baseline, not a hard-coded default --
+            so this also catches overriding a key that already differs from
+            ``polyt5.rewards.tg``'s own defaults in a custom ``--config``.
+
+    Returns:
+        ``{key: {"canonical": ..., "overridden_to": ...}}`` for every
+        ``reward.*`` key this run's overrides touch. Empty when none do.
+    """
+    reward_overrides = overrides.get("reward")
+    if not isinstance(reward_overrides, dict):
+        return {}
+    canonical_reward = canonical_cfg.get("reward", {})
+    return {
+        key: {"canonical": canonical_reward.get(key), "overridden_to": value}
+        for key, value in reward_overrides.items()
+    }
+
+
 def build_trainer_config(cfg: dict[str, Any], *, seed: int,
                           device_override: str | None) -> GRPOTrainerConfig:
     """Build a :class:`GRPOTrainerConfig` from a resolved config's ``train`` block.
@@ -527,6 +603,22 @@ def main(argv: list[str] | None = None) -> int:
         train_overrides["max_steps"] = args.max_steps
         overrides = {**overrides, "train": train_overrides}
 
+    # Refused BEFORE anything is loaded, not merely logged after the fact --
+    # see PINNED_REWARD_PARAMS. A `--set reward.sigma_unknown=0.0` must not
+    # be able to silently revert Ruling F.
+    reward_override_problems = check_reward_overrides(overrides)
+    if reward_override_problems:
+        print(
+            "ERROR: refusing to start -- " + "; ".join(reward_override_problems) + "\n"
+            "These are safety-critical constants pinned by Ruling F, not tunable knobs; their "
+            "whole value is that they cannot be changed after the fact by a per-run flag. If "
+            "the constant itself must legitimately change, edit polyt5.rewards.tg."
+            "DEFAULT_SIGMA0 / DEFAULT_SIGMA_UNKNOWN / DEFAULT_MIN_COVERAGE directly -- that "
+            "changes every arm's default in one visible diff instead of one silent override.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         cfg = load_config(config_path, overrides=overrides)
     except FileNotFoundError as error:
@@ -540,6 +632,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.novelty_index is not None:
         cfg.setdefault("reward", {})["novelty_index"] = str(args.novelty_index)
 
+    # Not refused (see check_reward_overrides for what is), but a reader must
+    # not be able to miss when a reward.* knob was moved for this particular
+    # run -- compared against the SAME file with no overrides applied.
+    canonical_cfg = load_config(config_path)
+    reward_override_record = summarize_reward_overrides(overrides, canonical_cfg)
+
     seed = int(cfg.get("seed", 0))
     seed_everything(seed)
 
@@ -547,6 +645,10 @@ def main(argv: list[str] | None = None) -> int:
                                   cfg.get("experiment_name") or f"grpo_{args.arm}")
     logger = get_logger("polyt5.train_grpo", log_file=run_dir.logs / "train_grpo.log")
     logger.info("arm=%s config=%s run_dir=%s", args.arm, config_path, run_dir.root)
+    if reward_override_record:
+        logger.warning(
+            "reward parameter override(s) active for this run -- differs from the canonical "
+            "%s: %s", config_path, reward_override_record)
 
     try:
         frozen = load_frozen_baseline(_resolve(cfg["baseline"]))
@@ -595,6 +697,11 @@ def main(argv: list[str] | None = None) -> int:
         "auditor_loaded_for_drift_monitoring": drift_monitor is not None,
         "reward_ensemble_size": len(predictor),
         "device": str(device),
+        # Loud, unmistakable record of any --set reward.* override this run
+        # actually applied (see summarize_reward_overrides) -- empty when
+        # none did. The three parameters Ruling F pins are refused outright,
+        # earlier in main(), and never reach here.
+        "reward_parameter_overrides": reward_override_record,
     })
     logger.info("reward ensemble: %s (%d members; auditor %r excluded from every reward path)",
                 frozen["reward_ensemble"], len(predictor), frozen["auditor"])
