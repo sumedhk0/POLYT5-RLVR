@@ -12,8 +12,6 @@ from polyt5.chemistry.validity import validate_pselfies
 from polyt5.evaluation import has_valid_termini
 from polyt5.rewards.base import RewardResult
 
-_PASS = RewardResult(value=1.0, components={"validity": 1.0}, gated=False)
-
 
 def validity_gate(pselfies: str, *, expected_termini: int = 2) -> RewardResult:
     """Return a passing result, or a gated zero with a reason.
@@ -35,6 +33,6 @@ def validity_gate(pselfies: str, *, expected_termini: int = 2) -> RewardResult:
         psmiles = pselfies_to_psmiles(pselfies)
         if psmiles is None or not has_valid_termini(psmiles, expected=expected_termini):
             return RewardResult(0.0, {"validity": 0.0}, True, "terminus_valency")
-        return _PASS
+        return RewardResult(value=1.0, components={"validity": 1.0}, gated=False)
     except Exception:  # a reward must never crash a training step
         return RewardResult(0.0, {"validity": 0.0}, True, "exception")

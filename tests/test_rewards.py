@@ -25,6 +25,13 @@ def test_wrong_terminus_count_is_gated():
     assert "termin" in result.reason.lower()
 
 
+def test_double_bonded_terminus_fails_despite_correct_count():
+    result = validity_gate("[At][=C][At]")  # decodes to [At]C=[At]
+    assert result.gated is True
+    assert result.value == 0.0
+    assert result.reason == "terminus_valency"
+
+
 def test_gate_never_raises_on_adversarial_input():
     for junk in ["", "   ", "((((", "[At]" * 500, "\x00", "[C][Ring9][C]"]:
         result = validity_gate(junk)
