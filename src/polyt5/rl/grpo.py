@@ -57,8 +57,8 @@ def k3_kl(logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
     Returns:
         Per-element KL estimate, same shape as the inputs.
     """
-    log_ratio = ref_logprobs - logprobs
-    ratio = torch.exp(log_ratio.clamp(-20.0, 20.0))
+    log_ratio = (ref_logprobs - logprobs).clamp(-20.0, 20.0)
+    ratio = torch.exp(log_ratio)
     return ratio - log_ratio - 1.0
 
 

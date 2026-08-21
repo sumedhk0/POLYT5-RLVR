@@ -1,6 +1,8 @@
 # tests/test_rl_grpo.py
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -19,6 +21,22 @@ def _inputs(b=2, t=4):
 def test_k3_kl_is_non_negative_and_zero_at_identity():
     assert k3_kl(torch.zeros(3), torch.zeros(3)).abs().max() < 1e-6
     for delta in (-2.0, -0.5, 0.5, 2.0):
+        assert k3_kl(torch.zeros(5), torch.full((5,), delta)).min() >= -1e-6
+
+
+def test_k3_kl_is_non_negative_at_and_beyond_the_clamp_boundary():
+    """log_ratio is clamped to +/-20 before both exp() and the linear term.
+
+    A mutant that clamps only the exponential while leaving the raw,
+    unclamped log_ratio in the linear term stays positive until the raw
+    value exceeds exp(20) ~= 4.85e8 -- past that, ratio - log_ratio - 1
+    goes NEGATIVE because the (capped) exponential term can no longer
+    outrun the (uncapped) linear term. -25/25 sit just past the +/-20
+    clamp edge and stay positive either way, so they're kept as ordinary
+    regression coverage; 6e8/1e9 are the values that actually discriminate
+    the bug.
+    """
+    for delta in (-25.0, 25.0, 6e8, 1e9):
         assert k3_kl(torch.zeros(5), torch.full((5,), delta)).min() >= -1e-6
 
 
@@ -84,6 +102,30 @@ def test_masked_positions_are_ignored():
     assert not torch.isnan(l_half)
 
 
+def test_all_padding_row_does_not_produce_nan():
+    """A group can contain a fully-padded row (e.g. group_size > number of
+    real candidates); the token-count clamp exists for exactly this case.
+    Without it, an all-zero mask row divides 0/0 in that row's own
+    normalisation, and the resulting NaN survives the batch mean and
+    poisons the whole loss -- even though row 0 is entirely normal.
+    """
+    lp = torch.zeros(2, 4, requires_grad=True)
+    old = torch.zeros(2, 4)
+    ref = torch.zeros(2, 4)
+    adv = torch.tensor([1.0, -1.0])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]])
+    loss, stats = grpo_loss(lp, old, ref, adv, mask, config=GRPOConfig())
+    assert torch.isfinite(loss)
+    for value in stats.values():
+        assert math.isfinite(value)
+    # row 0 (all real, ratio == 1, advantage +1) is unaffected by row 1's
+    # padding: policy_loss == mean(-1.0, 0.0) == -0.5, and with identical
+    # logprobs/ref the KL term is exactly zero, so loss == -0.5 exactly.
+    assert loss.item() == pytest.approx(-0.5, abs=1e-6)
+    loss.backward()
+    assert lp.grad is not None and torch.isfinite(lp.grad).all()
+
+
 def test_length_normalisation_prevents_long_sequence_dominance():
     """Sequences run 4-200 tokens; without 1/|y| the gradient follows length."""
     short = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
@@ -103,3 +145,28 @@ def test_kl_penalty_increases_loss_when_policy_diverges():
     far_kl, _ = grpo_loss(lp, lp.detach(), torch.zeros(1, 3), torch.tensor([0.0]),
                           torch.ones(1, 3), config=GRPOConfig(kl_coef=1.0))
     assert far_kl > zero_kl
+
+
+def test_kl_coefficient_scales_the_kl_term_linearly():
+    """With zero advantage the policy term vanishes entirely, so the loss
+    IS exactly kl_coef * kl. A mutant that adds the KL term without the
+    coefficient (e.g. `loss = policy_loss + kl`) is indistinguishable from
+    a correct implementation at kl_coef=1.0 alone -- this pins an
+    intermediate coefficient where a dropped multiply becomes visible.
+
+    logprobs=1.0, ref_logprobs=0.0 -> log_ratio = ref - logprobs = -1.0,
+    k3 = exp(-1) - (-1) - 1 = exp(-1) ~= 0.367879.
+    """
+    lp = torch.full((1, 3), 1.0, requires_grad=True)
+    old = torch.zeros(1, 3)
+    ref = torch.zeros(1, 3)
+    adv = torch.tensor([0.0])
+    mask = torch.ones(1, 3)
+    expected_k3 = math.exp(-1.0)
+
+    loss_half, _ = grpo_loss(lp, old, ref, adv, mask, config=GRPOConfig(kl_coef=0.5))
+    loss_full, _ = grpo_loss(lp, old, ref, adv, mask, config=GRPOConfig(kl_coef=1.0))
+
+    assert loss_full.item() == pytest.approx(expected_k3, rel=1e-4)
+    assert loss_half.item() == pytest.approx(0.5 * expected_k3, rel=1e-4)
+    assert loss_half.item() == pytest.approx(0.5 * loss_full.item(), rel=1e-4)
