@@ -468,6 +468,19 @@ polymer chains".
 | 5 | Td − Tg > 100 K | 168,815 | 2.7 |
 | 6 | soluble in H₂O or EtOH | 21,457 | 0.3 |
 
+> **Version note: the published cascade differs from the preprint.** The npj version consolidates the two
+> melt-processing stages into one and adds a **`Td > Tm`** criterion, which changes the downstream counts:
+> melt processing 177,985 → 168,815 (two stages) becomes **149,274** (one stage), the final soluble set
+> 21,457 becomes **18,243**, and SR passes 3,978 (18.5%) become **3,142 (17.2%)**. We have not implemented
+> the cascade — it requires Td, Tm, Eg, ε and solubility models, and we have Tg only — but if it is ever
+> built, build it to the published version, including `Td > Tm`.
+>
+> Every *method-critical* specification is byte-identical between the two versions, verified directly
+> against both PDFs: the span-corruption parameters, the 458/199/100 vocabulary split, the 200-token
+> limit, batch 450, both fine-tuning recipes (30/15 epochs, batch 16, lr 3e−4, wd 0.01), and beam width 4.
+> The "up to 5 epochs" versus "two epochs" contradiction also survives into the published version, so
+> register entry E-02 stands.
+
 `[PAPER]` One candidate (a polyamide from glutaryl dichloride + 4,4′-diaminodiphenylmethane) was
 synthesized and measured: predicted vs measured Tg 483 / 472 K, Tm 603 / 543 K, Td 643 / 607 K, Eg 4.45 /
 4.53 eV (Eg vs HSE06 DFT).
