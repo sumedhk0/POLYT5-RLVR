@@ -51,6 +51,11 @@ def _imported_module_names(path: Path) -> list[str]:
     ``rewards/`` themselves never resolve to a supervised package, so they
     are irrelevant here; ``node.module`` is ``None`` for a bare
     ``from . import x`` and is skipped rather than crashing.
+
+    For ``from a.b import c`` BOTH ``a.b`` and ``a.b.c`` are recorded. Only
+    recording ``node.module`` would let ``from polyt5 import rl`` through the
+    guard -- it names the forbidden package in the alias, not the module --
+    which is exactly the evasion the review of Task 9 found.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     names: list[str] = []
@@ -59,6 +64,7 @@ def _imported_module_names(path: Path) -> list[str]:
             names.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
             names.append(node.module)
+            names.extend(f"{node.module}.{alias.name}" for alias in node.names)
     return names
 
 
@@ -103,3 +109,36 @@ def test_rl_package_itself_is_exempt_from_its_own_check():
     """
     assert "rl" not in SUPERVISED_PACKAGES
     assert "rewards" not in SUPERVISED_PACKAGES
+
+
+def test_checker_detects_the_from_package_import_module_form(tmp_path):
+    """``from polyt5 import rl`` must be caught, not just ``import polyt5.rl``.
+
+    The Task 9 review found this evasion: the forbidden package is named in
+    the ImportFrom's ALIAS, while ``node.module`` is only the harmless
+    ``polyt5``. A checker that reads ``node.module`` alone reports clean on a
+    real violation, which is the one failure mode a guard must not have.
+    """
+    source = tmp_path / "sneaky.py"
+    source.write_text("from polyt5 import rl\n", encoding="utf-8")
+    names = _imported_module_names(source)
+    assert "polyt5.rl" in names, names
+
+    source.write_text("from polyt5 import rewards as r\n", encoding="utf-8")
+    assert "polyt5.rewards" in _imported_module_names(source)
+
+
+def test_checker_does_not_flag_a_legitimate_sibling_name(tmp_path):
+    """Guard against over-correction: ``polyt5.rlvr_utils`` is not ``polyt5.rl``.
+
+    The prefix match must be on a dotted boundary, or closing the evasion
+    above would start failing on unrelated modules whose names merely begin
+    with the forbidden string -- the same unescaped-substring mistake the
+    plan's original grep made.
+    """
+    source = tmp_path / "innocent.py"
+    source.write_text("from polyt5 import rlvr_utils\n", encoding="utf-8")
+    names = _imported_module_names(source)
+    assert not any(
+        name == root or name.startswith(root + ".") for name in names for root in FORBIDDEN_ROOTS
+    ), names

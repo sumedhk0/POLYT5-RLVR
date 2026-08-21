@@ -14,13 +14,15 @@ Deliberately incremental — no large-scale training until the whole path is exe
 | **1** | Real polymers → chemistry → tokenizer → span corruption → batch → polyT5-small → forward → loss → backward → optimizer step → checkpoint → reload | ✅ done |
 | **2** | Real proxy corpus (PI1M) → full train/validation pipeline | ✅ done |
 | **3** | polyT5-small pretraining on the full PI1M corpus | ✅ done |
-| **4** | polyT5-medium pretraining on polyOne | 🔄 running |
-| **5** | Downstream Tg property prediction (beam-4, MAE/RMSE/R²; split 0 of 5 done) | ✅ done |
+| **4** | polyT5-medium pretraining on polyOne (92.3M sequences) | ✅ done |
+| **5** | Downstream Tg property prediction (beam-4, MAE/RMSE/R²; all 5 splits) | ✅ done |
 | **6** | Tg-conditioned generation | ✅ done |
-| **7** | Full published evaluation methodology (SV/TSD/DD/PV, SR, SA, novelty done; target-property error and sampling sweep outstanding) | 🔄 partial |
-| **8** | Freeze baseline; Arm A and Arm B measured and recorded | ⏳ |
+| **7** | Full published evaluation methodology (SV/TSD/DD/PV, SR, SA, novelty, target-property error, sampling sweep) | ✅ done |
+| **8** | Freeze baseline; Arm A and Arm B measured and recorded | ✅ done |
 
 Phase 3 (GRPO/RLVR, see [`rlvr_plan.md`](rlvr_plan.md)) begins only after Stage 8.
+Stage 8 is now satisfied, and the Phase 3 apparatus is implemented and tested.
+**No arm has been trained yet, so this document reports no RLVR result.**
 
 ## Hardware reality
 
