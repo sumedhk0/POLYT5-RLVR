@@ -51,6 +51,27 @@ def test_clipping_bounds_a_large_ratio():
     assert stats["clip_fraction"] == pytest.approx(1.0)
 
 
+def test_clipping_changes_the_loss_value_not_just_the_statistic():
+    """clip_fraction is computed alongside the loss, not from it.
+
+    A mutant with clipping stripped from the loss path still reports
+    clip_fraction == 1.0, so only the loss VALUE distinguishes the two.
+    ratio = exp(5) = 148.41; clipped to 1.2 the loss is -1.20, unclipped
+    it would be -148.41.
+    """
+    lp = torch.full((1, 3), 5.0, requires_grad=True)
+    zeros = torch.zeros(1, 3)
+    mask = torch.ones(1, 3)
+    cfg = GRPOConfig(clip_eps=0.2, kl_coef=0.0)
+
+    loss_pos, _ = grpo_loss(lp, zeros, zeros, torch.tensor([1.0]), mask, config=cfg)
+    assert loss_pos.item() == pytest.approx(-1.2, abs=1e-4)
+
+    # negative advantage: min() selects the UNCLIPPED term by design
+    loss_neg, _ = grpo_loss(lp, zeros, zeros, torch.tensor([-1.0]), mask, config=cfg)
+    assert loss_neg.item() == pytest.approx(148.4132, rel=1e-4)
+
+
 def test_masked_positions_are_ignored():
     lp, old, ref, adv, _ = _inputs()
     full = torch.ones(2, 4)
