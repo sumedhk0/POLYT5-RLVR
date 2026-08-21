@@ -94,11 +94,47 @@ class ValidityArm(_BaseArm):
     never got to keeps its default of 0.0, so the first-failed stage is always
     identifiable. This mirrors :func:`polyt5.evaluation.apply_filter_cascade`,
     adapted to the injected-index protocol (``is_novel``) reward workers use.
+
+    ``gated`` is reserved for structural failure (SV or PV) - the meaning it
+    carries everywhere else in this package (:func:`polyt5.rewards.validity.
+    validity_gate`, and every other arm's ``_prepare``), and what Task 7's
+    trainer reads as ``gated_fraction`` to diagnose how much of a rollout
+    batch is chemically invalid. A TSD or DD failure is perfectly valid
+    chemistry that simply misses this arm's reward, not structural invalidity,
+    so it sets ``value=0.0`` with ``gated=False`` and ``reason=None`` - the
+    same convention :class:`ConstraintArm` already uses for its own
+    conjunction failures - and the stage stays visible in ``components``.
+
+    Without an injected novelty index the TSD stage can never be evaluated,
+    and this package's fail-closed rule (a missing capability must never
+    inflate a reward) would then zero every candidate silently: every GRPO
+    group would have zero reward variance and the policy would receive no
+    gradient at all, with no error raised. The constructor therefore requires
+    ``novelty_index`` by default; pass ``require_novelty_index=False`` to
+    explicitly opt into treating a missing index as a TSD no-op (every SV
+    survivor passes straight to DD), matching
+    :func:`polyt5.evaluation.apply_filter_cascade`'s own behaviour when its
+    ``training_index`` is ``None``.
     """
+
+    def __init__(self, *, require_novelty_index: bool = True, **kw) -> None:
+        super().__init__(**kw)
+        if require_novelty_index and self.novelty_index is None:
+            raise ValueError(
+                "ValidityArm cannot evaluate the TSD stage without a novelty_index: with "
+                "none, TSD fails closed for every candidate (this package's rule - a missing "
+                "capability must never inflate a reward), so every candidate would score "
+                "0.0, every GRPO group would have zero reward variance, and the policy would "
+                "receive no gradient at all, with no error raised. Pass a novelty_index, or "
+                "pass require_novelty_index=False to explicitly opt into treating TSD as a "
+                "no-op (every SV survivor passes straight to DD)."
+            )
+        self.require_novelty_index = require_novelty_index
 
     def __call__(self, candidates, targets, predictions):
         out: list[RewardResult] = []
         seen_canonical: set[str] = set()
+        tsd_is_noop = self.novelty_index is None and not self.require_novelty_index
         for pselfies in candidates:
             verdict = validate_pselfies(pselfies)
             components = {"sv": float(verdict.valid), "tsd": 0.0, "dd": 0.0, "pv": 0.0}
@@ -108,16 +144,18 @@ class ValidityArm(_BaseArm):
                 continue
 
             canon = verdict.canonical_psmiles
-            novel = bool(novelty_reward(canon, self.novelty_index).value)
+            novel = True if tsd_is_noop else bool(
+                novelty_reward(canon, self.novelty_index).value
+            )
             components["tsd"] = float(novel)
             if not novel:
-                out.append(RewardResult(0.0, components, True, "not_novel"))
+                out.append(RewardResult(0.0, components))
                 continue
 
             first_occurrence = canon not in seen_canonical
             components["dd"] = float(first_occurrence)
             if not first_occurrence:
-                out.append(RewardResult(0.0, components, True, "duplicate"))
+                out.append(RewardResult(0.0, components))
                 continue
             seen_canonical.add(canon)
 

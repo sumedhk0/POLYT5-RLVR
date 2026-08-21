@@ -147,10 +147,14 @@ def test_validity_arm_is_binary():
 def test_validity_arm_tsd_stage_rejects_training_set_members():
     """A training-set member is a well-formed, non-duplicate polymer that
     must still score zero - TSD is a real stage of the cascade, not a
-    diagnostic-only component."""
+    diagnostic-only component. It is a reward miss, not structural
+    invalidity, so gated must stay False - Task 7's gated_fraction diagnostic
+    would otherwise misreport a healthy, chemically-valid batch as broken."""
     arm = build_arm("validity", novelty_index=_FakeIndex([VALID_CANONICAL]))
     out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
     assert out.value == 0.0
+    assert out.gated is False, "TSD failure is valid chemistry, not a structural gate"
+    assert out.reason is None
     assert out.components["sv"] == 1.0
     assert out.components["tsd"] == 0.0
     assert out.components["dd"] == 0.0, "DD is never reached once TSD has failed"
@@ -160,11 +164,14 @@ def test_validity_arm_tsd_stage_rejects_training_set_members():
 def test_validity_arm_dd_stage_rejects_within_batch_duplicates():
     """The first occurrence of a candidate passes; a later occurrence of the
     same polymer within the same batch must fail DD even though it is
-    individually valid and novel."""
+    individually valid and novel. Like TSD, this is a reward miss on valid
+    chemistry, not structural invalidity, so gated must stay False."""
     arm = build_arm("validity", novelty_index=_FakeIndex([]))
     out = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
     assert out[0].value == 1.0, "first occurrence clears the full cascade"
     assert out[1].value == 0.0, "second occurrence of the same polymer fails DD"
+    assert out[1].gated is False, "DD failure is valid chemistry, not a structural gate"
+    assert out[1].reason is None
     assert out[1].components["sv"] == 1.0
     assert out[1].components["tsd"] == 1.0, "still absent from the reference index"
     assert out[1].components["dd"] == 0.0
@@ -172,7 +179,9 @@ def test_validity_arm_dd_stage_rejects_within_batch_duplicates():
 
 
 def test_validity_arm_sv_stage_gates_invalid_structures():
-    """An unparseable structure fails at SV, before TSD/DD/PV ever run."""
+    """An unparseable structure fails at SV, before TSD/DD/PV ever run. This
+    IS structural invalidity, so gated stays True - the same meaning
+    validity_gate and every other arm give it."""
     arm = build_arm("validity", novelty_index=_FakeIndex([]))
     out = arm([INVALID], [500.0], [(500.0, 1.0, 4)])[0]
     assert out.value == 0.0
@@ -181,6 +190,27 @@ def test_validity_arm_sv_stage_gates_invalid_structures():
     assert out.components["tsd"] == 0.0
     assert out.components["dd"] == 0.0
     assert out.components["pv"] == 0.0
+
+
+def test_validity_arm_requires_a_novelty_index_by_default():
+    """Without an index, TSD would fail closed for every candidate, silently
+    collapsing every GRPO group to zero reward variance and zero gradient
+    with no error raised. Fail loudly at construction instead."""
+    with pytest.raises(ValueError, match="novelty_index"):
+        build_arm("validity")
+
+
+def test_validity_arm_opt_out_still_enforces_sv_dd_pv():
+    """A caller who explicitly opts out of requiring a novelty index gets a
+    working arm: TSD becomes a no-op pass, but SV, DD, and PV are still
+    enforced - the opt-out must not silently degenerate into "always 1.0"
+    either."""
+    arm = build_arm("validity", require_novelty_index=False)
+    out = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+    assert out[0].value == 1.0
+    assert out[0].components["tsd"] == 1.0, "TSD is a no-op without an index, not a failure"
+    assert out[1].value == 0.0, "DD still applies under the opt-out"
+    assert out[1].components["dd"] == 0.0
 
 
 def test_constraint_arm_requires_every_condition():
