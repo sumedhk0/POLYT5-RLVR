@@ -3,5 +3,6 @@
 from __future__ import annotations
 
 from polyt5.rl.advantages import group_advantages
+from polyt5.rl.grpo import GRPOConfig, grpo_loss, k3_kl
 
-__all__ = ["group_advantages"]
+__all__ = ["GRPOConfig", "grpo_loss", "group_advantages", "k3_kl"]
