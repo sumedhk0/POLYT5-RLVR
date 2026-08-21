@@ -78,7 +78,8 @@ def test_one_step_runs_end_to_end_and_changes_parameters(monkeypatch):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy", tg_config=TgRewardConfig(tolerance=1000.0)),
+        arm=build_arm("accuracy", ensemble_size=4,
+                      tg_config=TgRewardConfig(tolerance=1000.0)),
         predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=32,
                                  device="cpu", seed=0, learning_rate=1e-3),
@@ -104,7 +105,7 @@ def test_reference_policy_never_updates():
     ref_before = [p.detach().clone() for p in reference.parameters()]
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=32,
                                  device="cpu", seed=0),
     )
@@ -149,7 +150,7 @@ def test_step_is_deterministic_under_a_seed(monkeypatch):
         monkeypatch.setattr(trainer_mod, "sample_groups", spy)
 
         t = GRPOTrainer(policy=policy, reference=reference, tokenizer=tok,
-                        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+                        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
                         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2,
                                                  max_length=32, device="cpu", seed=11))
         stats = t.step(0)
@@ -189,7 +190,7 @@ def test_targets_are_sensitive_to_the_seed_not_just_reproducible(monkeypatch):
 
         monkeypatch.setattr(trainer_mod, "sample_groups", spy)
         t = GRPOTrainer(policy=policy, reference=reference, tokenizer=tok,
-                        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+                        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
                         config=GRPOTrainerConfig(group_size=1, prompts_per_step=4,
                                                  max_length=8, device="cpu", seed=seed))
         t.step(0)
@@ -206,7 +207,7 @@ def test_reward_hacking_canary_is_suppressed_by_the_confidence_gate():
     """
     from polyt5.rewards import build_arm as _build
 
-    arm = _build("accuracy")
+    arm = _build("accuracy", ensemble_size=4)
     confident = arm(["[At][C][C][O][At]"], [500.0], [(500.0, 2.0, 4)])[0].value
     uncertain = arm(["[At][C][C][O][At]"], [500.0], [(500.0, 45.0, 4)])[0].value
     assert confident > 2 * uncertain
@@ -216,7 +217,7 @@ def test_logs_weighted_and_unweighted_reward():
     policy, tok = _tiny()
     reference, _ = _tiny()
     trainer = GRPOTrainer(policy=policy, reference=reference, tokenizer=tok,
-                          arm=build_arm("accuracy"), predictor=_FakePredictor(),
+                          arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
                           config=GRPOTrainerConfig(group_size=4, prompts_per_step=2,
                                                    max_length=32, device="cpu", seed=0))
     stats = trainer.step(0)
@@ -255,7 +256,7 @@ def test_advantages_are_computed_per_group_not_over_the_flat_batch(monkeypatch):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0),
     )
@@ -317,7 +318,7 @@ def test_policy_logprobs_carry_gradient_and_are_not_the_reference_logprobs(monke
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0),
     )
@@ -344,7 +345,7 @@ def test_optimizer_step_is_actually_called(monkeypatch):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0),
     )
@@ -389,7 +390,7 @@ def test_gated_candidates_contribute_exactly_the_arms_own_gated_reward(monkeypat
 
     monkeypatch.setattr(trainer_mod, "sample_groups", fake_sample_groups)
 
-    arm = build_arm("accuracy")
+    arm = build_arm("accuracy", ensemble_size=4)
     expected_predictions = predictor.predict_with_uncertainty(forced_texts)
     expected_results = arm(forced_texts, forced_targets, expected_predictions)
     expected_reward_mean = float(np.mean([r.value for r in expected_results]))
@@ -398,7 +399,7 @@ def test_gated_candidates_contribute_exactly_the_arms_own_gated_reward(monkeypat
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(mean=500.0, std=2.0),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(mean=500.0, std=2.0),
         config=GRPOTrainerConfig(group_size=2, prompts_per_step=1, max_length=16,
                                  device="cpu", seed=0),
     )
@@ -425,7 +426,7 @@ def test_ratio_is_exactly_one_at_step_zero_when_policy_equals_reference():
     reference.load_state_dict(policy.state_dict())
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=32,
                                  device="cpu", seed=0),
     )
@@ -444,7 +445,7 @@ def test_reference_must_be_a_separate_object_from_policy():
     with pytest.raises(ValueError, match="[Ss]eparate"):
         GRPOTrainer(
             policy=policy, reference=policy, tokenizer=tok,
-            arm=build_arm("accuracy"), predictor=_FakePredictor(),
+            arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
             config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=16,
                                      device="cpu", seed=0),
         )
@@ -464,7 +465,7 @@ def test_decoder_start_token_id_mismatch_raises():
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0),
     )
@@ -494,7 +495,7 @@ def test_rollout_batch_size_is_forwarded_as_chunk_size(monkeypatch):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0, rollout_batch_size=3),
     )
@@ -517,7 +518,7 @@ def test_train_loop_always_checkpoints_the_final_step(tmp_path):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=2, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0, max_steps=3, log_every=10,
                                  save_every=10),
@@ -542,7 +543,7 @@ def test_train_loop_logs_and_checkpoints(tmp_path):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=2, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0, max_steps=2, log_every=1,
                                  save_every=1),
@@ -619,7 +620,7 @@ def test_train_resumes_from_start_step(tmp_path, monkeypatch):
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=2, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0, max_steps=3, log_every=1,
                                  save_every=1),
@@ -656,7 +657,7 @@ def test_train_start_step_zero_is_unchanged_from_before_the_parameter_existed(tm
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tok,
-        arm=build_arm("accuracy"), predictor=_FakePredictor(),
+        arm=build_arm("accuracy", ensemble_size=4), predictor=_FakePredictor(),
         config=GRPOTrainerConfig(group_size=2, prompts_per_step=2, max_length=16,
                                  device="cpu", seed=0, max_steps=2, log_every=1,
                                  save_every=1),

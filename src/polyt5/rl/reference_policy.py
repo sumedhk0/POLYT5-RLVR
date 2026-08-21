@@ -19,6 +19,7 @@ and the whole run would be silently wasted.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -37,6 +38,7 @@ class ReferencePolicy:
         model: PolyT5ForConditionalGeneration,
         *,
         device: str | torch.device = "cpu",
+        tokenizer: Any | None = None,
     ) -> None:
         """Freeze ``model`` in place and hold it for scoring.
 
@@ -48,6 +50,25 @@ class ReferencePolicy:
         Args:
             model: The model to freeze and wrap.
             device: Device to run scoring on.
+            tokenizer: The tokenizer whose ``decoder_start_token_id``
+                :func:`~polyt5.rl.rollout.sample_groups` actually shifted in
+                when it built the sequences this reference will score. When
+                given, it is the id :meth:`score` uses, and the reference
+                model's own ``config.decoder_start_token_id`` is asserted to
+                agree. This is the third consumer of the rule Task 7 applied to
+                :meth:`~polyt5.rl.trainer.GRPOTrainer._policy_logprobs` and
+                ``sample_groups`` -- "read it from the tokenizer, and assert
+                the model config agrees" -- and was the one it missed. ``None``
+                falls back to the model's own config, which is correct only
+                because the shipped path loads policy and reference from the
+                same checkpoint.
+
+        Raises:
+            ValueError: If ``tokenizer`` is given and its
+                ``decoder_start_token_id`` disagrees with the reference model's
+                config. A silent mismatch here shifts every position of
+                ``ref_logprobs`` by one token relative to the policy's, which
+                corrupts the KL anchor without raising anywhere.
         """
         self.device = torch.device(device)
         self.model = model.to(self.device)
@@ -55,12 +76,27 @@ class ReferencePolicy:
         for param in self.model.parameters():
             param.requires_grad_(False)
 
+        model_start = self.model.config.decoder_start_token_id
+        if tokenizer is not None and tokenizer.decoder_start_token_id != model_start:
+            raise ValueError(
+                "tokenizer.decoder_start_token_id "
+                f"({tokenizer.decoder_start_token_id}) != "
+                f"reference.config.decoder_start_token_id ({model_start}): sample_groups() "
+                "shifted in the tokenizer's start token when it built `sequences`, so scoring "
+                "them with a different one would silently desynchronise every position of the "
+                "KL anchor."
+            )
+        self.decoder_start_token_id = (
+            tokenizer.decoder_start_token_id if tokenizer is not None else model_start
+        )
+
     @classmethod
     def from_checkpoint(
         cls,
         path: str | Path,
         *,
         device: str | torch.device = "cpu",
+        tokenizer: Any | None = None,
     ) -> ReferencePolicy:
         """Build a frozen reference policy from a saved checkpoint.
 
@@ -68,6 +104,8 @@ class ReferencePolicy:
             path: Checkpoint written by
                 :func:`~polyt5.training.save_checkpoint`.
             device: Device to load and run the reference model on.
+            tokenizer: Forwarded to :meth:`__init__` -- see its
+                ``tokenizer`` argument for the decoder-start-token check.
 
         Returns:
             A :class:`ReferencePolicy` wrapping a freshly constructed model
@@ -77,7 +115,7 @@ class ReferencePolicy:
         config = PolyT5Config.from_dict(payload["model_config"])
         model = PolyT5ForConditionalGeneration(config)
         model.load_state_dict(payload["model_state"])
-        return cls(model, device=device)
+        return cls(model, device=device, tokenizer=tokenizer)
 
     @torch.no_grad()
     def score(self, sequences: Tensor, prompt_ids: Tensor, prompt_mask: Tensor) -> Tensor:
@@ -112,7 +150,7 @@ class ReferencePolicy:
         prompt_ids = prompt_ids.to(self.device)
         prompt_mask = prompt_mask.to(self.device)
 
-        decoder_start = self.model.config.decoder_start_token_id
+        decoder_start = self.decoder_start_token_id
         start = torch.full(
             (sequences.shape[0], 1), decoder_start, dtype=sequences.dtype, device=self.device
         )

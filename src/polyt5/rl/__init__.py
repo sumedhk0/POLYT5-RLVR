@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from polyt5.rl.advantages import group_advantages
+from polyt5.rl.drift import DriftMonitor
 from polyt5.rl.grpo import GRPOConfig, grpo_loss, k3_kl
 from polyt5.rl.reference_policy import ReferencePolicy
 from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE, RolloutBatch, sample_groups
@@ -13,6 +14,7 @@ __all__ = [
     "GRPOTrainer",
     "GRPOTrainerConfig",
     "ROLLOUT_CHUNK_SIZE",
+    "DriftMonitor",
     "ReferencePolicy",
     "RolloutBatch",
     "grpo_loss",
