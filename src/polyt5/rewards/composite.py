@@ -1,7 +1,12 @@
 """The four arms. Weights live in config, never in code.
 
-Every arm applies the validity gate first: a structure that is not a polymer
-earns nothing on any axis.
+Every arm rejects a structure that RDKit cannot parse before scoring anything
+else: a structure that is not a polymer earns nothing on any axis. Three arms
+(accuracy, composite, constraint) apply the combined SV+PV validity gate up
+front and score the rest of their terms only on survivors. ``ValidityArm`` is
+the exception: its whole job is to *measure* the paper's nested SV -> TSD ->
+DD -> PV cascade, so it checks SV first but defers PV until after TSD and DD,
+in the cascade's own order - see its docstring.
 """
 
 from __future__ import annotations
@@ -12,6 +17,8 @@ from typing import Any, Protocol
 from polyt5.chemistry.canonicalization import canonical_psmiles
 from polyt5.chemistry.conversion import pselfies_to_psmiles
 from polyt5.chemistry.metrics import synthetic_accessibility
+from polyt5.chemistry.validity import validate_pselfies
+from polyt5.evaluation import has_valid_termini
 from polyt5.rewards.base import RewardResult
 from polyt5.rewards.constraints import constraint_reward
 from polyt5.rewards.novelty import novelty_reward
@@ -70,17 +77,58 @@ class AccuracyArm(_BaseArm):
 
 
 class ValidityArm(_BaseArm):
-    """C2: binary - did the candidate survive the full filter cascade?"""
+    """C2: R = 1 only if the candidate clears the nested SV -> TSD -> DD -> PV
+    cascade; 0 otherwise.
+
+    Each stage runs only if every earlier stage passed:
+
+    * **SV** - RDKit parses and sanitizes the structure.
+    * **TSD** - absent from the injected reference index; a training-set
+      duplicate fails here even though it is a well-formed polymer.
+    * **DD** - first occurrence of its canonical form within this call's
+      batch; a later duplicate fails here even though the first copy passed.
+    * **PV** - exactly the expected number of termini, each with valency one.
+
+    ``components`` records the boolean outcome of every stage the candidate
+    actually reached (``sv``, ``tsd``, ``dd``, ``pv``); a stage the candidate
+    never got to keeps its default of 0.0, so the first-failed stage is always
+    identifiable. This mirrors :func:`polyt5.evaluation.apply_filter_cascade`,
+    adapted to the injected-index protocol (``is_novel``) reward workers use.
+    """
 
     def __call__(self, candidates, targets, predictions):
         out: list[RewardResult] = []
+        seen_canonical: set[str] = set()
         for pselfies in candidates:
-            gate, canon = self._prepare(pselfies)
-            if gate.gated:
-                out.append(gate)
+            verdict = validate_pselfies(pselfies)
+            components = {"sv": float(verdict.valid), "tsd": 0.0, "dd": 0.0, "pv": 0.0}
+
+            if not verdict.valid:
+                out.append(RewardResult(0.0, components, True, verdict.reason or "invalid"))
                 continue
-            novel = novelty_reward(canon, self.novelty_index).value
-            out.append(RewardResult(1.0, {"pv": 1.0, "novelty": novel}))
+
+            canon = verdict.canonical_psmiles
+            novel = bool(novelty_reward(canon, self.novelty_index).value)
+            components["tsd"] = float(novel)
+            if not novel:
+                out.append(RewardResult(0.0, components, True, "not_novel"))
+                continue
+
+            first_occurrence = canon not in seen_canonical
+            components["dd"] = float(first_occurrence)
+            if not first_occurrence:
+                out.append(RewardResult(0.0, components, True, "duplicate"))
+                continue
+            seen_canonical.add(canon)
+
+            pv = bool(verdict.correct_termini and has_valid_termini(canon))
+            components["pv"] = float(pv)
+            if not pv:
+                reason = verdict.reason if not verdict.correct_termini else "terminus_valency"
+                out.append(RewardResult(0.0, components, True, reason))
+                continue
+
+            out.append(RewardResult(1.0, components, False, None))
         return out
 
 

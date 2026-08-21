@@ -3,7 +3,17 @@ from __future__ import annotations
 
 import pytest
 
-from polyt5.rewards import RewardResult, TgRewardConfig, build_arm, tg_reward, validity_gate
+from polyt5.chemistry.canonicalization import canonical_psmiles
+from polyt5.chemistry.conversion import pselfies_to_psmiles
+from polyt5.chemistry.metrics import synthetic_accessibility
+from polyt5.rewards import (
+    RewardResult,
+    TgRewardConfig,
+    build_arm,
+    sa_reward,
+    tg_reward,
+    validity_gate,
+)
 
 
 def test_valid_polymer_passes_the_gate():
@@ -78,6 +88,12 @@ def test_non_finite_prediction_is_gated():
 VALID = "[At][C][C][O][At]"
 INVALID = "[Zz][Qq]"
 
+# The canonical PSMILES an arm actually looks up for VALID - computed the same
+# way _BaseArm._prepare / ValidityArm do, so a fake novelty index seeded with
+# this string is seeded with what the code under test really queries with,
+# not with the raw PSELFIES.
+VALID_CANONICAL = canonical_psmiles(pselfies_to_psmiles(VALID))
+
 
 class _FakeIndex:
     """Stands in for ScalableNoveltyIndex; 'known' PSELFIES are not novel."""
@@ -87,6 +103,24 @@ class _FakeIndex:
 
     def is_novel(self, psmiles):
         return psmiles not in self._known
+
+
+def test_sa_reward_normalises_and_fails_closed():
+    # SA=1 (easiest possible) -> full credit.
+    assert sa_reward(1.0, sa_max=6.0).value == pytest.approx(1.0)
+    # SA at the threshold -> zero credit, not partial credit.
+    assert sa_reward(6.0, sa_max=6.0).value == pytest.approx(0.0)
+    # SA past the threshold -> clamped to zero, not negative.
+    assert sa_reward(8.0, sa_max=6.0).value == 0.0
+    # No scorer available -> 0.0, NOT a pass: a missing capability must never
+    # inflate a reward.
+    r = sa_reward(None, sa_max=6.0)
+    assert r.value == 0.0
+    assert r.components == {"sa": 0.0}
+    # Hand-computed midpoint: (sa_max - score) / (sa_max - 1) = (6 - 3.5) / 5 = 0.5.
+    mid = sa_reward(3.5, sa_max=6.0)
+    assert mid.value == pytest.approx(0.5)
+    assert mid.components["sa_score"] == 3.5
 
 
 def test_accuracy_arm_uses_only_the_tg_term():
@@ -110,6 +144,45 @@ def test_validity_arm_is_binary():
     assert out[0].value == 1.0, "validity arm must ignore how wrong Tg is"
 
 
+def test_validity_arm_tsd_stage_rejects_training_set_members():
+    """A training-set member is a well-formed, non-duplicate polymer that
+    must still score zero - TSD is a real stage of the cascade, not a
+    diagnostic-only component."""
+    arm = build_arm("validity", novelty_index=_FakeIndex([VALID_CANONICAL]))
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 0.0
+    assert out.components["sv"] == 1.0
+    assert out.components["tsd"] == 0.0
+    assert out.components["dd"] == 0.0, "DD is never reached once TSD has failed"
+    assert out.components["pv"] == 0.0, "PV is never reached once TSD has failed"
+
+
+def test_validity_arm_dd_stage_rejects_within_batch_duplicates():
+    """The first occurrence of a candidate passes; a later occurrence of the
+    same polymer within the same batch must fail DD even though it is
+    individually valid and novel."""
+    arm = build_arm("validity", novelty_index=_FakeIndex([]))
+    out = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+    assert out[0].value == 1.0, "first occurrence clears the full cascade"
+    assert out[1].value == 0.0, "second occurrence of the same polymer fails DD"
+    assert out[1].components["sv"] == 1.0
+    assert out[1].components["tsd"] == 1.0, "still absent from the reference index"
+    assert out[1].components["dd"] == 0.0
+    assert out[1].components["pv"] == 0.0, "PV is never reached once DD has failed"
+
+
+def test_validity_arm_sv_stage_gates_invalid_structures():
+    """An unparseable structure fails at SV, before TSD/DD/PV ever run."""
+    arm = build_arm("validity", novelty_index=_FakeIndex([]))
+    out = arm([INVALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 0.0
+    assert out.gated is True
+    assert out.components["sv"] == 0.0
+    assert out.components["tsd"] == 0.0
+    assert out.components["dd"] == 0.0
+    assert out.components["pv"] == 0.0
+
+
 def test_constraint_arm_requires_every_condition():
     arm = build_arm("constraint", novelty_index=_FakeIndex([]),
                     tolerance=50.0, sa_max=6.0)
@@ -117,6 +190,34 @@ def test_constraint_arm_requires_every_condition():
     off_target = arm([VALID], [500.0], [(700.0, 2.0, 4)])[0].value
     assert on_target == 1.0
     assert off_target == 0.0, "conjunction: missing one condition scores zero"
+
+
+def test_constraint_arm_sa_leg_can_fail_alone():
+    """Tg on-target and novel, but not synthesisable, must still score zero -
+    otherwise an implementation could drop the SA leg and this suite would not
+    notice."""
+    actual_sa = synthetic_accessibility(VALID_CANONICAL)
+    assert actual_sa is not None, "SA scorer must be available for this test to mean anything"
+    arm = build_arm("constraint", novelty_index=_FakeIndex([]),
+                    tolerance=50.0, sa_max=actual_sa - 0.5)
+    out = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0]
+    assert out.value == 0.0
+    assert out.components["in_window"] == 1.0
+    assert out.components["novel"] == 1.0
+    assert out.components["synthesisable"] == 0.0
+
+
+def test_constraint_arm_novelty_leg_can_fail_alone():
+    """Tg on-target and synthesisable, but already in the reference set, must
+    still score zero - otherwise an implementation could drop the novelty leg
+    and this suite would not notice."""
+    arm = build_arm("constraint", novelty_index=_FakeIndex([VALID_CANONICAL]),
+                    tolerance=50.0, sa_max=6.0)
+    out = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0]
+    assert out.value == 0.0
+    assert out.components["in_window"] == 1.0
+    assert out.components["synthesisable"] == 1.0
+    assert out.components["novel"] == 0.0
 
 
 def test_composite_arm_weights_are_configurable_not_hardcoded():
