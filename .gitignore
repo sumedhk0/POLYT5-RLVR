@@ -24,6 +24,7 @@ artifacts/**/*.vocab
 *.safetensors
 runs/
 notebooks/*.ipynb_checkpoints
+.claude/
 
 # os / editors
 .DS_Store
@@ -39,3 +40,8 @@ pv_tree.json
 
 # derived novelty indices are rebuilt by scripts/build_novelty_index.py
 artifacts/novelty/*.u64
+
+# SDD scratch workspace
+.superpowers/
+
+polyt5-nature.pdf
