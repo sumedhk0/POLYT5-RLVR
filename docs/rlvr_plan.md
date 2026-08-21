@@ -1,15 +1,22 @@
 # Phase 3 plan: GRPO + RLVR extension
 
-> **⚠️ NOT IMPLEMENTED. NOT PART OF THE PUBLISHED polyT5 METHOD.**
+> **⚠️ APPARATUS IMPLEMENTED (Tasks 1–9). NO ARM HAS BEEN TRAINED YET. NOT PART OF THE PUBLISHED polyT5
+> METHOD.**
 >
 > polyT5 (Sahu et al., npj Artificial Intelligence 2026) is **supervised throughout**: span-corruption
 > pretraining, supervised fine-tuning, then sampling and screening. It contains no reinforcement learning
 > of any kind. Everything in this document is **our proposed research extension** and must never be
 > attributed to the paper. Results from it are reported as *"our RLVR extension obtains"* — a third
 > category, distinct from both *"the paper reports"* and *"our reproduction obtains"*.
+>
+> This document predates the implementation and is kept as the original design record. The as-built spec
+> and task-by-task plan are `docs/superpowers/specs/2026-08-20-grpo-rlvr-design.md` and
+> `docs/superpowers/plans/2026-08-20-grpo-rlvr.md`; §8 below records entry-gate status.
 
-This file exists now, before any RL code, so that the supervised architecture is shaped correctly. Nothing
-here may leak into `src/polyt5/{model,data,training,tokenization,chemistry}`.
+The reward primitives (`src/polyt5/rewards/`) and RL core (`src/polyt5/rl/`) described below now exist,
+built exactly per the constraint stated when this file was written: nothing in
+`src/polyt5/{model,data,training,tokenization,chemistry}` imports either (verified by
+`tests/test_dependency_direction.py`).
 
 ---
 
@@ -151,7 +158,11 @@ quantified below with real numbers from `docs/baseline.md`.
      disagreement is roughly half the error magnitude and varies threefold across candidates, which is
      exactly the spread a gate needs. Candidates where five independently trained models disagree by 45 K
      are the ones a policy would otherwise farm.
-   - **A held-out auditor** — one split's model never used in any reward, only for final scoring.
+   - **A held-out auditor** — one split's model never used in any reward, only for final scoring. It is
+     held out of the reward *path*, not statistically independent of the reward models: the five splits
+     are independent random 80/20 draws from the same corpus, so the auditor shares ~80% of its training
+     data with each reward model in expectation. It can tell us a gain is not an artifact of *these four
+     particular models*; it cannot tell us the Tg claim is true.
    - **A novelty ceiling**, so the policy cannot escape the predictor's support entirely.
    - **Log the predicted-value histogram every RL epoch.** Collapse onto modal values is the signature of
      this failure, and it is visible immediately if plotted.
@@ -161,7 +172,8 @@ quantified below with real numbers from `docs/baseline.md`.
    high-Tg polymers are aromatic. Either condition it on structure class or keep its weight near zero.
 3. **The circularity between generator and predictor.** Both were fine-tuned on the same LamaLab Tg data,
    so the predictor scoring the generator is partly self-referential *before* RL even starts. The auditor
-   split is the only clean measurement; quote it separately in every result.
+   split is the *cleanest* measurement available, not a clean one — it is drawn from the same corpus — so
+   quote it separately in every result, with that caveat attached.
 2. **Mode collapse.** Group-relative advantages plus a validity-heavy reward push toward a handful of
    trivially valid polymers. The diversity term and within-group duplicate penalties exist for this.
 3. **Degenerate short sequences.** Short PSELFIES are easier to keep valid. Length-aware normalization is
@@ -173,10 +185,21 @@ quantified below with real numbers from `docs/baseline.md`.
 
 ## 8. Entry criteria — none of this starts until all are true
 
-- [ ] Supervised pretraining runs end-to-end and its loss curve is recorded
-- [ ] Tg property prediction reproduces a sane MAE/RMSE/R² on the substitute dataset, over five splits
-- [ ] Tg-conditioned generation works, with the full evaluation layer (SV/TSD/DD/PV, SR, SA, novelty)
-- [ ] Arm A **and** Arm B are measured, frozen, and written to `results/`
-- [ ] The frozen baseline checkpoint is tagged and its manifest recorded
+**[SATISFIED, Task 9.]** All five criteria hold, recorded in `artifacts/baseline/frozen_baseline.json`
+(frozen `2026-08-20T23:02:41Z`, commit `5ff1c44`) and `docs/baseline.md`. The Phase-3 apparatus this
+criterion gates — reward components (`src/polyt5/rewards/`), RL core (`src/polyt5/rl/`), `GRPOTrainer`,
+`scripts/train_grpo.py`, the four arm configs, and `scripts/compare_arms.py` — is now built and tested
+(Tasks 1–9; see `docs/superpowers/plans/2026-08-20-grpo-rlvr.md`). **No arm has been trained yet** — this
+marks the entry gate open, not a result.
+
+- [x] Supervised pretraining runs end-to-end and its loss curve is recorded
+- [x] Tg property prediction reproduces a sane MAE/RMSE/R² on the substitute dataset, over five splits
+      (mean MAE 28.6733 ± 0.7591 K, `n=5`, per `frozen_baseline.json`'s `tg_prediction_5split`)
+- [x] Tg-conditioned generation works, with the full evaluation layer (SV/TSD/DD/PV, SR, SA, novelty)
+- [x] Arm A **and** Arm B are measured, frozen, and written to `results/` (`arm_a_default_sampling` /
+      `arm_b_tuned_sampling` in `frozen_baseline.json`)
+- [x] The frozen baseline checkpoint is tagged and its manifest recorded (all 8 artifacts SHA-256 verified
+      in `frozen_baseline.json`; splits 0–3 are the reward ensemble, split 4 is the auditor and never
+      enters a reward path, per `success_criterion` and `auditor_note`)
 
 Only then does Phase 3 begin.

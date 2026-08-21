@@ -14,13 +14,15 @@ Deliberately incremental — no large-scale training until the whole path is exe
 | **1** | Real polymers → chemistry → tokenizer → span corruption → batch → polyT5-small → forward → loss → backward → optimizer step → checkpoint → reload | ✅ done |
 | **2** | Real proxy corpus (PI1M) → full train/validation pipeline | ✅ done |
 | **3** | polyT5-small pretraining on the full PI1M corpus | ✅ done |
-| **4** | polyT5-medium pretraining on polyOne | 🔄 running |
-| **5** | Downstream Tg property prediction (beam-4, MAE/RMSE/R²; split 0 of 5 done) | ✅ done |
+| **4** | polyT5-medium pretraining on polyOne (92.3M sequences) | ✅ done |
+| **5** | Downstream Tg property prediction (beam-4, MAE/RMSE/R²; all 5 splits) | ✅ done |
 | **6** | Tg-conditioned generation | ✅ done |
-| **7** | Full published evaluation methodology (SV/TSD/DD/PV, SR, SA, novelty done; target-property error and sampling sweep outstanding) | 🔄 partial |
-| **8** | Freeze baseline; Arm A and Arm B measured and recorded | ⏳ |
+| **7** | Full published evaluation methodology (SV/TSD/DD/PV, SR, SA, novelty, target-property error, sampling sweep) | ✅ done |
+| **8** | Freeze baseline; Arm A and Arm B measured and recorded | ✅ done |
 
 Phase 3 (GRPO/RLVR, see [`rlvr_plan.md`](rlvr_plan.md)) begins only after Stage 8.
+Stage 8 is now satisfied, and the Phase 3 apparatus is implemented and tested.
+**No arm has been trained yet, so this document reports no RLVR result.**
 
 ## Hardware reality
 
@@ -366,6 +368,39 @@ batch 16, lr 3e-4, wd 0.01, beam width 4), identical evaluation. Only the initia
 | **pretrained** | **medium** | **polyOne, 92.3 M** | **28.67 ± 0.76** | **44.45 ± 2.52** | **0.845 ± 0.018** | **0.923 ± 0.008** |
 | *paper reports* | *medium* | *withheld, 100.1 M* | *—* | *40.82 ± 1.33* | *0.86* | *0.93 ± 0.01* |
 
+#### Against the published external baselines
+
+The npj version adds model comparisons the preprint did not carry. They reframe our result: the question
+is not only "how close to polyT5" but "where does this sit among published chemical language models on the
+same task".
+
+| Model | Tg RMSE (K) |
+|---|---|
+| GPT-3.5, fine-tuned on PSMILES | 47.2 |
+| **our reproduction, medium @ 92.3 M** | **44.45 ± 2.52** |
+| polyT5-medium (the paper) | 40.82 ± 1.33 |
+| Llama-3, fine-tuned | 39.5 |
+| polyBART embeddings + Gaussian process regression | 39.9 |
+
+**Our reproduction lands in the same band as these published models — within ~4 K of polyT5,
+polyBART+GPR and Llama-3, and indistinguishable from fine-tuned GPT-3.5** — on substitute data, a
+substitute tokenizer, and a laptop GPU. That is a more useful statement of where we landed than "9% short
+of the paper".
+
+> **This table is not a leaderboard, and the GPT-3.5 row in particular is not a win.** `[OURS]` 44.45 ±
+> 2.52 K is measured on 7,367 LamaLab experimental values; `[PAPER]` 47.2 K is measured on the paper's own
+> withheld 5,130. Different test sets are not comparable by subtraction at all, and even setting that
+> aside the 2.75 K nominal difference is smaller than our own ±2.52 K spread across the five splits. The
+> honest reading is "same band, different data", not "beats". The other three rows carry the identical
+> caveat; they are quoted because they say where this class of model sits, not because our number can be
+> ranked against them.
+
+> **Label-noise floor, from the published Methods.** The thermal datasets "should be interpreted as
+> literature-reported values under varying conditions" — molecular weight, dispersity and measurement
+> protocol are not held constant. That is an irreducible error floor beneath every RMSE in this table, and
+> it bounds how much any method can improve. It also matters for Phase 3: it is noise the RLVR reward
+> inherits directly.
+
 **At matched scale we land close to the paper.** Our final configuration — polyT5-medium pretrained on
 92.3 M polymers, 92% of their corpus size — reaches RMSE **44.45** against their **40.82**, R² **0.845**
 against **0.860**, and Pearson r **0.923** against **0.930**. The residual gap is ~9% in RMSE, on
@@ -456,6 +491,21 @@ An earlier version of this table reported TSD at 100%; that run supplied **no no
 could fail the filter. With the real training corpus indexed, 27 of 735 candidates (3.7%) turn out to be
 training-set members. Measuring novelty without a reference set measures nothing.
 
+> **PV pass rate is our clearest shortfall against the paper.** The published version reports **~80.6%**
+> of candidates passing PV at its medium optimum (6 epochs, T = 1.1, top_p = 0.75). Our best is **58.6%** —
+> a 22-point gap. This is the one place we fall short of a *published number* rather than merely differing
+> on substitute data, so it is worth naming plainly.
+>
+> The most likely cause is an axis we never swept. The paper tunes `(epochs, temperature, top_p)` jointly
+> and its optimum sits at **6 fine-tuning epochs**; our generation models were fine-tuned for 15, and the
+> sampling sweep varied only temperature and top_p against a single checkpoint. The paper also reports that
+> validity *improves* with fine-tuning epochs up to a point and then degrades into duplication — so 15
+> epochs may sit past that peak. Re-running the generation fine-tune with every-epoch checkpoint retention,
+> then sweeping the epoch axis, is the experiment that would close or explain this gap.
+>
+> For context the published version also reports polyBART at **86.7%** on analogous filters, so ~80% is
+> achievable rather than exceptional.
+
 #### Conditioning fidelity — the number RLVR has to beat
 
 The candidates above were conditioned on the validation set's own Tg values, which span **167.2 – 729.1 K**.
@@ -477,8 +527,12 @@ predictor error.
 > ⚠️ **Circularity caveat.** The predictor and the generator were fine-tuned on the same LamaLab Tg data, so
 > using one to score the other is partly self-referential. This is the exact failure mode the RLVR phase
 > must defend against, since the policy would be free to farm the predictor's blind spots. The mitigation —
-> an ensemble of five independently-split Tg models plus one held-out auditor never used in any reward — is
-> being built now (see `docs/rlvr_plan.md` §7).
+> an ensemble of four independently-split Tg models plus one held-out auditor never used in any reward — is
+> built (see `docs/rlvr_plan.md` §7). It *reduces* the circularity; it does not remove it. The five splits
+> are independent random 80/20 draws from the same corpus, so the auditor shares ~80% of its training data
+> with each reward model in expectation. It can establish that a gain is not an artifact of those four
+> particular models. It cannot establish that the Tg claim is true, because a hack exploiting a genuinely
+> data-sparse region of chemical space fools all five identically.
 
 Reported at a fixed 500 K target instead, for comparability with the paper's Figure S10 protocol:
 **TP = 31.5%** within 500 ± 50 K. That figure answers a different question than the table above, and the

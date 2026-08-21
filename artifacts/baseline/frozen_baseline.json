@@ -50,7 +50,8 @@
     "tg_predictor_split3"
   ],
   "auditor": "tg_predictor_split4",
-  "auditor_note": "Never used in any reward. Scores final candidates only, so that a reported improvement cannot be an artifact of the reward model itself.",
+  "auditor_note": "Never used in any reward. Scores final candidates only, so that a reported improvement cannot be an artifact of THESE FOUR PARTICULAR reward models' idiosyncrasies. It is held out of the reward PATH; it is NOT statistically independent of the reward models. scripts/run_splits.py builds five independent random 80/20 splits of the same corpus, not a partitioning k-fold, so split 4 trains on a random 80% of the same LamaLab Tg data and shares ~80% of its training set with each reward model in expectation, and its own held-out 20% is not held out from the reward ensemble. A reward hack that exploits a genuinely data-sparse region of chemical space would fool all five models identically, because all five are sparse there. The check is real and worth having; it cannot establish that a Tg claim is true.",
+  "auditor_process_note": "By default the auditor is held out of the training process entirely, not merely out of the reward path: scripts/train_grpo.py's build_drift_monitor does not open, verify, or construct the split-4 checkpoint unless --drift-auditor is passed. This is stronger than 'loaded but never consulted for a reward' -- sigma (ensemble disagreement) is itself optimized against by the Tg confidence weight, so it cannot double as a trustworthy drift diagnostic, and the auditor gap was the proposed check on that; but auditor_note's ~80%-shared-training-data limitation gives it only weak power to catch what sigma cannot, so never opening it by default is preferred over loading it unused. max-Tanimoto similarity monitoring (polyt5.rl.DriftMonitor's other half) needs no auditor and stays on. --drift-auditor opts back into the auditor-gap half: polyt5.rl.DriftMonitor then loads it for spec 4.4's logging only -- GRPOTrainer holds the monitor in an attribute of its own, never passes it to the reward arm, and only writes its output into the step stats. tests/test_rl_drift.py pins that a step's rewards, advantages and loss are identical with and without a monitor attached.",
   "tg_prediction_5split": {
     "mae": {
       "mean": 28.6733,
@@ -96,5 +97,57 @@
     "n_per_target": 500,
     "note": "Phase-3 arms must be evaluated identically."
   },
-  "success_criterion": "An RLVR arm succeeds only if it beats arm_b on the metric it optimized AND the gain survives scoring by the auditor."
+  "success_criterion": "An RLVR arm succeeds only if it beats arm_b on the metric it optimized AND the gain survives scoring by the auditor. 'Beats' means, on BOTH scorings, an improvement of at least the arm's pre-registered min_margin AND a 95% bootstrap confidence interval over candidates that excludes zero; and only if the arm was sampled at arm_b's temperature and top_p, since a different sampling point makes the row incomparable on every column. See pre_registered_metrics and success_criterion_statistics.",
+  "pre_registered_metrics": {
+    "_note": "The metric each RLVR arm is judged on is fixed HERE, before any arm is trained, so that it cannot be chosen after seeing results. scripts/compare_arms.py's ARM_METRIC must match this record exactly; it asserts so at run time and tests/test_compare_arms.py fails if the two disagree. Each metric is the mean of a per-candidate quantity over the FULL raw rollout batch (gated candidates included in the denominator) except property_mae, which is survivor-only -- which is precisely why property_mae is reported but is not any arm's success metric.",
+    "accuracy": {
+      "metric": "accuracy_score",
+      "direction": "higher",
+      "min_margin": 0.01,
+      "why": "C1's reward IS mean(closeness x confidence) over the full batch. property_mae is unweighted, unclipped and computed only over PV survivors, so a policy can move the two in opposite directions; it stays in the matrix as an informative off-diagonal column, not as C1's success metric."
+    },
+    "validity": {
+      "metric": "pv_rate",
+      "direction": "higher",
+      "min_margin": 0.02,
+      "why": "C2's reward IS 'cleared the full SV->TSD->DD->PV cascade'. Structural: no predictor is involved, so the auditor clause does not apply (see structural_metrics)."
+    },
+    "composite": {
+      "metric": "composite_score",
+      "direction": "higher",
+      "min_margin": 0.02,
+      "why": "C3's reward is w_tg*r_tg + w_pv*pv_pass + w_novelty*novel; no pre-existing aggregate column captures the joint, so it is scored with the arm object itself."
+    },
+    "constraint": {
+      "metric": "constraint_satisfaction_rate",
+      "direction": "higher",
+      "min_margin": 0.02,
+      "why": "C4's reward is a conjunction over (|Tg-target| <= tolerance) AND (SA <= sa_max) AND novel AND ensemble-backed; again no pre-existing aggregate captures the joint."
+    }
+  },
+  "structural_metrics": [
+    "pv_rate"
+  ],
+  "success_criterion_statistics": {
+    "test": "percentile bootstrap over candidates, resampling each arm's per-candidate metric values independently",
+    "n_bootstrap": 2000,
+    "confidence": 0.95,
+    "bootstrap_seed": 0,
+    "rule": "beats_arm_b requires (delta >= min_margin) AND (bootstrap CI lower bound > 0), where delta is signed so that positive always means better. survives_audit applies the identical rule to the auditor-scored column. success = beats_arm_b AND survives_audit AND sampling_matches_arm_b.",
+    "why": "A bare inequality on point estimates from one generation seed records an 0.1 K win as success = True, indistinguishable from sampling noise: arm_a and arm_b differ by 3.6 K and MAE sampling error on ~840 survivors at RMSE ~44 K is order 1.5 K. Requiring both a minimum effect size and a CI that excludes zero must be fixed BEFORE the runs or it is post-hoc metric selection."
+  },
+  "amendments": [
+    {
+      "utc": "2026-08-21",
+      "what": "Added pre_registered_metrics, structural_metrics and success_criterion_statistics; changed accuracy's metric from property_mae to accuracy_score; corrected auditor_note's independence claim.",
+      "why": "Final whole-branch review findings B2, S3, S4 and S9. Made before any arm was trained: no RLVR result existed, exists, or influenced any of these choices. The measured baseline numbers above (checkpoint hashes, 5-split metrics, arm_a/arm_b sampling results) are unchanged.",
+      "no_result_exists": true
+    },
+    {
+      "utc": "2026-08-21",
+      "what": "Changed scripts/train_grpo.py's default drift-monitoring behaviour: the held-out split-4 auditor is no longer loaded by default -- build_drift_monitor does not open, verify, or construct its checkpoint unless the new --drift-auditor flag is passed. max-Tanimoto similarity monitoring, which needs no auditor, remains on by default. Rewrote auditor_process_note accordingly.",
+      "why": "Sigma (ensemble disagreement) is itself optimized against by the Tg reward's confidence weight, so it cannot be trusted as a drift diagnostic; the auditor gap was the proposed check on that, but split 4 shares ~80% of its training data with each reward model and so has only weak power against corpus-wide error. Given that limited power, holding split 4 out of the training PROCESS entirely by default is a strictly stronger containment guarantee than loading it unused. A genuinely independent group-contribution oracle is being built separately to fill the auditor's intended role. Made before any arm was trained: no RLVR result existed, exists, or influenced this choice. The measured baseline numbers above are unchanged.",
+      "no_result_exists": true
+    }
+  ]
 }

@@ -394,11 +394,20 @@ enabled.
 | **medium** | **6** | **1.1** | **0.75** |
 | large | 8 | 1.1 | 0.95 |
 
-> ⚠️ **Correction to the project brief.** The brief cites "approximately 80.6% of candidates passing the
-> reported PV filter" for the medium configuration. The medium configuration `(6 epochs, T = 1.1,
-> top_p = 0.75)` **is** confirmed, but **no per-configuration pass-rate table is published** — those results
-> exist only as unlabeled heatmaps (Figures 4A, S7, S9, S10). We could not verify the 80.6% figure from the
-> paper text and therefore do not treat it as a reproduction target. See ambiguity register E-03.
+> ✅ **80.6% is real — and it is a reproduction target.** An earlier version of this document recorded the
+> brief's "approximately 80.6% of candidates passing the PV filter" as unverifiable. That was correct for
+> the **arXiv preprint**, which publishes per-configuration results only as unlabeled heatmaps (Figures 4A,
+> S7, S9, S10). The **published npj version states it outright**:
+>
+> > "the best balance we observed for POLYT5-medium was obtained at 6 fine-tuning epochs with top_p=0.75
+> > and a sampling temperature of T = 1.1, yielding **~80.6% of generated candidates passing the PV filter**."
+>
+> So PV pass rate is a quotable target after all. **Ours is 58.6%** at our best configuration — a 22-point
+> gap, and the first place our reproduction falls clearly short of a published number rather than merely
+> differing on substitute data. The most likely cause is the axis we never swept: the paper tunes
+> `(epochs, temperature, top_p)` jointly and its optimum sits at **6 fine-tuning epochs**, while our
+> generation models were fine-tuned for 15 and only a few epoch checkpoints were retained. See
+> `docs/baseline.md`.
 
 `[PAPER]` Qualitative trade-offs the paper does state: more fine-tuning epochs first reduces invalid
 candidates but eventually increases duplicates (pronounced for medium/large); higher temperature increases
@@ -458,6 +467,19 @@ polymer chains".
 | 4 | Tm − Tg > 100 K | 177,985 | 2.9 |
 | 5 | Td − Tg > 100 K | 168,815 | 2.7 |
 | 6 | soluble in H₂O or EtOH | 21,457 | 0.3 |
+
+> **Version note: the published cascade differs from the preprint.** The npj version consolidates the two
+> melt-processing stages into one and adds a **`Td > Tm`** criterion, which changes the downstream counts:
+> melt processing 177,985 → 168,815 (two stages) becomes **149,274** (one stage), the final soluble set
+> 21,457 becomes **18,243**, and SR passes 3,978 (18.5%) become **3,142 (17.2%)**. We have not implemented
+> the cascade — it requires Td, Tm, Eg, ε and solubility models, and we have Tg only — but if it is ever
+> built, build it to the published version, including `Td > Tm`.
+>
+> Every *method-critical* specification is byte-identical between the two versions, verified directly
+> against both PDFs: the span-corruption parameters, the 458/199/100 vocabulary split, the 200-token
+> limit, batch 450, both fine-tuning recipes (30/15 epochs, batch 16, lr 3e−4, wd 0.01), and beam width 4.
+> The "up to 5 epochs" versus "two epochs" contradiction also survives into the published version, so
+> register entry E-02 stands.
 
 `[PAPER]` One candidate (a polyamide from glutaryl dichloride + 4,4′-diaminodiphenylmethane) was
 synthesized and measured: predicted vs measured Tg 483 / 472 K, Tm 603 / 543 K, Td 643 / 607 K, Eg 4.45 /

@@ -62,7 +62,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from polyt5.chemistry import NoveltyIndex
 from polyt5.data.prepare import format_property_value
 
-from .filters import apply_filter_cascade
+from .filters import CandidateRecord, FilterCounts, apply_filter_cascade
 from .generation_metrics import target_property_rate
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -81,13 +81,16 @@ __all__ = [
     "PAPER_TEMPERATURES",
     "PAPER_TOP_PS",
     "SWEEP_COLUMNS",
+    "ScreenedBatch",
     "SweepPoint",
     "SweepResult",
     "append_result_jsonl",
     "assign_targets",
     "generate_candidates",
+    "property_columns",
     "read_results_jsonl",
     "run_sweep_point",
+    "screen_candidates",
     "select_best",
     "sweep_grid",
     "sweep_to_dataframe",
@@ -566,7 +569,143 @@ def _finite(value: Any) -> float | None:
     return as_float if math.isfinite(as_float) else None
 
 
-def _property_columns(
+@dataclass(frozen=True)
+class ScreenedBatch:
+    """Generated candidates plus their per-candidate cascade outcomes.
+
+    Produced by :func:`screen_candidates`, factored out of
+    :func:`run_sweep_point` so a caller that needs PER-CANDIDATE detail --
+    not just the aggregate a :class:`SweepResult` reports -- can reuse the
+    exact same generation-and-screening pipeline instead of duplicating it.
+    ``scripts/compare_arms.py`` is the motivating caller: scoring a
+    composite or constraint reward needs the raw candidates, each one's own
+    conditioning target, and (for a confidence-weighted term) a per-candidate
+    ensemble std that no aggregate ``SweepResult`` can reconstruct -- reward
+    scoring for those is done by feeding these fields straight into a
+    :class:`polyt5.rewards.ArmReward`, not by re-deriving it from counts.
+
+    Attributes:
+        point: The configuration that produced these candidates.
+        candidates: Raw generated PSELFIES strings, in prompt order.
+        sample_targets: The conditioning target each candidate was prompted
+            with, positionally aligned with ``candidates``.
+        records: Per-candidate cascade outcomes from
+            :func:`~polyt5.evaluation.filters.apply_filter_cascade`, same
+            order as ``candidates``.
+        counts: The nested SV/TSD/DD/PV counts for this batch.
+        sr_rate: SELFIES Reproducibility over all generated strings.
+        duplicate_rate: Fraction of SV survivors repeating a polymer already
+            seen earlier in this batch.
+        mean_length: Mean SELFIES-token length over all generated strings,
+            including ones that fail screening.
+    """
+
+    point: SweepPoint
+    candidates: list[str]
+    sample_targets: list[float]
+    records: list[CandidateRecord]
+    counts: FilterCounts
+    sr_rate: float
+    duplicate_rate: float
+    mean_length: float
+
+    @property
+    def screened_psmiles(self) -> list[str]:
+        """Canonical PSMILES of the PV survivors, in input order."""
+        return [
+            record.canonical_psmiles
+            for record in self.records
+            if record.passed_pv and record.canonical_psmiles is not None
+        ]
+
+    @property
+    def screened_targets(self) -> list[float]:
+        """Conditioning target of each PV survivor, aligned with ``screened_psmiles``."""
+        return [
+            self.sample_targets[index]
+            for index, record in enumerate(self.records)
+            if record.passed_pv and record.canonical_psmiles is not None
+        ]
+
+
+def screen_candidates(
+    model: Any,
+    tokenizer: _Tokenizer,
+    *,
+    point: SweepPoint,
+    targets: Sequence[float],
+    n_samples: int,
+    training_index: NoveltyIndex | None,
+    device: Any,
+    batch_size: int = 64,
+    seed: int = 0,
+    max_length: int = 200,
+    compute_sa: bool = False,
+) -> ScreenedBatch:
+    """Generate and screen one configuration -- the shared core of :func:`run_sweep_point`.
+
+    Args:
+        model: The generation model, in or out of eval mode (put in eval mode
+            for the duration by :func:`generate_candidates`).
+        tokenizer: The polyT5 tokenizer.
+        point: The temperature / ``top_p`` configuration to sample at.
+        targets: Property values to condition on, cycled round-robin.
+        n_samples: Candidates to generate.
+        training_index: Known training polymers for the TSD stage; ``None``
+            makes TSD a no-op.
+        device: Torch device (or device string) to decode on.
+        batch_size: Prompts per decoding batch.
+        seed: Base RNG seed; the result is fully determined by it.
+        max_length: Maximum tokens to generate.
+        compute_sa: Compute synthetic accessibility per candidate. Off by
+            default (SA is the most expensive cascade step); the reward arms
+            in :mod:`polyt5.rewards` compute their own SA when they need it,
+            so most callers of this function do not need it precomputed here.
+
+    Returns:
+        A :class:`ScreenedBatch`. This function never raises on model output.
+    """
+    sample_targets = assign_targets(targets, n_samples)
+    candidates = generate_candidates(
+        model,
+        tokenizer,
+        point=point,
+        targets=targets,
+        n_samples=n_samples,
+        device=device,
+        batch_size=batch_size,
+        seed=seed,
+        max_length=max_length,
+    )
+
+    records, counts = apply_filter_cascade(
+        candidates, training_index=training_index, expected_termini=2, compute_sa=compute_sa
+    )
+
+    n_reproducible = sum(1 for record in records if record.reproducible)
+    sr_rate = (n_reproducible / counts.n_input) if counts.n_input else 0.0
+
+    valid_canonical = [
+        record.canonical_psmiles
+        for record in records
+        if record.passed_sv and record.canonical_psmiles is not None
+    ]
+    n_unique = len(dict.fromkeys(valid_canonical))
+    duplicate_rate = (1.0 - n_unique / counts.n_sv) if counts.n_sv else 0.0
+
+    return ScreenedBatch(
+        point=point,
+        candidates=candidates,
+        sample_targets=sample_targets,
+        records=records,
+        counts=counts,
+        sr_rate=sr_rate,
+        duplicate_rate=duplicate_rate,
+        mean_length=_mean_selfies_length(candidates),
+    )
+
+
+def property_columns(
     screened: Sequence[str],
     screened_targets: Sequence[float],
     predictor: Callable[[Sequence[str]], Sequence[float]] | None,
@@ -677,55 +816,32 @@ def run_sweep_point(
         A :class:`SweepResult`. This function never raises on model output.
     """
     started = time.perf_counter()
-    sample_targets = assign_targets(targets, n_samples)
-    candidates = generate_candidates(
+    batch = screen_candidates(
         model,
         tokenizer,
         point=point,
         targets=targets,
         n_samples=n_samples,
+        training_index=training_index,
         device=device,
         batch_size=batch_size,
         seed=seed,
         max_length=max_length,
+        compute_sa=False,
     )
 
-    records, counts = apply_filter_cascade(
-        candidates, training_index=training_index, expected_termini=2, compute_sa=False
-    )
-
-    n_reproducible = sum(1 for record in records if record.reproducible)
-    sr_rate = (n_reproducible / counts.n_input) if counts.n_input else 0.0
-
-    valid_canonical = [
-        record.canonical_psmiles
-        for record in records
-        if record.passed_sv and record.canonical_psmiles is not None
-    ]
-    n_unique = len(dict.fromkeys(valid_canonical))
-    duplicate_rate = (1.0 - n_unique / counts.n_sv) if counts.n_sv else 0.0
-
-    screened: list[str] = []
-    screened_targets: list[float] = []
-    for index, record in enumerate(records):
-        if record.passed_pv and record.canonical_psmiles is not None:
-            screened.append(record.canonical_psmiles)
-            # ``records`` is in input order, so index i was prompted with
-            # sample_targets[i]; that alignment is what makes the MAE column a
-            # statement about prompt obedience.
-            screened_targets.append(sample_targets[index])
-
-    tp_rate, property_mean, property_mae = _property_columns(
-        screened, screened_targets, property_predictor, target_property, tolerance
+    tp_rate, property_mean, property_mae = property_columns(
+        batch.screened_psmiles, batch.screened_targets, property_predictor, target_property,
+        tolerance,
     )
 
     return SweepResult(
         point=point,
         n_requested=n_samples,
-        counts=counts.to_dict(),
-        sr_rate=sr_rate,
-        duplicate_rate=duplicate_rate,
-        mean_length=_mean_selfies_length(candidates),
+        counts=batch.counts.to_dict(),
+        sr_rate=batch.sr_rate,
+        duplicate_rate=batch.duplicate_rate,
+        mean_length=batch.mean_length,
         tp_rate=tp_rate,
         property_mean=property_mean,
         property_mae=property_mae,

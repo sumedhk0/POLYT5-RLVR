@@ -1,0 +1,50 @@
+# Arm C2 - reward is 1.0 only if the candidate clears the nested
+# SV -> TSD -> DD -> PV cascade, 0.0 otherwise.
+# Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
+experiment_name: grpo_validity
+arm: validity
+seed: 0
+
+baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
+
+reward:
+  tolerance: 100.0        # unused by this arm; kept so configs stay comparable
+  sigma0: 17.0            # unused by this arm; kept so configs stay comparable
+  sigma_unknown: 45.2     # spread substituted when only ONE ensemble member could score a
+                          # candidate: its true spread is UNDEFINED, not 0.0, so our maximum
+                          # observed disagreement is used (TgRewardConfig.sigma_unknown)
+  min_coverage: 0.5       # ConstraintArm only: minimum n_contributing/n_total for the
+                          # ensemble mean to count as a consensus (TgRewardConfig.min_coverage)
+  sa_max: 6.0             # unused by this arm; kept so configs stay comparable
+  window_tolerance: 50.0  # unused by this arm; kept so configs stay comparable
+  novelty_index: artifacts/novelty/tg_generation_train  # required: TSD stage needs it
+
+train:
+  group_size: 16          # candidates per prompt; the GRPO baseline
+  prompts_per_step: 32    # 512 candidates per step
+  max_steps: 2000
+  max_length: 200         # [PAPER] the paper's sequence limit
+  target_min: 250.0       # uniform sampling forces genuine conditioning
+  target_max: 600.0
+  temperature: 0.7        # arm B's tuned operating point
+  top_p: 0.95
+  learning_rate: 1.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.02           # primary knob; KL is logged every step
+  max_grad_norm: 1.0
+  rollout_batch_size: 128 # measured optimum; 512 is 3.5x slower
+  log_every: 10
+  save_every: 250
+  device: auto
+
+# Spec 4.4 drift monitoring. LOGGING ONLY: the auditor loaded here is handed to
+# polyt5.rl.DriftMonitor and is never passed to the reward arm (see
+# scripts/train_grpo.py's module docstring). --no-drift-monitor overrides this.
+drift:
+  enabled: true
+  every: 50                                         # steps between measurements; step 0 always measured
+  reference: data/processed/tg/generation/train.jsonl  # labelled Tg set for max-Tanimoto
+  max_reference: 20000
+
+output:
+  results_root: results
