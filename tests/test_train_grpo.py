@@ -214,3 +214,112 @@ def test_latest_checkpoint_ignores_non_step_named_pt_files(tmp_path):
     (checkpoints / "best.pt").write_bytes(b"")
     with pytest.raises(FileNotFoundError):
         _latest_checkpoint(tmp_path)
+
+
+# ------------------------------------------------- ensemble_size wiring (Ruling F)
+
+
+def test_build_reward_arm_requires_the_caller_to_declare_the_ensemble_size():
+    """Ruling F. ``n_contributing == 1`` means "full coverage" for a
+    single-model predictor and "three of four members could not read this
+    candidate" for the reward ensemble; only the declared size separates them,
+    and it must come from the frozen record's ``reward_ensemble`` list (via
+    ``len(predictor)``), never from an arm's own ``--set``-overridable config.
+    """
+    assert build_reward_arm("accuracy", {}).ensemble_size == 1
+    assert build_reward_arm("accuracy", {}, ensemble_size=4).ensemble_size == 4
+
+
+def test_build_reward_arm_ignores_a_config_supplied_ensemble_size():
+    """A ``--set reward.ensemble_size=1`` on a four-member ensemble would
+    silently restore the inverted confidence weight, so the config is not
+    allowed to say.
+    """
+    cfg = {"reward": {"ensemble_size": 1}}
+    assert build_reward_arm("accuracy", cfg, ensemble_size=4).ensemble_size == 4
+
+
+def test_build_reward_arm_threads_the_new_tg_constants():
+    cfg = {"reward": {"sigma_unknown": 30.0, "min_coverage": 0.75}}
+    arm = build_reward_arm("accuracy", cfg, ensemble_size=4)
+    assert arm.tg_config.sigma_unknown == 30.0
+    assert arm.tg_config.min_coverage == 0.75
+
+
+def test_build_reward_arm_tg_constant_defaults_match_the_documented_values():
+    arm = build_reward_arm("accuracy", {})
+    assert arm.tg_config.sigma_unknown == pytest.approx(45.2)
+    assert arm.tg_config.min_coverage == pytest.approx(0.5)
+
+
+# --------------------------------------------------- drift monitor (spec 4.4)
+
+
+def test_build_drift_monitor_refuses_an_auditor_that_leaks_into_the_ensemble(tmp_path):
+    """The third independent guard on the same invariant, placed at the only
+    point in the TRAINING path that opens the auditor's checkpoint at all.
+    """
+    from train_grpo import build_drift_monitor
+
+    frozen = {
+        "artifacts": {"split4": {"path": "nope.pt", "sha256": "0" * 64}},
+        "reward_ensemble": ["split4"],
+        "auditor": "split4",
+    }
+    with pytest.raises(ValueError, match="auditor"):
+        build_drift_monitor(frozen, {}, tmp_path / "tok.json", device="cpu",
+                            batch_size=1, num_beams=1, seed=0)
+
+
+def test_load_drift_reference_reads_pselfies_and_drops_junk(tmp_path):
+    from train_grpo import load_drift_reference
+
+    path = tmp_path / "train.jsonl"
+    path.write_text(
+        json.dumps({"source": "300.0", "target": "[At][C][C][O][At]"}) + "\n"
+        + "\n"
+        + json.dumps({"source": "300.0", "target": "[Zz][not-a-token]"}) + "\n"
+        + json.dumps({"source": "300.0", "target": "[At][C][C][C][At]"}) + "\n",
+        encoding="utf-8",
+    )
+    reference = load_drift_reference(path, limit=10)
+    assert len(reference) == 2, reference
+    assert all("At" in entry or "*" in entry for entry in reference)
+
+
+def test_load_drift_reference_missing_file_is_empty_not_fatal(tmp_path):
+    """A drift monitor is a diagnostic; a run must not die because one could
+    not be fully built.
+    """
+    from train_grpo import load_drift_reference
+
+    assert load_drift_reference(tmp_path / "absent.jsonl", limit=10) == []
+
+
+def test_load_drift_reference_honours_the_cap(tmp_path):
+    from train_grpo import load_drift_reference
+
+    path = tmp_path / "train.jsonl"
+    path.write_text(
+        "\n".join(json.dumps({"target": "[At][C][C][O][At]"}) for _ in range(10)),
+        encoding="utf-8",
+    )
+    assert len(load_drift_reference(path, limit=3)) == 3
+
+
+def test_trainer_config_reads_drift_every_from_the_config():
+    from train_grpo import build_trainer_config
+
+    config = build_trainer_config({"drift": {"every": 7}}, seed=0, device_override="cpu")
+    assert config.drift_every == 7
+    assert build_trainer_config({}, seed=0, device_override="cpu").drift_every == 50
+
+
+def test_every_shipped_arm_config_declares_a_drift_block():
+    from polyt5.utils import load_config
+
+    for arm in ("accuracy", "validity", "composite", "constraint"):
+        cfg = load_config(REPO_ROOT / "configs" / "rl" / f"{arm}.yaml")
+        assert "drift" in cfg, arm
+        assert cfg["drift"]["enabled"] is True, arm
+        assert int(cfg["drift"]["every"]) >= 1, arm

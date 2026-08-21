@@ -6,16 +6,29 @@ Every run is anchored to ``artifacts/baseline/frozen_baseline.json`` (see
 ``configs/rl/*.yaml``): every checkpoint this script opens has its SHA-256
 verified against that record before it is loaded, and the property-prediction
 ensemble that backs the reward is built EXCLUSIVELY from the four checkpoints
-listed under ``reward_ensemble``. The fifth split, ``auditor``, is held out on
-purpose -- it must never enter a reward path, so this script never even looks
-at its path. ``scripts/compare_arms.py`` is the only place the auditor is used,
-for confirmation scoring after training.
+listed under ``reward_ensemble``. The fifth split, ``auditor``, is held out of
+every REWARD path. ``scripts/compare_arms.py`` uses it for confirmation scoring
+after training.
+
+The auditor and the training process
+------------------------------------
+Spec section 4.4 promises an ``auditor gap`` logged during training, so this
+script does load the auditor -- but only into
+:class:`~polyt5.rl.drift.DriftMonitor`, which is handed to
+:class:`~polyt5.rl.trainer.GRPOTrainer` in an attribute of its own and is never
+passed to the reward arm, never consulted while a reward is computed, and can
+only ever write into the step stats. :func:`build_drift_monitor` additionally
+re-checks that the auditor key is absent from ``reward_ensemble`` before
+constructing anything, on top of the two guards
+:func:`load_frozen_baseline` and :func:`build_reward_ensemble` already apply.
+``--no-drift-monitor`` skips loading it at all.
 
 Usage:
     python scripts/train_grpo.py --arm accuracy
     python scripts/train_grpo.py --arm composite --set train.max_steps=50
     python scripts/train_grpo.py --arm constraint --max-steps 10 --device cpu
     python scripts/train_grpo.py --arm accuracy --resume results/grpo_accuracy
+    python scripts/train_grpo.py --arm accuracy --no-drift-monitor
 """
 
 from __future__ import annotations
@@ -32,11 +45,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from polyt5.chemistry import ScalableNoveltyIndex  # noqa: E402
-from polyt5.inference import EnsemblePropertyPredictor  # noqa: E402
+from polyt5.chemistry import ScalableNoveltyIndex, pselfies_to_psmiles  # noqa: E402
+from polyt5.inference import EnsemblePropertyPredictor, PolyT5PropertyPredictor  # noqa: E402
 from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration  # noqa: E402
-from polyt5.rewards import DEFAULT_SIGMA0, TgRewardConfig, build_arm  # noqa: E402
-from polyt5.rl import GRPOTrainer, GRPOTrainerConfig  # noqa: E402
+from polyt5.rewards import (  # noqa: E402
+    DEFAULT_MIN_COVERAGE,
+    DEFAULT_SIGMA0,
+    DEFAULT_SIGMA_UNKNOWN,
+    TgRewardConfig,
+    build_arm,
+)
+from polyt5.rl import DriftMonitor, GRPOTrainer, GRPOTrainerConfig  # noqa: E402
+from polyt5.rl.drift import DEFAULT_MAX_REFERENCE  # noqa: E402
 from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE  # noqa: E402
 from polyt5.tokenization import PolyT5Tokenizer  # noqa: E402
 from polyt5.training import load_checkpoint  # noqa: E402
@@ -66,6 +86,12 @@ POLICY_ARTIFACT_KEY = "generation"
 #: Default novelty index, built by ``scripts/build_novelty_index.py`` from the
 #: same generation training split the frozen baseline's models were trained on.
 DEFAULT_NOVELTY_INDEX = REPO_ROOT / "artifacts" / "novelty" / "tg_generation_train"
+
+#: Labelled Tg polymers the drift monitor measures max-Tanimoto against -- the
+#: same generation training split the novelty index is built from, so "novel"
+#: (exact canonical absence) and "similar" (ECFP6) are talking about the same
+#: reference set.
+DEFAULT_DRIFT_REFERENCE = REPO_ROOT / "data" / "processed" / "tg" / "generation" / "train.jsonl"
 
 
 def _resolve(path: str | Path) -> Path:
@@ -226,6 +252,104 @@ def build_reward_ensemble(
     )
 
 
+def load_drift_reference(path: Path, *, limit: int, field: str = "target") -> list[str]:
+    """Read the labelled Tg polymers the drift monitor fingerprints against.
+
+    Args:
+        path: A JSONL file whose ``field`` holds a PSELFIES string -- the same
+            ``data/processed/tg/generation/train.jsonl`` the novelty index is
+            built from.
+        limit: Stop after this many usable rows.
+        field: Which key holds the polymer.
+
+    Returns:
+        Canonical-ish PSMILES strings (whatever
+        :func:`~polyt5.chemistry.pselfies_to_psmiles` returns), with
+        unconvertible rows dropped. An empty list -- a missing or unreadable
+        file included -- disables the max-Tanimoto half rather than raising:
+        this is a diagnostic, and a run must not die because a monitor could
+        not be built.
+    """
+    if not path.is_file():
+        return []
+    out: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line).get(field)
+                psmiles = pselfies_to_psmiles(value) if value else None
+            except Exception:
+                continue
+            if psmiles:
+                out.append(psmiles)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def build_drift_monitor(
+    frozen: dict[str, Any],
+    cfg: dict[str, Any],
+    tokenizer_path: Path,
+    *,
+    device: str,
+    batch_size: int,
+    num_beams: int,
+    seed: int,
+) -> DriftMonitor:
+    """Build spec section 4.4's drift monitor, auditor included.
+
+    Args:
+        frozen: The parsed ``frozen_baseline.json``.
+        cfg: The resolved run config; reads the optional ``drift`` block
+            (``reference``, ``max_reference``).
+        tokenizer_path: Tokenizer artifact for the auditor predictor.
+        device: Torch device string.
+        batch_size: Decode batch size for the auditor.
+        num_beams: Beam width for the auditor. [PAPER] 4.
+        seed: Seed for the reference subsample.
+
+    Returns:
+        A :class:`~polyt5.rl.drift.DriftMonitor`. The auditor goes in as a
+        plain callable and the monitor exposes no way to get it back out; see
+        that class's module docstring for why that matters and
+        :class:`~polyt5.rl.trainer.GRPOTrainer` for the second half of the
+        containment.
+
+    Raises:
+        ValueError: If the auditor split appears in ``reward_ensemble``. This
+            is the third independent check of the same invariant, placed here
+            because this is the only function in the training path that opens
+            the auditor's checkpoint at all.
+    """
+    auditor_key = frozen["auditor"]
+    if auditor_key in frozen["reward_ensemble"]:
+        raise ValueError(
+            f"auditor split {auditor_key!r} appears in reward_ensemble "
+            f"{frozen['reward_ensemble']!r}; refusing to load it anywhere in the training "
+            "process."
+        )
+    meta = frozen["artifacts"][auditor_key]
+    auditor_path = _resolve(meta["path"])
+    verify_artifact(auditor_path, meta["sha256"], label=auditor_key)
+    auditor = PolyT5PropertyPredictor.from_checkpoint(
+        auditor_path, tokenizer_path, device=device, batch_size=batch_size,
+        num_beams=num_beams, property_name="Tg",
+    )
+
+    drift_cfg = cfg.get("drift", {})
+    reference_path = _resolve(drift_cfg.get("reference", DEFAULT_DRIFT_REFERENCE))
+    max_reference = int(drift_cfg.get("max_reference", DEFAULT_MAX_REFERENCE))
+    reference = load_drift_reference(reference_path, limit=max_reference)
+    return DriftMonitor(
+        auditor=auditor, reference_psmiles=reference,
+        max_reference=max_reference, seed=seed,
+    )
+
+
 #: Sentinel distinguishing "no override was given" (resolve the index from
 #: ``cfg`` as before) from "the override IS None" (use no index at all, e.g.
 #: ``scripts/compare_arms.py --allow-missing-novelty-index``). Plain ``None``
@@ -237,13 +361,25 @@ _NO_NOVELTY_INDEX_OVERRIDE = object()
 
 
 def build_reward_arm(
-    arm_name: str, cfg: dict[str, Any], *, novelty_index: Any = _NO_NOVELTY_INDEX_OVERRIDE
+    arm_name: str, cfg: dict[str, Any], *, novelty_index: Any = _NO_NOVELTY_INDEX_OVERRIDE,
+    ensemble_size: int = 1,
 ):
     """Construct the reward arm from a resolved config's ``reward`` block.
 
     Args:
         arm_name: One of :data:`ARMS`.
         cfg: The fully-resolved run config.
+        ensemble_size: How many members the property predictor whose
+            ``(mean, std, n_contributing_members)`` triples this arm will
+            receive actually has -- ``len(predictor)`` for the reward
+            ensemble, ``1`` for a single-model predictor such as the auditor.
+            It is the denominator of the coverage term in the confidence
+            weight (see :mod:`polyt5.rewards.tg`); getting it wrong raises at
+            the first prediction rather than silently understating the
+            penalty. It is NOT read from ``cfg``: the ensemble is defined by
+            ``frozen_baseline.json``'s ``reward_ensemble`` list, not by an
+            arm's own config, and a ``--set`` override must not be able to
+            change it.
         novelty_index: Pre-opened novelty index to use instead of opening one
             from ``cfg["reward"]["novelty_index"]``. Passed by
             ``scripts/compare_arms.py`` so that every arm it scores shares
@@ -272,11 +408,14 @@ def build_reward_arm(
     tg_config = TgRewardConfig(
         tolerance=float(reward_cfg.get("tolerance", 100.0)),
         sigma0=float(reward_cfg.get("sigma0", DEFAULT_SIGMA0)),
+        sigma_unknown=float(reward_cfg.get("sigma_unknown", DEFAULT_SIGMA_UNKNOWN)),
+        min_coverage=float(reward_cfg.get("min_coverage", DEFAULT_MIN_COVERAGE)),
     )
     kwargs: dict[str, Any] = {
         "tolerance": float(reward_cfg.get("window_tolerance", 50.0)),
         "sa_max": float(reward_cfg.get("sa_max", 6.0)),
         "tg_config": tg_config,
+        "ensemble_size": int(ensemble_size),
     }
     if arm_name in ARMS_NEEDING_NOVELTY_INDEX:
         if novelty_index is not _NO_NOVELTY_INDEX_OVERRIDE:
@@ -321,6 +460,7 @@ def build_trainer_config(cfg: dict[str, Any], *, seed: int,
         log_every=int(train_cfg.get("log_every", 10)),
         save_every=int(train_cfg.get("save_every", 250)),
         rollout_batch_size=int(train_cfg.get("rollout_batch_size", ROLLOUT_CHUNK_SIZE)),
+        drift_every=int(cfg.get("drift", {}).get("every", 50)),
     )
 
 
@@ -368,6 +508,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Decode batch size for the reward ensemble.")
     parser.add_argument("--predictor-num-beams", type=int, default=4,
                         help="Beam width for the reward ensemble. [PAPER] 4.")
+    parser.add_argument("--no-drift-monitor", action="store_true",
+                        help="Skip spec 4.4 drift monitoring. The monitor loads the held-out "
+                             "auditor into the training process (for logging only -- it is "
+                             "never passed to the reward arm); pass this to keep the auditor "
+                             "checkpoint out of the process entirely.")
     return parser.parse_args(argv)
 
 
@@ -411,12 +556,27 @@ def main(argv: list[str] | None = None) -> int:
         policy, _ = load_verified_model(frozen, POLICY_ARTIFACT_KEY)
         reference, _ = load_verified_model(frozen, POLICY_ARTIFACT_KEY)
 
+        tokenizer_path = _resolve(frozen["artifacts"]["tokenizer"]["path"])
         predictor = build_reward_ensemble(
-            frozen, _resolve(frozen["artifacts"]["tokenizer"]["path"]),
+            frozen, tokenizer_path,
             device=str(device), batch_size=args.predictor_batch_size,
             num_beams=args.predictor_num_beams,
         )
-        arm = build_reward_arm(args.arm, cfg)
+        # The arm MUST know how many members produced the triples it will be
+        # fed: n_contributing == 1 means "full coverage" for a single-model
+        # predictor and "three of four members could not read this candidate"
+        # for the reward ensemble, and only this denominator separates them.
+        arm = build_reward_arm(args.arm, cfg, ensemble_size=len(predictor))
+
+        drift_monitor = None
+        drift_cfg = cfg.get("drift", {})
+        drift_enabled = bool(drift_cfg.get("enabled", True)) and not args.no_drift_monitor
+        if drift_enabled:
+            drift_monitor = build_drift_monitor(
+                frozen, cfg, tokenizer_path, device=str(device),
+                batch_size=args.predictor_batch_size, num_beams=args.predictor_num_beams,
+                seed=seed,
+            )
     except (FileNotFoundError, ValueError, KeyError) as error:
         logger.error("could not build the run: %s", error)
         print(f"ERROR: {error}", file=sys.stderr)
@@ -431,16 +591,27 @@ def main(argv: list[str] | None = None) -> int:
         "tokenizer_sha256": tokenizer.sha256,
         "baseline": str(_resolve(cfg["baseline"])),
         "reward_ensemble": list(frozen["reward_ensemble"]),
-        "auditor_excluded": frozen["auditor"],
+        "auditor_excluded_from_reward": frozen["auditor"],
+        "auditor_loaded_for_drift_monitoring": drift_monitor is not None,
+        "reward_ensemble_size": len(predictor),
         "device": str(device),
     })
-    logger.info("reward ensemble: %s (auditor %r excluded)", frozen["reward_ensemble"],
-                frozen["auditor"])
+    logger.info("reward ensemble: %s (%d members; auditor %r excluded from every reward path)",
+                frozen["reward_ensemble"], len(predictor), frozen["auditor"])
+    if drift_monitor is not None:
+        logger.info(
+            "drift monitor: every %d steps; auditor=%s (LOGGING ONLY -- never passed to the "
+            "reward arm) reference_fingerprints=%d",
+            trainer_config.drift_every, drift_monitor.has_auditor, drift_monitor.n_reference,
+        )
+    else:
+        logger.info("drift monitor: disabled (spec 4.4 auditor gap and max-Tanimoto not logged)")
     logger.info("trainer config: %s", asdict(trainer_config))
 
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tokenizer, arm=arm,
         predictor=predictor, config=trainer_config, run_dir=run_dir,
+        drift_monitor=drift_monitor,
     )
 
     start_step = 0
