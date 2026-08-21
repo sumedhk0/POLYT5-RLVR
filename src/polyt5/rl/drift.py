@@ -1,16 +1,18 @@
 """Spec section 4.4 drift monitoring: watch the policy leave the data, do not stop it.
 
-Spec section 4.4 ("Drift is monitored, not prevented") promises two logged
-quantities that nothing in the branch actually computed:
+Spec section 4.4 ("Drift is monitored, not prevented") logs one quantity by
+default, and a second, opt-in one:
 
-* **the auditor gap** -- the held-out split-4 predictor's Tg estimate minus the
-  reward ensemble's, per candidate. A policy farming the reward ensemble drives
-  this apart; a policy genuinely getting closer to the requested Tg does not.
 * **max-Tanimoto to the labelled Tg set** -- how close each generated candidate
   sits to its nearest known polymer, using the paper's loop-closed ECFP6
-  fingerprints (:mod:`polyt5.evaluation.similarity`).
+  fingerprints (:mod:`polyt5.evaluation.similarity`). ON by default -- see
+  "Why this is the default", below.
+* **the auditor gap** -- the held-out split-4 predictor's Tg estimate minus the
+  reward ensemble's, per candidate. OFF by default; opt in with
+  ``scripts/train_grpo.py --drift-auditor``. See "Why the auditor is not the
+  default", below.
 
-The second matters more than it looks. Novelty as this branch rewards it is
+max-Tanimoto matters more than it looks. Novelty as this branch rewards it is
 *absence of the exact canonical form* from the index
 (:meth:`~polyt5.chemistry.scalable_novelty.ScalableNoveltyIndex.is_novel`), so
 a one-atom edit of a memorised training polymer scores ``novel = 1.0`` -- full
@@ -20,11 +22,50 @@ climbing toward 1.0 is the only in-flight signal that it is happening. This
 module REPORTS that; it does not change any reward, and no reward term reads
 its output.
 
-Auditor containment
--------------------
+Why this is the default
+------------------------
+Sigma (ensemble disagreement) is ITSELF optimized against: the confidence
+weight in :mod:`polyt5.rewards.tg` is
+``closeness x coverage x 1/(1+sigma_eff/17)``, which explicitly rewards the
+policy for landing in regions where the four reward models agree with each
+other. A policy that finds a low-disagreement pocket that is also wrong looks,
+from inside the training loop, identical to one that got closer to the truth.
+Sigma is Goodharted the moment it enters the reward, so it cannot double as a
+trustworthy drift diagnostic -- watching the quantity you are optimizing only
+tells you the optimizer worked, not that anything real improved. max-Tanimoto
+needs no predictor at all and is read by no reward term, so it stays a
+genuine, unoptimized, in-flight signal for the one failure mode (near-copy
+"novelty") the reward cannot see. This is the actual reason drift monitoring
+exists at all.
+
+Why the auditor is not the default
+------------------------------------
+The auditor gap was the original proposed answer to sigma being Goodharted: a
+fifth model, held out of every reward path, that the policy has no gradient
+into. But ``scripts/run_splits.py`` builds five independent random 80/20
+splits of the SAME corpus, not a partitioning k-fold, so split 4 shares ~80%
+of its training data with each reward model in expectation. It is genuinely
+held out of the reward PATH -- it never contributes to any reward -- but it is
+*not* statistically independent of the reward models, and a reward hack that
+exploits a region all four reward models are sparse in fools the auditor
+identically, because the auditor is sparse there too: it detects
+ensemble-specific error well and corpus-wide error barely. Given that limited
+power, holding split 4 out of the training PROCESS entirely -- never opening
+its checkpoint by default -- is a strictly stronger containment guarantee than
+"loaded but never consulted for a reward", at the cost of the (weak)
+auditor-gap diagnostic. A genuinely independent group-contribution oracle,
+built separately from this study's five splits, is the intended long-term
+replacement for that role.
+
+``--drift-auditor`` restores the auditor-gap half for anyone who wants the
+weaker, more thorough combination back; the containment machinery below
+applies whenever the auditor IS loaded, opt-in or not.
+
+Auditor containment (when the auditor is loaded)
+---------------------------------------------------
 Loading the auditor inside the training process is a real containment risk: the
 whole study rests on split 4 never entering a reward path. Three things keep it
-out, structurally rather than by convention:
+out, structurally rather than by convention, whenever it is loaded:
 
 1. :class:`DriftMonitor` accepts the auditor as a plain
    ``Callable[[Sequence[str]], Sequence[float]]`` and stores it privately. It
@@ -36,6 +77,11 @@ out, structurally rather than by convention:
    stats dict.
 3. ``tests/test_rl_drift.py`` pins that the rewards, advantages and loss of a
    step are bit-identical with and without a monitor attached.
+
+The stronger guarantee sits one level up: by default, none of this machinery
+is even exercised. ``scripts/train_grpo.py``'s ``build_drift_monitor`` does
+not open, verify, or construct the auditor checkpoint at all unless
+``--drift-auditor`` is passed -- see that function's docstring.
 
 What the auditor gap can and cannot establish is a separate question -- see
 :func:`DriftMonitor.observe`'s note and ``artifacts/baseline/

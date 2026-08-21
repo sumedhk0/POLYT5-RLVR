@@ -10,10 +10,37 @@ listed under ``reward_ensemble``. The fifth split, ``auditor``, is held out of
 every REWARD path. ``scripts/compare_arms.py`` uses it for confirmation scoring
 after training.
 
-The auditor and the training process
-------------------------------------
-Spec section 4.4 promises an ``auditor gap`` logged during training, so this
-script does load the auditor -- but only into
+The auditor is held out of the training process, not just the reward
+----------------------------------------------------------------------
+By default this script never opens the auditor's checkpoint at all. Split 4 is
+held out of the training PROCESS -- absent entirely -- not merely prevented
+from reaching a reward. :func:`build_drift_monitor` builds
+:class:`~polyt5.rl.drift.DriftMonitor` with only its max-Tanimoto-to-training
+half (:mod:`polyt5.evaluation.similarity`, no predictor needed at all) unless
+``--drift-auditor`` is passed.
+
+That similarity half stays on by default because it needs no auditor, is not
+part of any reward, and is genuinely unoptimized in-flight signal. Contrast
+that with sigma (ensemble disagreement): ``polyt5.rewards.tg``'s confidence
+weight is ``closeness x coverage x 1/(1+sigma_eff/17)``, which explicitly
+rewards the policy for landing where the four reward models agree with each
+other. Sigma is optimized against the moment it enters the reward, so a
+falling sigma during training cannot be trusted as a drift diagnostic --
+watching the quantity you are optimizing only tells you the optimizer worked,
+not that anything real improved. The auditor gap was the original proposed
+check on exactly that failure mode: a fifth model with no gradient into it.
+But ``scripts/run_splits.py`` builds five independent random 80/20 splits of
+the SAME corpus, not a partitioning k-fold (see ``frozen_baseline.json``'s
+``auditor_note``), so split 4 shares ~80% of its training data with each
+reward model in expectation. It detects ensemble-specific error well and
+corpus-wide error barely. Given that limited power, never opening the auditor
+checkpoint by default is a strictly stronger containment guarantee than
+"loaded but never consulted for a reward". A genuinely independent
+group-contribution oracle is being built separately to fill the auditor's
+intended role properly.
+
+``--drift-auditor`` restores the auditor-gap half for anyone who wants it: the
+checkpoint is then loaded -- but only into
 :class:`~polyt5.rl.drift.DriftMonitor`, which is handed to
 :class:`~polyt5.rl.trainer.GRPOTrainer` in an attribute of its own and is never
 passed to the reward arm, never consulted while a reward is computed, and can
@@ -21,13 +48,14 @@ only ever write into the step stats. :func:`build_drift_monitor` additionally
 re-checks that the auditor key is absent from ``reward_ensemble`` before
 constructing anything, on top of the two guards
 :func:`load_frozen_baseline` and :func:`build_reward_ensemble` already apply.
-``--no-drift-monitor`` skips loading it at all.
+``--no-drift-monitor`` skips ALL drift monitoring, similarity included.
 
 Usage:
     python scripts/train_grpo.py --arm accuracy
     python scripts/train_grpo.py --arm composite --set train.max_steps=50
     python scripts/train_grpo.py --arm constraint --max-steps 10 --device cpu
     python scripts/train_grpo.py --arm accuracy --resume results/grpo_accuracy
+    python scripts/train_grpo.py --arm accuracy --drift-auditor
     python scripts/train_grpo.py --arm accuracy --no-drift-monitor
 """
 
@@ -299,46 +327,64 @@ def build_drift_monitor(
     batch_size: int,
     num_beams: int,
     seed: int,
+    load_auditor: bool = False,
 ) -> DriftMonitor:
-    """Build spec section 4.4's drift monitor, auditor included.
+    """Build spec section 4.4's drift monitor.
 
     Args:
         frozen: The parsed ``frozen_baseline.json``.
         cfg: The resolved run config; reads the optional ``drift`` block
             (``reference``, ``max_reference``).
-        tokenizer_path: Tokenizer artifact for the auditor predictor.
+        tokenizer_path: Tokenizer artifact for the auditor predictor. Unused
+            unless ``load_auditor`` is ``True``.
         device: Torch device string.
         batch_size: Decode batch size for the auditor.
         num_beams: Beam width for the auditor. [PAPER] 4.
         seed: Seed for the reference subsample.
+        load_auditor: Opt in to the auditor-gap half (``--drift-auditor``).
+            ``False`` by default, in which case this function does not open,
+            verify, or construct the auditor checkpoint AT ALL -- split 4 is
+            held out of the training process entirely, not merely prevented
+            from reaching a reward. See this module's docstring for the
+            reasoning (sigma is Goodharted by the confidence weight, so the
+            auditor gap was the proposed diagnostic for that; split 4's
+            limited statistical power relative to the reward ensemble makes
+            never loading it the stronger guarantee).
 
     Returns:
-        A :class:`~polyt5.rl.drift.DriftMonitor`. The auditor goes in as a
-        plain callable and the monitor exposes no way to get it back out; see
-        that class's module docstring for why that matters and
-        :class:`~polyt5.rl.trainer.GRPOTrainer` for the second half of the
-        containment.
+        A :class:`~polyt5.rl.drift.DriftMonitor`. When ``load_auditor`` is
+        ``True`` the auditor goes in as a plain callable and the monitor
+        exposes no way to get it back out; see that class's module docstring
+        for why that matters and :class:`~polyt5.rl.trainer.GRPOTrainer` for
+        the second half of the containment. When ``load_auditor`` is
+        ``False`` (the default) the monitor carries no auditor at all --
+        ``has_auditor`` is ``False`` -- and only the max-Tanimoto half is
+        built.
 
     Raises:
-        ValueError: If the auditor split appears in ``reward_ensemble``. This
-            is the third independent check of the same invariant, placed here
-            because this is the only function in the training path that opens
-            the auditor's checkpoint at all.
+        ValueError: If ``load_auditor`` is ``True`` and the auditor split
+            appears in ``reward_ensemble``. This is the third independent
+            check of the same invariant, placed here because this is the
+            only function in the training path that opens the auditor's
+            checkpoint at all -- and it runs only when that checkpoint is
+            actually about to be opened.
     """
-    auditor_key = frozen["auditor"]
-    if auditor_key in frozen["reward_ensemble"]:
-        raise ValueError(
-            f"auditor split {auditor_key!r} appears in reward_ensemble "
-            f"{frozen['reward_ensemble']!r}; refusing to load it anywhere in the training "
-            "process."
+    auditor = None
+    if load_auditor:
+        auditor_key = frozen["auditor"]
+        if auditor_key in frozen["reward_ensemble"]:
+            raise ValueError(
+                f"auditor split {auditor_key!r} appears in reward_ensemble "
+                f"{frozen['reward_ensemble']!r}; refusing to load it anywhere in the training "
+                "process."
+            )
+        meta = frozen["artifacts"][auditor_key]
+        auditor_path = _resolve(meta["path"])
+        verify_artifact(auditor_path, meta["sha256"], label=auditor_key)
+        auditor = PolyT5PropertyPredictor.from_checkpoint(
+            auditor_path, tokenizer_path, device=device, batch_size=batch_size,
+            num_beams=num_beams, property_name="Tg",
         )
-    meta = frozen["artifacts"][auditor_key]
-    auditor_path = _resolve(meta["path"])
-    verify_artifact(auditor_path, meta["sha256"], label=auditor_key)
-    auditor = PolyT5PropertyPredictor.from_checkpoint(
-        auditor_path, tokenizer_path, device=device, batch_size=batch_size,
-        num_beams=num_beams, property_name="Tg",
-    )
 
     drift_cfg = cfg.get("drift", {})
     reference_path = _resolve(drift_cfg.get("reference", DEFAULT_DRIFT_REFERENCE))
@@ -584,11 +630,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Decode batch size for the reward ensemble.")
     parser.add_argument("--predictor-num-beams", type=int, default=4,
                         help="Beam width for the reward ensemble. [PAPER] 4.")
+    parser.add_argument("--drift-auditor", action="store_true",
+                        help="Opt in to spec 4.4's auditor-gap half of drift monitoring: loads "
+                             "the held-out split-4 checkpoint into the training process for "
+                             "logging only (it is never passed to the reward arm). OFF by "
+                             "default -- the auditor checkpoint is not opened at all unless "
+                             "this is passed, so split 4 stays held out of the training "
+                             "process entirely, not merely out of the reward path. "
+                             "Max-Tanimoto similarity monitoring is unaffected by this flag.")
     parser.add_argument("--no-drift-monitor", action="store_true",
-                        help="Skip spec 4.4 drift monitoring. The monitor loads the held-out "
-                             "auditor into the training process (for logging only -- it is "
-                             "never passed to the reward arm); pass this to keep the auditor "
-                             "checkpoint out of the process entirely.")
+                        help="Skip spec 4.4 drift monitoring entirely (similarity included). "
+                             "By default the monitor loads no auditor -- see --drift-auditor -- "
+                             "and needs only the reference set, never a checkpoint, unless "
+                             "--drift-auditor is also passed.")
     return parser.parse_args(argv)
 
 
@@ -677,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
             drift_monitor = build_drift_monitor(
                 frozen, cfg, tokenizer_path, device=str(device),
                 batch_size=args.predictor_batch_size, num_beams=args.predictor_num_beams,
-                seed=seed,
+                seed=seed, load_auditor=args.drift_auditor,
             )
     except (FileNotFoundError, ValueError, KeyError) as error:
         logger.error("could not build the run: %s", error)
@@ -694,7 +748,9 @@ def main(argv: list[str] | None = None) -> int:
         "baseline": str(_resolve(cfg["baseline"])),
         "reward_ensemble": list(frozen["reward_ensemble"]),
         "auditor_excluded_from_reward": frozen["auditor"],
-        "auditor_loaded_for_drift_monitoring": drift_monitor is not None,
+        "auditor_loaded_for_drift_monitoring": (
+            drift_monitor.has_auditor if drift_monitor is not None else False
+        ),
         "reward_ensemble_size": len(predictor),
         "device": str(device),
         # Loud, unmistakable record of any --set reward.* override this run

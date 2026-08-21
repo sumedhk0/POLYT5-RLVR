@@ -51,7 +51,7 @@
   ],
   "auditor": "tg_predictor_split4",
   "auditor_note": "Never used in any reward. Scores final candidates only, so that a reported improvement cannot be an artifact of THESE FOUR PARTICULAR reward models' idiosyncrasies. It is held out of the reward PATH; it is NOT statistically independent of the reward models. scripts/run_splits.py builds five independent random 80/20 splits of the same corpus, not a partitioning k-fold, so split 4 trains on a random 80% of the same LamaLab Tg data and shares ~80% of its training set with each reward model in expectation, and its own held-out 20% is not held out from the reward ensemble. A reward hack that exploits a genuinely data-sparse region of chemical space would fool all five models identically, because all five are sparse there. The check is real and worth having; it cannot establish that a Tg claim is true.",
-  "auditor_process_note": "The auditor may be loaded inside the training process by polyt5.rl.DriftMonitor for spec 4.4's auditor-gap logging. That path is logging-only: GRPOTrainer holds the monitor in an attribute of its own, never passes it to the reward arm, and only writes its output into the step stats. tests/test_rl_drift.py pins that a step's rewards, advantages and loss are identical with and without a monitor attached.",
+  "auditor_process_note": "By default the auditor is held out of the training process entirely, not merely out of the reward path: scripts/train_grpo.py's build_drift_monitor does not open, verify, or construct the split-4 checkpoint unless --drift-auditor is passed. This is stronger than 'loaded but never consulted for a reward' -- sigma (ensemble disagreement) is itself optimized against by the Tg confidence weight, so it cannot double as a trustworthy drift diagnostic, and the auditor gap was the proposed check on that; but auditor_note's ~80%-shared-training-data limitation gives it only weak power to catch what sigma cannot, so never opening it by default is preferred over loading it unused. max-Tanimoto similarity monitoring (polyt5.rl.DriftMonitor's other half) needs no auditor and stays on. --drift-auditor opts back into the auditor-gap half: polyt5.rl.DriftMonitor then loads it for spec 4.4's logging only -- GRPOTrainer holds the monitor in an attribute of its own, never passes it to the reward arm, and only writes its output into the step stats. tests/test_rl_drift.py pins that a step's rewards, advantages and loss are identical with and without a monitor attached.",
   "tg_prediction_5split": {
     "mae": {
       "mean": 28.6733,
@@ -141,6 +141,12 @@
       "utc": "2026-08-21",
       "what": "Added pre_registered_metrics, structural_metrics and success_criterion_statistics; changed accuracy's metric from property_mae to accuracy_score; corrected auditor_note's independence claim.",
       "why": "Final whole-branch review findings B2, S3, S4 and S9. Made before any arm was trained: no RLVR result existed, exists, or influenced any of these choices. The measured baseline numbers above (checkpoint hashes, 5-split metrics, arm_a/arm_b sampling results) are unchanged.",
+      "no_result_exists": true
+    },
+    {
+      "utc": "2026-08-21",
+      "what": "Changed scripts/train_grpo.py's default drift-monitoring behaviour: the held-out split-4 auditor is no longer loaded by default -- build_drift_monitor does not open, verify, or construct its checkpoint unless the new --drift-auditor flag is passed. max-Tanimoto similarity monitoring, which needs no auditor, remains on by default. Rewrote auditor_process_note accordingly.",
+      "why": "Sigma (ensemble disagreement) is itself optimized against by the Tg reward's confidence weight, so it cannot be trusted as a drift diagnostic; the auditor gap was the proposed check on that, but split 4 shares ~80% of its training data with each reward model and so has only weak power against corpus-wide error. Given that limited power, holding split 4 out of the training PROCESS entirely by default is a strictly stronger containment guarantee than loading it unused. A genuinely independent group-contribution oracle is being built separately to fill the auditor's intended role. Made before any arm was trained: no RLVR result existed, exists, or influenced this choice. The measured baseline numbers above are unchanged.",
       "no_result_exists": true
     }
   ]

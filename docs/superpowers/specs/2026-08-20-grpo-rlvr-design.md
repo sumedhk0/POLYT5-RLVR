@@ -134,25 +134,43 @@ measured) and logged into the step stats. If the policy leaves the predictor's s
 report it, rather than quietly forbidding it.
 
 - **max-Tanimoto to the labelled Tg set** — mean, 90th percentile, and the fraction of candidates whose
-  nearest labelled neighbour is at Tanimoto ≥ 0.9. Loop-closed ECFP6, `polyt5.evaluation.similarity`.
+  nearest labelled neighbour is at Tanimoto ≥ 0.9. Loop-closed ECFP6, `polyt5.evaluation.similarity`. ON
+  by default.
 - **the auditor gap** — auditor prediction minus reward-ensemble prediction, mean magnitude and mean
-  signed value.
+  signed value. OFF by default; opt in with `scripts/train_grpo.py --drift-auditor`.
 
-**Why the Tanimoto half is load-bearing.** Novelty as C3 and C4 reward it is *absence of the exact
-canonical form* from the index (`ScalableNoveltyIndex.is_novel`). **A one-atom edit of a memorised
-training polymer scores `novel = 1.0`** — full credit in C3's novelty term, a satisfied conjunct in C4's —
-and no reward term anywhere can tell that from genuinely new chemistry. This is a real limitation of the
-C3/C4 reward, not a bug in the monitor; the monitor is what makes it *visible* rather than what fixes it.
-A rising `max_tanimoto_mean` or `near_copy_fraction` alongside a rising reward means the arm is
-rediscovering the training set. `[OURS]`
+**Why the Tanimoto half is load-bearing, and is the default.** Novelty as C3 and C4 reward it is *absence
+of the exact canonical form* from the index (`ScalableNoveltyIndex.is_novel`). **A one-atom edit of a
+memorised training polymer scores `novel = 1.0`** — full credit in C3's novelty term, a satisfied conjunct
+in C4's — and no reward term anywhere can tell that from genuinely new chemistry. This is a real
+limitation of the C3/C4 reward, not a bug in the monitor; the monitor is what makes it *visible* rather
+than what fixes it. A rising `max_tanimoto_mean` or `near_copy_fraction` alongside a rising reward means
+the arm is rediscovering the training set. `[OURS]` It needs no auditor and is read by no reward term, so
+it is a genuinely unoptimized in-flight signal — unlike σ, see below — and stays on by default.
 
-**Auditor containment.** The monitor loads the held-out split-4 auditor into the training process, which
-is a real risk to the study's central invariant, so the containment is structural rather than
-conventional: the monitor stores the predictor privately and exposes only `observe(...) -> dict[str,
+**Why the auditor gap is not the default.** §4.2's confidence weight (`closeness × coverage ×
+1/(1+σ_eff/17)`) makes σ ITSELF optimized against: it explicitly rewards the policy for landing where the
+four reward models agree with each other, so a falling σ during training cannot be trusted as a drift
+diagnostic on its own — watching the quantity you are optimizing only shows the optimizer worked, not that
+anything real improved. The auditor gap was the original proposed check on exactly that failure mode: a
+fifth model with no gradient into it. But split 4 shares ~80% of its training data with each reward model
+in expectation (five independent random 80/20 draws from one corpus, not a partitioning k-fold — see
+"What the auditor can and cannot establish" above and `frozen_baseline.json`'s `auditor_note`), so it
+detects ensemble-specific error well and corpus-wide error barely. Given that limited power, the decision
+is to hold split 4 out of the training PROCESS entirely by default — never opening its checkpoint — rather
+than load it and rely on the containment below to keep it out of the reward. That is a strictly stronger
+guarantee than "loaded but never consulted for a reward". A genuinely independent group-contribution
+oracle is being built separately to fill the auditor's intended role properly. `[OURS]`
+
+**Auditor containment, when `--drift-auditor` loads it.** Loading the held-out split-4 auditor into the
+training process is a real risk to the study's central invariant, so the containment is structural rather
+than conventional: the monitor stores the predictor privately and exposes only `observe(...) -> dict[str,
 float]`; `GRPOTrainer` holds it in an attribute separate from the reward arm and never passes one to the
 other; `build_drift_monitor` re-checks that the auditor is absent from `reward_ensemble` before opening
 anything; and `tests/test_rl_drift.py` pins that a step's rewards, advantages and loss are identical with
-and without a monitor attached. `--no-drift-monitor` keeps the checkpoint out of the process entirely.
+and without a monitor attached. None of this machinery runs by default: `build_drift_monitor` does not
+open, verify, or construct the auditor checkpoint at all unless `--drift-auditor` is passed.
+`--no-drift-monitor` disables all drift monitoring, Tanimoto included.
 
 The unweighted reward is logged alongside the weighted one, so the gate's effect on the learning signal
 is measurable rather than assumed — and is logged as `null`, not `0.0`, for the two arms (C2, C4) that
@@ -206,7 +224,7 @@ src/polyt5/rl/
     advantages.py        group-relative advantage
     grpo.py              clipped surrogate + k3 KL
     reference_policy.py  frozen π_ref loader
-    drift.py             section 4.4 monitor: auditor gap + max-Tanimoto
+    drift.py             section 4.4 monitor: max-Tanimoto (default) + auditor gap (opt-in)
     trainer.py           the synchronous loop
 
 src/polyt5/rewards/

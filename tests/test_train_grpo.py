@@ -13,6 +13,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -23,10 +24,12 @@ if str(REPO_ROOT / "scripts") not in sys.path:
 import train_grpo  # noqa: E402
 from train_grpo import (  # noqa: E402
     _latest_checkpoint,
+    build_drift_monitor,
     build_reward_arm,
     build_reward_ensemble,
     check_reward_overrides,
     load_frozen_baseline,
+    parse_args,
     sha256_of_file,
     summarize_reward_overrides,
     verify_artifact,
@@ -256,22 +259,189 @@ def test_build_reward_arm_tg_constant_defaults_match_the_documented_values():
 
 
 # --------------------------------------------------- drift monitor (spec 4.4)
+#
+# Split 4 (the auditor) must be truly held out: absent from the training
+# process entirely, not merely prevented from reaching a reward. The default
+# path (``load_auditor=False``) must never open, verify, or construct the
+# auditor checkpoint at all -- max-Tanimoto similarity monitoring stays on,
+# since it needs no auditor and is not itself optimized against (unlike
+# sigma, which the confidence weight rewards the policy for shrinking).
+
+
+def _bogus_frozen(*, reward_ensemble=("split0", "split1", "split2", "split3")):
+    """A ``frozen_baseline.json``-shaped dict whose auditor artifact path does
+    not exist -- opening it would raise ``FileNotFoundError``, so any test
+    that reaches real file access on it fails loudly, not silently.
+    """
+    return {
+        "artifacts": {"split4": {"path": "nope.pt", "sha256": "0" * 64}},
+        "reward_ensemble": list(reward_ensemble),
+        "auditor": "split4",
+    }
+
+
+def test_build_drift_monitor_default_never_touches_the_auditor(tmp_path, monkeypatch):
+    """The containment property itself: patch the two functions that would
+    have to run to open the auditor checkpoint so each raises if called, then
+    prove the default call completes without either firing.
+    """
+    def _must_not_verify(*_args, **_kwargs):
+        raise AssertionError("verify_artifact must not run for the auditor by default")
+
+    class _MustNotConstruct:
+        @classmethod
+        def from_checkpoint(cls, *_args, **_kwargs):
+            raise AssertionError(
+                "PolyT5PropertyPredictor must not be constructed for the auditor by default")
+
+    monkeypatch.setattr(train_grpo, "verify_artifact", _must_not_verify)
+    monkeypatch.setattr(train_grpo, "PolyT5PropertyPredictor", _MustNotConstruct)
+
+    monitor = build_drift_monitor(
+        _bogus_frozen(), {}, tmp_path / "tok.json", device="cpu",
+        batch_size=1, num_beams=1, seed=0,
+    )
+    assert monitor.has_auditor is False
+
+
+def test_build_drift_monitor_default_still_has_similarity(tmp_path):
+    """The one signal that stays on by default: max-Tanimoto needs no
+    predictor at all.
+    """
+    reference = tmp_path / "train.jsonl"
+    reference.write_text(json.dumps({"target": "[At][C][C][O][At]"}) + "\n", encoding="utf-8")
+
+    monitor = build_drift_monitor(
+        _bogus_frozen(), {"drift": {"reference": str(reference)}}, tmp_path / "tok.json",
+        device="cpu", batch_size=1, num_beams=1, seed=0,
+    )
+    assert monitor.has_auditor is False
+    assert monitor.has_similarity is True
+
+
+def test_build_drift_monitor_load_auditor_true_loads_and_verifies_it(tmp_path, monkeypatch):
+    """``load_auditor=True`` (wired from ``--drift-auditor``) is the opt-in
+    path: the checkpoint IS verified and constructed in this case.
+    """
+    verified: list[str] = []
+
+    def _fake_verify(_path, _sha256, *, label):
+        verified.append(label)
+
+    class _FakePredictor:
+        @classmethod
+        def from_checkpoint(cls, *_args, **_kwargs):
+            return lambda candidates: [0.0 for _ in candidates]
+
+    monkeypatch.setattr(train_grpo, "verify_artifact", _fake_verify)
+    monkeypatch.setattr(train_grpo, "PolyT5PropertyPredictor", _FakePredictor)
+
+    monitor = build_drift_monitor(
+        _bogus_frozen(), {}, tmp_path / "tok.json", device="cpu",
+        batch_size=1, num_beams=1, seed=0, load_auditor=True,
+    )
+    assert monitor.has_auditor is True
+    assert verified == ["split4"]
 
 
 def test_build_drift_monitor_refuses_an_auditor_that_leaks_into_the_ensemble(tmp_path):
     """The third independent guard on the same invariant, placed at the only
-    point in the TRAINING path that opens the auditor's checkpoint at all.
+    point in the TRAINING path that opens the auditor's checkpoint at all --
+    so it only fires when the auditor is actually requested.
     """
-    from train_grpo import build_drift_monitor
-
-    frozen = {
-        "artifacts": {"split4": {"path": "nope.pt", "sha256": "0" * 64}},
-        "reward_ensemble": ["split4"],
-        "auditor": "split4",
-    }
+    frozen = _bogus_frozen(reward_ensemble=["split4"])
     with pytest.raises(ValueError, match="auditor"):
         build_drift_monitor(frozen, {}, tmp_path / "tok.json", device="cpu",
-                            batch_size=1, num_beams=1, seed=0)
+                            batch_size=1, num_beams=1, seed=0, load_auditor=True)
+
+
+def test_parse_args_drift_auditor_flag_defaults_off():
+    assert parse_args(["--arm", "accuracy"]).drift_auditor is False
+    assert parse_args(["--arm", "accuracy", "--drift-auditor"]).drift_auditor is True
+
+
+def _stub_main_pipeline_up_to_drift_decision(monkeypatch):
+    """Stub every real object ``main()`` builds up to (but not past) the
+    drift-monitor decision, so a test can observe exactly what happens at
+    that one decision point without a real checkpoint, model, or GPU.
+
+    Returns the sentinel exception ``build_trainer_config`` (the first real
+    call after the drift block) raises, so a test that never triggers the
+    drift block can still prove it got that far.
+    """
+    frozen = _minimal_frozen()
+
+    class _FakeTokenizer:
+        sha256 = "deadbeef"
+
+    class _FakePredictor:
+        def __len__(self):
+            return 4
+
+    monkeypatch.setattr(train_grpo, "load_frozen_baseline", lambda _path: frozen)
+    monkeypatch.setattr(train_grpo, "build_verified_tokenizer", lambda _frozen: _FakeTokenizer())
+    monkeypatch.setattr(train_grpo, "select_device", lambda _device: "cpu")
+    monkeypatch.setattr(train_grpo, "load_verified_model", lambda _frozen, _key: (object(), {}))
+    monkeypatch.setattr(train_grpo, "build_reward_ensemble", lambda *a, **k: _FakePredictor())
+    monkeypatch.setattr(train_grpo, "build_reward_arm", lambda *a, **k: object())
+
+    sentinel = RuntimeError("stopped after the drift-monitor decision (by design)")
+
+    def _stop(*_a, **_k):
+        raise sentinel
+
+    monkeypatch.setattr(train_grpo, "build_trainer_config", _stop)
+    return sentinel
+
+
+def test_main_no_drift_monitor_never_calls_build_drift_monitor(tmp_path, monkeypatch):
+    _stub_main_pipeline_up_to_drift_decision(monkeypatch)
+
+    def _must_not_be_called(*_a, **_k):
+        raise AssertionError("build_drift_monitor must not run under --no-drift-monitor")
+
+    monkeypatch.setattr(train_grpo, "build_drift_monitor", _must_not_be_called)
+
+    with pytest.raises(RuntimeError, match="stopped after the drift-monitor decision"):
+        train_grpo.main([
+            "--arm", "accuracy", "--no-drift-monitor",
+            "--set", f"output.results_root={tmp_path}",
+        ])
+
+
+def test_main_default_wires_load_auditor_false_into_build_drift_monitor(tmp_path, monkeypatch):
+    sentinel = _stub_main_pipeline_up_to_drift_decision(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def _capture(*_a, **kwargs):
+        captured.update(kwargs)
+        raise sentinel
+
+    monkeypatch.setattr(train_grpo, "build_drift_monitor", _capture)
+
+    with pytest.raises(RuntimeError, match="stopped after the drift-monitor decision"):
+        train_grpo.main(["--arm", "accuracy", "--set", f"output.results_root={tmp_path}"])
+    assert captured["load_auditor"] is False
+
+
+def test_main_drift_auditor_flag_wires_load_auditor_true_into_build_drift_monitor(
+    tmp_path, monkeypatch
+):
+    sentinel = _stub_main_pipeline_up_to_drift_decision(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def _capture(*_a, **kwargs):
+        captured.update(kwargs)
+        raise sentinel
+
+    monkeypatch.setattr(train_grpo, "build_drift_monitor", _capture)
+
+    with pytest.raises(RuntimeError, match="stopped after the drift-monitor decision"):
+        train_grpo.main([
+            "--arm", "accuracy", "--drift-auditor",
+            "--set", f"output.results_root={tmp_path}",
+        ])
+    assert captured["load_auditor"] is True
 
 
 def test_load_drift_reference_reads_pselfies_and_drops_junk(tmp_path):

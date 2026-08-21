@@ -193,10 +193,17 @@ SHA-256) and Arm A / Arm B are measured against it. What is built on top of that
   with a k3 KL anchor to a frozen reference policy, and `GRPOTrainer`, the synchronous training loop.
 - **Training CLI** (`scripts/train_grpo.py`) and **four arm configs** (`configs/rl/*.yaml`) — one GRPO run
   per arm, differing only in reward.
-- **Drift monitoring** (`src/polyt5/rl/drift.py`) — spec §4.4's auditor gap and max-Tanimoto-to-training
-  distribution, logged every 50 steps. The auditor is loaded for logging only and never reaches a reward
-  arm; the containment is enforced by construction and pinned by a test that the step's rewards,
-  advantages and loss are identical with and without it.
+- **Drift monitoring** (`src/polyt5/rl/drift.py`) — spec §4.4's max-Tanimoto-to-training distribution,
+  logged every 50 steps, ON by default. The held-out split-4 auditor gap is OFF by default and opt-in via
+  `--drift-auditor`: σ (ensemble disagreement) is itself optimized against — the Tg reward's confidence
+  weight explicitly rewards the policy for landing where the four reward models agree — so σ cannot double
+  as a trustworthy drift signal, and the auditor gap was the proposed check on that. But split 4 shares
+  ~80% of its training data with each reward model (independent random 80% draws from one corpus), so it
+  detects ensemble-specific error well and corpus-wide error barely; given that limited power, the default
+  is to never open its checkpoint at all — held out of the training *process*, not merely the reward path.
+  When loaded (`--drift-auditor`), the containment is enforced by construction and pinned by a test that
+  the step's rewards, advantages and loss are identical with and without it. max-Tanimoto needs no auditor
+  and stays on regardless, since it is not itself optimized against.
 - **Arm-comparison matrix** (`scripts/compare_arms.py`) — samples fresh candidates from every trained arm
   under the frozen evaluation protocol and scores them twice: once by the reward ensemble (splits 0–3,
   "the metric it optimized") and once by the held-out auditor (split 4, never used in any reward path).
