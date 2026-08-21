@@ -22,10 +22,13 @@ import compare_arms  # noqa: E402
 from compare_arms import (  # noqa: E402
     ARM_METRIC,
     MATRIX_COLUMNS,
+    ArmScorers,
     _auditor_predictions,
+    _bootstrap_delta,
     _metric_column,
     _score_with_arm,
     apply_success_criterion,
+    check_pre_registration,
     skipped_arm_row,
     write_matrix_csv,
     write_matrix_markdown,
@@ -45,9 +48,28 @@ def test_arm_metric_constraint_is_constraint_satisfaction_rate():
     assert ARM_METRIC["constraint"] == ("constraint_satisfaction_rate", "higher")
 
 
-def test_arm_metric_accuracy_and_validity_unchanged():
-    assert ARM_METRIC["accuracy"] == ("property_mae", "lower")
+def test_arm_metric_accuracy_is_accuracy_score_not_property_mae():
+    """Ruling G / mutant (b). C1's reward is mean(closeness x confidence) over
+    the FULL rollout batch; ``property_mae`` is unweighted, unclipped and
+    computed only over PV survivors, so the two can move in opposite
+    directions. Reverting this line judges C1 on a metric its own reward can
+    move against -- the identical defect the ledger already ruled invalidating
+    for ``composite``.
+    """
+    assert ARM_METRIC["accuracy"] == ("accuracy_score", "higher")
+
+
+def test_arm_metric_validity_unchanged():
     assert ARM_METRIC["validity"] == ("pv_rate", "higher")
+
+
+def test_property_mae_is_still_reported_for_every_row():
+    """It is not C1's success metric, but it IS the paper's headline
+    conditioning metric and arm_b's frozen number is one, so it stays in the
+    matrix as an off-diagonal column.
+    """
+    assert "property_mae_auditor" in MATRIX_COLUMNS
+    assert "property_mae_ensemble" in MATRIX_COLUMNS
 
 
 def test_every_arm_metric_column_exists_in_the_matrix():
@@ -62,97 +84,196 @@ def test_every_arm_metric_column_exists_in_the_matrix():
             assert column in MATRIX_COLUMNS, (arm, metric, predictor, column)
 
 
-# ------------------------------------------------------------------ _metric_column
+# --------------------------------------------------------- pre-registration binding
 
 
-def test_metric_column_structural_metric_ignores_predictor():
-    assert _metric_column("pv_rate", "auditor") == "pv_rate"
-    assert _metric_column("pv_rate", "ensemble") == "pv_rate"
+def _frozen():
+    import json
+    path = REPO_ROOT / "artifacts" / "baseline" / "frozen_baseline.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_metric_column_non_structural_suffixes_by_predictor():
-    assert _metric_column("property_mae", "auditor") == "property_mae_auditor"
-    assert _metric_column("composite_score", "ensemble") == "composite_score_ensemble"
+def test_arm_metric_matches_the_frozen_pre_registration():
+    """Ruling H / finding S4. The executable criterion used to live entirely in
+    ``ARM_METRIC`` -- ordinary mutable Python that nothing bound to the
+    pre-registration -- so a post-run edit produced a ``summary.json`` that
+    looked equally authoritative. This fails if the code and the frozen record
+    ever disagree, in EITHER direction.
+    """
+    problems = check_pre_registration(_frozen())
+    assert problems == [], problems
+
+
+def test_pre_registration_check_catches_a_changed_metric(monkeypatch):
+    """The binding test must actually be able to fail -- verified against the
+    exact mutant it guards (reverting accuracy to ``property_mae``).
+    """
+    monkeypatch.setitem(compare_arms.ARM_METRIC, "accuracy", ("property_mae", "lower"))
+    problems = check_pre_registration(_frozen())
+    assert problems, "reverting accuracy to property_mae was not detected"
+    assert any("accuracy" in problem for problem in problems), problems
+
+
+def test_pre_registration_check_catches_a_changed_margin(monkeypatch):
+    monkeypatch.setitem(compare_arms.ARM_MIN_MARGIN, "composite", 0.0)
+    problems = check_pre_registration(_frozen())
+    assert any("min_margin" in problem for problem in problems), problems
+
+
+def test_frozen_record_pins_a_margin_for_every_arm():
+    registered = _frozen()["pre_registered_metrics"]
+    for arm in ARM_METRIC:
+        assert float(registered[arm]["min_margin"]) > 0.0, arm
+
+
+# ------------------------------------------------------------------ _bootstrap_delta
+
+
+def test_bootstrap_delta_is_signed_so_positive_always_means_better():
+    higher, _lo, _hi = _bootstrap_delta([1.0] * 50, [0.0] * 50, direction="higher", n_boot=200)
+    lower, _lo2, _hi2 = _bootstrap_delta([1.0] * 50, [2.0] * 50, direction="lower", n_boot=200)
+    assert higher == pytest.approx(1.0)
+    assert lower == pytest.approx(1.0), "for a 'lower is better' metric, being 1.0 lower is +1.0"
+
+
+def test_bootstrap_delta_interval_excludes_zero_for_a_clean_separation():
+    _delta, low, high = _bootstrap_delta([1.0] * 200, [0.0] * 200, direction="higher", n_boot=400)
+    assert low > 0.0 and high > 0.0
+
+
+def test_bootstrap_delta_interval_includes_zero_for_noise():
+    own = [1.0 if i % 2 else 0.0 for i in range(40)]
+    base = [1.0 if i % 3 else 0.0 for i in range(40)]
+    _delta, low, high = _bootstrap_delta(own, base, direction="higher", n_boot=800)
+    assert low < 0.0 < high, (low, high)
+
+
+def test_bootstrap_delta_is_none_on_an_empty_sample():
+    assert _bootstrap_delta([], [1.0], direction="higher") == (None, None, None)
+    assert _bootstrap_delta([1.0], [], direction="higher") == (None, None, None)
 
 
 # ----------------------------------------------------------- apply_success_criterion
 
 
-def _row(arm, **values):
+def _row(arm, *, samples=None, **values):
     row = dict.fromkeys(MATRIX_COLUMNS)
     row["arm"] = arm
+    # Default every row to arm_b's operating point, so a test that is not
+    # ABOUT the sampling clause does not accidentally exercise it.
+    row["temperature"] = 0.7
+    row["top_p"] = 0.95
     row.update(values)
+    if samples is not None:
+        row[compare_arms.SAMPLES_KEY] = samples
     return row
 
 
-def test_apply_success_criterion_true_when_both_clauses_hold_lower_is_better():
+def _samples(metric, values, *, auditor=None):
+    """Per-candidate samples for one metric; same on both predictors unless told."""
+    return {metric: {"ensemble": list(values), "auditor": list(auditor or values)}}
+
+
+N = 300
+BOOT = {"n_boot": 300}
+
+
+def test_apply_success_criterion_true_when_every_clause_holds():
     rows = [
-        _row("arm_b", property_mae_ensemble=50.0, property_mae_auditor=50.0),
-        _row("accuracy", property_mae_ensemble=40.0, property_mae_auditor=40.0),
+        _row("arm_b", composite_score_ensemble=0.5, composite_score_auditor=0.5,
+             samples=_samples("composite_score", [0.5] * N)),
+        _row("composite", composite_score_ensemble=0.9, composite_score_auditor=0.9,
+             samples=_samples("composite_score", [0.9] * N)),
     ]
-    apply_success_criterion(rows)
-    accuracy = rows[1]
-    assert accuracy["beats_arm_b"] is True
-    assert accuracy["survives_audit"] is True
-    assert accuracy["success"] is True
+    apply_success_criterion(rows, **BOOT)
+    composite = rows[1]
+    assert composite["beats_arm_b"] is True
+    assert composite["survives_audit"] is True
+    assert composite["success"] is True
+    assert composite["delta_ensemble"] == pytest.approx(0.4)
+    assert composite["delta_ensemble_ci_low"] > 0.0
 
 
-def test_apply_success_criterion_false_when_ensemble_clause_fails_lower_is_better():
-    rows = [
-        _row("arm_b", property_mae_ensemble=50.0, property_mae_auditor=50.0),
-        _row("accuracy", property_mae_ensemble=60.0, property_mae_auditor=40.0),
-    ]
-    apply_success_criterion(rows)
-    accuracy = rows[1]
-    assert accuracy["beats_arm_b"] is False
-    assert accuracy["survives_audit"] is True
-    assert accuracy["success"] is False
-
-
-def test_apply_success_criterion_false_when_only_audit_clause_fails():
-    """The reward-hacking scenario the two-clause design exists to catch: a
-    win under the ensemble that does not survive independent auditing.
+def test_apply_success_criterion_rejects_a_win_smaller_than_the_margin():
+    """Ruling H / mutant (c): reverting the criterion to a bare comparison
+    makes this pass. A 0.005 improvement is real, perfectly reproducible, and
+    has an interval that excludes zero by a mile -- and is a quarter of the
+    pre-registered 0.02 minimum effect size, so it is NOT a win.
     """
     rows = [
-        _row("arm_b", property_mae_ensemble=50.0, property_mae_auditor=50.0),
-        _row("accuracy", property_mae_ensemble=40.0, property_mae_auditor=60.0),
+        _row("arm_b", composite_score_ensemble=0.500, composite_score_auditor=0.500,
+             samples=_samples("composite_score", [0.500] * N)),
+        _row("composite", composite_score_ensemble=0.505, composite_score_auditor=0.505,
+             samples=_samples("composite_score", [0.505] * N)),
     ]
-    apply_success_criterion(rows)
-    accuracy = rows[1]
-    assert accuracy["beats_arm_b"] is True
-    assert accuracy["survives_audit"] is False
-    assert accuracy["success"] is False
+    apply_success_criterion(rows, **BOOT)
+    composite = rows[1]
+    assert composite["delta_ensemble"] == pytest.approx(0.005)
+    assert composite["delta_ensemble_ci_low"] > 0.0, "the CI alone would call this a win"
+    assert composite["beats_arm_b"] is False, "below the pre-registered min_margin"
+    assert composite["success"] is False
 
 
-def test_apply_success_criterion_higher_is_better_direction():
+def test_apply_success_criterion_rejects_a_large_win_whose_interval_spans_zero():
+    """The other half of Ruling H / mutant (c): a difference FIVE TIMES the
+    minimum effect size, in the right direction, that is still
+    indistinguishable from sampling noise. The margin alone would call this a
+    win; only the interval catches it.
+    """
+    own = [1.0] * 22 + [0.0] * 18          # mean 0.55
+    base = [1.0] * 18 + [0.0] * 22         # mean 0.45
     rows = [
-        _row("arm_b", constraint_satisfaction_rate_ensemble=0.3,
-             constraint_satisfaction_rate_auditor=0.3),
-        _row("constraint", constraint_satisfaction_rate_ensemble=0.5,
-             constraint_satisfaction_rate_auditor=0.5),
+        _row("arm_b", composite_score_ensemble=0.45, composite_score_auditor=0.45,
+             samples=_samples("composite_score", base)),
+        _row("composite", composite_score_ensemble=0.55, composite_score_auditor=0.55,
+             samples=_samples("composite_score", own)),
     ]
-    apply_success_criterion(rows)
-    assert rows[1]["success"] is True
+    apply_success_criterion(rows, **BOOT)
+    composite = rows[1]
+    assert composite["delta_ensemble"] == pytest.approx(0.10)
+    assert composite["delta_ensemble"] > 0.02, "well past the pre-registered min_margin"
+    assert composite["delta_ensemble_ci_low"] < 0.0 < composite["delta_ensemble_ci_high"]
+    assert composite["beats_arm_b"] is False, (
+        "a 0.10 difference on n=40 with unit-scale spread is noise; the margin alone "
+        "would have called it a win"
+    )
+
+
+def test_apply_success_criterion_false_when_only_the_audit_clause_fails():
+    """The reward-hacking scenario the two-clause design exists to catch: a
+    win under the reward ensemble that does not survive the auditor.
+    """
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.5, composite_score_auditor=0.5,
+             samples=_samples("composite_score", [0.5] * N)),
+        _row("composite", composite_score_ensemble=0.9, composite_score_auditor=0.4,
+             samples=_samples("composite_score", [0.9] * N, auditor=[0.4] * N)),
+    ]
+    apply_success_criterion(rows, **BOOT)
+    composite = rows[1]
+    assert composite["beats_arm_b"] is True
+    assert composite["survives_audit"] is False
+    assert composite["success"] is False
 
 
 def test_apply_success_criterion_a_tie_does_not_count_as_beating():
     rows = [
-        _row("arm_b", property_mae_ensemble=50.0, property_mae_auditor=50.0),
-        _row("accuracy", property_mae_ensemble=50.0, property_mae_auditor=50.0),
+        _row("arm_b", samples=_samples("accuracy_score", [0.5] * N)),
+        _row("accuracy", samples=_samples("accuracy_score", [0.5] * N)),
     ]
-    apply_success_criterion(rows)
+    apply_success_criterion(rows, **BOOT)
     accuracy = rows[1]
+    assert accuracy["delta_ensemble"] == pytest.approx(0.0)
     assert accuracy["beats_arm_b"] is False
-    assert accuracy["survives_audit"] is False
     assert accuracy["success"] is False
 
 
 def test_apply_success_criterion_none_propagates_when_metric_unmeasured():
     rows = [
-        _row("arm_b", property_mae_ensemble=None, property_mae_auditor=50.0),
-        _row("accuracy", property_mae_ensemble=40.0, property_mae_auditor=40.0),
+        _row("arm_b"),
+        _row("accuracy", samples=_samples("accuracy_score", [0.9] * N)),
     ]
-    apply_success_criterion(rows)
+    apply_success_criterion(rows, **BOOT)
     accuracy = rows[1]
     assert accuracy["beats_arm_b"] is None
     assert accuracy["success"] is None
@@ -161,56 +282,95 @@ def test_apply_success_criterion_none_propagates_when_metric_unmeasured():
 def test_apply_success_criterion_none_for_arms_with_no_optimized_metric():
     rows = [
         _row("arm_a"),
-        _row("arm_b", property_mae_ensemble=50.0, property_mae_auditor=50.0),
+        _row("arm_b", samples=_samples("accuracy_score", [0.5] * N)),
     ]
-    apply_success_criterion(rows)
+    apply_success_criterion(rows, **BOOT)
     assert rows[0]["beats_arm_b"] is None
     assert rows[0]["survives_audit"] is None
     assert rows[0]["success"] is None
 
 
 def test_apply_success_criterion_structural_metric_reports_na_not_true():
-    """Ruling D / finding 7: ``pv_rate`` is structural, so clause 2 must
-    never silently read as an independently-confirmed pass.
+    """Ruling D: ``pv_rate`` is structural, so clause 2 must never silently
+    read as an independently-confirmed pass.
     """
     rows = [
-        _row("arm_b", pv_rate=0.5),
-        _row("validity", pv_rate=0.6),
+        _row("arm_b", pv_rate=0.5, samples=_samples("pv_rate", [0.5] * N)),
+        _row("validity", pv_rate=0.9, samples=_samples("pv_rate", [0.9] * N)),
     ]
-    apply_success_criterion(rows)
+    apply_success_criterion(rows, **BOOT)
     validity = rows[1]
     assert validity["beats_arm_b"] is True
-    assert validity["survives_audit"] == "N/A - structural metric, no predictor involved"
+    assert validity["survives_audit"] == compare_arms.STRUCTURAL_AUDIT_NOTE
     assert validity["success"] is True  # reduces to beats_arm_b alone
+    assert validity["delta_auditor"] is None, "no auditor comparison was made"
 
 
 def test_apply_success_criterion_structural_metric_false_when_it_does_not_beat_arm_b():
     rows = [
-        _row("arm_b", pv_rate=0.5),
-        _row("validity", pv_rate=0.4),
+        _row("arm_b", pv_rate=0.9, samples=_samples("pv_rate", [0.9] * N)),
+        _row("validity", pv_rate=0.5, samples=_samples("pv_rate", [0.5] * N)),
     ]
-    apply_success_criterion(rows)
+    apply_success_criterion(rows, **BOOT)
     assert rows[1]["success"] is False
 
 
 def test_apply_success_criterion_regression_arm_b_optimized_value_is_never_read():
     """The exact bug fixed by hand in the original submission: arm_b has no
-    ``ARM_METRIC`` entry, so ``arm_b["optimized_value_*"]`` is ALWAYS
-    ``None`` on its own row. Reading it (instead of arm_b's own
-    ``property_mae_*`` column) makes every RLVR arm's success verdict
-    ``None`` regardless of the real numbers -- this must not regress.
+    ``ARM_METRIC`` entry, so ``arm_b["optimized_value_*"]`` is ALWAYS ``None``
+    on its own row. Reading it makes every RLVR arm's verdict ``None``
+    regardless of the real numbers -- this must not regress.
     """
     rows = [
-        _row("arm_b", property_mae_ensemble=50.0, property_mae_auditor=50.0,
-             optimized_value_ensemble=None, optimized_value_auditor=None),
-        _row("accuracy", property_mae_ensemble=30.0, property_mae_auditor=30.0),
+        _row("arm_b", optimized_value_ensemble=None, optimized_value_auditor=None,
+             samples=_samples("accuracy_score", [0.2] * N)),
+        _row("accuracy", samples=_samples("accuracy_score", [0.8] * N)),
     ]
-    apply_success_criterion(rows)
-    accuracy = rows[1]
-    assert accuracy["success"] is True, (
+    apply_success_criterion(rows, **BOOT)
+    assert rows[1]["success"] is True, (
         "success came back non-True even though accuracy clearly beats arm_b on both "
         "predictors -- the arm_b['optimized_value_*'] regression is back"
     )
+
+
+# ------------------------------------------------- sampling point (finding 11)
+
+
+def test_sampling_mismatch_refuses_the_verdict_rather_than_failing_the_arm():
+    """Finding 11: an arm trained with ``--set train.temperature=1.0`` is
+    resampled at 1.0 and cannot be compared to arm_b on any column. The row
+    must be marked and ``success`` refused -- ``None``, not ``False``: the arm
+    has not lost, it has not been measured comparably.
+    """
+    rows = [
+        _row("arm_b", samples=_samples("accuracy_score", [0.2] * N)),
+        _row("accuracy", temperature=1.0, samples=_samples("accuracy_score", [0.9] * N)),
+    ]
+    apply_success_criterion(rows, **BOOT)
+    accuracy = rows[1]
+    assert accuracy["sampling_matches_arm_b"] is False
+    assert accuracy["beats_arm_b"] is True, "the comparison is still recorded"
+    assert accuracy["success"] is None, "but no verdict is issued"
+
+
+def test_sampling_match_is_recorded_true_when_the_points_agree():
+    rows = [
+        _row("arm_b", samples=_samples("accuracy_score", [0.2] * N)),
+        _row("accuracy", samples=_samples("accuracy_score", [0.9] * N)),
+    ]
+    apply_success_criterion(rows, **BOOT)
+    assert rows[1]["sampling_matches_arm_b"] is True
+    assert rows[1]["success"] is True
+
+
+def test_sampling_match_is_none_for_an_untrained_arm_placeholder():
+    rows = [
+        _row("arm_b", samples=_samples("accuracy_score", [0.2] * N)),
+        skipped_arm_row("accuracy"),
+    ]
+    apply_success_criterion(rows, **BOOT)
+    assert rows[1]["sampling_matches_arm_b"] is None
+    assert rows[1]["success"] is None
 
 
 # ----------------------------------------------------------------- skipped_arm_row
@@ -334,26 +494,31 @@ def test_evaluate_arm_auditor_predictions_are_wired_through_the_helper(monkeypat
             self.calls.append(list(predictions))
             return [_FakeResult(1.0) for _ in candidates]
 
-    composite_arm = _RecordingArm()
-    constraint_arm = _RecordingArm()
+    auditor_scorers = ArmScorers(
+        accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
+    ensemble_scorers = ArmScorers(
+        accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
 
     row = compare_arms.evaluate_arm(
         None, None, arm_key="composite", label="test", kind="rlvr",
         point=SweepPoint(temperature=0.7, top_p=0.95), targets=[300.0, 400.0], n_samples=2,
         training_index=None, auditor=fake_auditor, ensemble=_FakeEnsemble(),
-        composite_arm=composite_arm, constraint_arm=constraint_arm, device="cpu",
+        auditor_scorers=auditor_scorers, ensemble_scorers=ensemble_scorers, device="cpu",
         batch_size=2, max_length=200, seed=0, tolerance=50.0,
         checkpoint_label=None, checkpoint_sha256=None, novelty_index_sha256=None,
     )
 
-    # evaluate_arm computes the auditor-scored column before the
-    # ensemble-scored one, for both arms (see its body) -- calls[0] is
-    # therefore always the auditor-built triples, calls[1] the ensemble's.
-    assert composite_arm.calls[0] == [(111.0, 0.0, 1), (222.0, 0.0, 1)]
-    assert composite_arm.calls[1] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
-    assert constraint_arm.calls[0] == [(111.0, 0.0, 1), (222.0, 0.0, 1)]
-    assert constraint_arm.calls[1] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
+    # The auditor-side scorers receive the (mean, 0.0, 1) triples and the
+    # ensemble-side scorers the real ones -- the two sets are kept separate
+    # precisely so their `ensemble_size` can differ (1 vs len(ensemble)).
+    for scorer in (auditor_scorers.accuracy, auditor_scorers.composite,
+                   auditor_scorers.constraint):
+        assert scorer.calls[0] == [(111.0, 0.0, 1), (222.0, 0.0, 1)]
+    for scorer in (ensemble_scorers.accuracy, ensemble_scorers.composite,
+                   ensemble_scorers.constraint):
+        assert scorer.calls[0] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
     assert row["composite_score_auditor"] == pytest.approx(1.0)
+    assert row["accuracy_score_ensemble"] == pytest.approx(1.0)
 
 
 # ------------------------------------------------------------------ matrix writers

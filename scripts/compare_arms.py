@@ -26,34 +26,65 @@ the only way the columns are actually comparable:
 Every predictor-dependent column is measured TWICE:
 
 * by **the auditor** (``frozen_baseline.json``'s ``auditor`` split,
-  ``tg_predictor_split4``) -- held out of every reward path, so this number
-  cannot be an artifact of the reward model an RLVR arm was optimised against.
+  ``tg_predictor_split4``) -- held out of every reward PATH, so this number
+  cannot be an artifact of the four particular models an RLVR arm was optimised
+  against. It is not an independent confirmation of the Tg claim itself: the
+  auditor is an independent random 80% sibling of the same corpus and shares
+  ~80% of its training data with each reward model in expectation, so a hack
+  exploiting a genuinely data-sparse region fools all five identically. See
+  ``frozen_baseline.json``'s ``auditor_note``.
 * by **the reward ensemble** (the same four splits ``scripts/train_grpo.py``
   builds the reward from) -- this is literally "the metric it optimized" for
   the RLVR arms, and gives a same-scale baseline for Arm A/B too.
 
 [DECISION] (Ruling C) The auditor is a SINGLE model, so it has no ensemble
 disagreement to report; every auditor-side prediction is fed to the reward
-arms as ``(mean, std=0.0, n=1)``, which drives ``TgRewardConfig``'s confidence
-weight to exactly 1.0. Concretely: the ensemble-scored ``composite_score`` /
-accuracy reward is the TRUE, confidence-weighted objective an arm actually
+arms as ``(mean, std=0.0, n=1)``, and the auditor-side arm objects are built
+with ``ensemble_size=1``. Coverage is then ``1/1`` and the spread is the
+reported ``0.0``, which drives ``TgRewardConfig``'s confidence weight to
+exactly 1.0. Concretely: the ensemble-scored ``accuracy_score`` /
+``composite_score`` is the TRUE, confidence-weighted objective an arm actually
 optimizes; the auditor-scored version of the same quantity is UNWEIGHTED
 closeness. This is deliberate, not an inconsistency -- confidence weighting is
 a training-time steering device that keeps the policy away from predictions
 its own ensemble cannot back; the auditor is answering a different question
 (is the Tg claim true at all), so scoring it without that weighting is the
 intended, and slightly STRICTER, comparison: the safe direction for a
-reward-hacking check. See ``_auditor_predictions``.
+reward-hacking check. Note that "1 of 1" and "1 of 4" are deliberately NOT the
+same case to :mod:`polyt5.rewards.tg` -- see its module docstring -- which is
+exactly why the two sets of arm objects declare different ``ensemble_size``
+values. See ``_auditor_predictions`` and :class:`ArmScorers`.
 
 The pre-registered ``success_criterion`` -- "An RLVR arm succeeds only if it
 beats arm_b on the metric it optimized AND the gain survives scoring by the
-auditor" -- is applied per RLVR arm as a two-clause test:
+auditor" -- is applied per RLVR arm as a three-clause test:
 
     beats_arm_b    = ensemble-scored optimized metric beats arm_b's
                      ensemble-scored value of the SAME metric
     survives_audit = auditor-scored optimized metric beats arm_b's
                      auditor-scored value of the SAME metric
-    success        = beats_arm_b AND survives_audit
+    success        = beats_arm_b AND survives_audit AND sampling_matches_arm_b
+
+"Beats" is NOT a bare inequality. A bare ``<``/``>`` on point estimates from a
+single generation seed records an 0.1 K win as ``success = True``,
+indistinguishable from sampling noise -- arm_a and arm_b differ by 3.6 K and
+MAE sampling error on ~840 survivors at RMSE ~44 K is order 1.5 K. Each clause
+therefore requires BOTH an effect at least as large as the arm's
+pre-registered ``min_margin`` AND a 95% percentile-bootstrap confidence
+interval over candidates that excludes zero (:func:`_bootstrap_delta`). Both
+the metric and the margin live in ``frozen_baseline.json``'s
+``pre_registered_metrics``, not only in the mutable :data:`ARM_METRIC`;
+:func:`check_pre_registration` asserts the two agree before anything is
+measured, so a post-run edit to either one fails loudly instead of producing a
+new, equally authoritative-looking ``summary.json``.
+
+The third clause is finding 11: an RLVR arm is resampled at the temperature and
+``top_p`` its own run trained with, and a single
+``train_grpo.py --set train.temperature=1.0`` therefore produces a row that
+cannot be compared to arm_b on ANY column (temperature alone moves MAE 7.1%
+between arm_a and arm_b). ``sampling_matches_arm_b`` records that per row and
+``success`` is refused -- left ``None``, not ``False`` -- when it is false: the
+arm has not failed, it has not been measured comparably.
 
 [DECISION] (Ruling D) For an arm whose optimized metric is purely STRUCTURAL
 (``pv_rate`` -- RDKit chemistry, no predictor in the loop at all), clause 2 is
@@ -82,16 +113,27 @@ so the only part of the conjunction clause 2 can independently confirm is Tg,
 and it does. See :func:`_score_with_arm` and
 :class:`~polyt5.rewards.composite.ConstraintArm`.
 
-See ``ARM_METRIC`` for which column each arm is judged on and why; ``composite``
-and ``constraint`` need PER-CANDIDATE scoring (not an aggregate the paper's
-sweep machinery already returns), so this script reuses the actual
-``polyt5.rewards`` arm objects -- ``build_reward_arm("composite", ...)`` /
-``build_reward_arm("constraint", ...)`` -- built ONCE from the CANONICAL
-``configs/rl/{composite,constraint}.yaml`` and applied identically to every
-row, never from an RLVR arm's own (possibly ``--set``-overridden) training
-config. That is what "computed identically for every row" requires: the
-formula must be the same across rows, independent of how any one arm was
-actually trained.
+See ``ARM_METRIC`` for which column each arm is judged on and why. ``accuracy``,
+``composite`` and ``constraint`` all need PER-CANDIDATE scoring (not an
+aggregate the paper's sweep machinery already returns), so this script reuses
+the actual ``polyt5.rewards`` arm objects -- ``build_reward_arm("accuracy",
+...)`` / ``("composite", ...)`` / ``("constraint", ...)`` -- built ONCE from the
+CANONICAL ``configs/rl/*.yaml`` and applied identically to every row, never
+from an RLVR arm's own (possibly ``--set``-overridden) training config. That is
+what "computed identically for every row" requires: the formula must be the
+same across rows, independent of how any one arm was actually trained.
+
+``accuracy_score`` was added for exactly the reason Task 8 added
+``composite_score``: ``ARM_METRIC["accuracy"]`` used to be ``property_mae``,
+which is not what C1 optimizes. C1's reward is ``mean(closeness x confidence)``
+over the FULL rollout batch, with closeness clipped to zero beyond
+``tolerance = 100 K`` and gated candidates contributing ``0.0``;
+``property_mae`` is unweighted, unclipped and computed only over PV survivors,
+so the two can move in opposite directions (measured: errors
+``[10, 10, 120, 120] K`` beat errors ``[5, 5, 300, 300] K`` on MAE and lose on
+C1's own reward). ``property_mae`` is KEPT as a reported column for every row --
+it is the paper's headline conditioning metric and arm_b's frozen number is one
+-- it is simply not C1's pre-registered success criterion.
 
 Outputs (always ``results/arm_comparison/`` unless ``--out`` overrides it):
     matrix.csv     one row per arm, every measured column
@@ -111,8 +153,11 @@ import csv
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
@@ -155,7 +200,10 @@ STRUCTURAL_METRICS: frozenset[str] = frozenset({"pv_rate"})
 #: The metric each RLVR arm is compared against arm_b on, and which direction
 #: is "better", matched against each arm's actual reward definition in
 #: ``polyt5.rewards.composite``:
-#:   accuracy   - AccuracyArm's reward IS Tg closeness -> property_mae (lower).
+#:   accuracy   - AccuracyArm's reward IS mean(closeness x confidence) over the
+#:                FULL batch, so it is scored directly with the arm object ->
+#:                accuracy_score (higher). NOT property_mae; see the module
+#:                docstring.
 #:   validity   - ValidityArm's reward IS "cleared the full SV->TSD->DD->PV
 #:                cascade" -> pv_rate (higher); STRUCTURAL (see above).
 #:   composite  - CompositeArm's reward is w_tg*r_tg + w_pv*pv_pass +
@@ -163,29 +211,79 @@ STRUCTURAL_METRICS: frozenset[str] = frozenset({"pv_rate"})
 #:                aggregate column, so it is scored directly with the arm
 #:                object itself -> composite_score (higher).
 #:   constraint - ConstraintArm's reward is a conjunction over (|Tg-target| <=
-#:                tolerance) AND (SA <= sa_max) AND novel -- again no existing
-#:                aggregate captures the joint, so it is scored directly ->
-#:                constraint_satisfaction_rate (higher).
+#:                tolerance) AND (SA <= sa_max) AND novel AND ensemble-backed --
+#:                again no existing aggregate captures the joint, so it is
+#:                scored directly -> constraint_satisfaction_rate (higher).
+#:
+#: This mapping is ordinary mutable Python and therefore is NOT the
+#: pre-registration. ``frozen_baseline.json``'s ``pre_registered_metrics`` is;
+#: :func:`check_pre_registration` refuses to run if the two disagree.
 ARM_METRIC: dict[str, tuple[str, str]] = {
-    "accuracy": ("property_mae", "lower"),
+    "accuracy": ("accuracy_score", "higher"),
     "validity": ("pv_rate", "higher"),
     "composite": ("composite_score", "higher"),
     "constraint": ("constraint_satisfaction_rate", "higher"),
 }
 
+#: Minimum improvement over arm_b, in each metric's own units, below which a
+#: difference is not called a win no matter how tight the bootstrap interval
+#: is. Pre-registered in ``frozen_baseline.json`` alongside the metric names.
+ARM_MIN_MARGIN: dict[str, float] = {
+    "accuracy": 0.01,
+    "validity": 0.02,
+    "composite": 0.02,
+    "constraint": 0.02,
+}
+
+#: Bootstrap settings, pre-registered in ``frozen_baseline.json``'s
+#: ``success_criterion_statistics``.
+N_BOOTSTRAP = 2000
+BOOTSTRAP_CONFIDENCE = 0.95
+BOOTSTRAP_SEED = 0
+
 MATRIX_COLUMNS: tuple[str, ...] = (
     "arm", "kind", "checkpoint", "checkpoint_sha256", "temperature", "top_p",
-    "n_requested",
+    "sampling_matches_arm_b", "n_requested",
     "n_sv", "sv_rate", "n_tsd", "tsd_rate", "n_dd", "dd_rate", "n_pv", "pv_rate",
     "sr_rate", "duplicate_rate", "mean_length",
     "property_mean_auditor", "property_mae_auditor", "tp_rate_auditor",
     "property_mean_ensemble", "property_mae_ensemble", "tp_rate_ensemble",
+    "accuracy_score_auditor", "accuracy_score_ensemble",
     "composite_score_auditor", "composite_score_ensemble",
     "constraint_satisfaction_rate_auditor", "constraint_satisfaction_rate_ensemble",
     "novelty_index_sha256",
-    "optimized_metric", "optimized_value_auditor", "optimized_value_ensemble",
+    "optimized_metric", "optimized_min_margin",
+    "optimized_value_auditor", "optimized_value_ensemble",
+    "delta_ensemble", "delta_ensemble_ci_low", "delta_ensemble_ci_high",
+    "delta_auditor", "delta_auditor_ci_low", "delta_auditor_ci_high",
     "beats_arm_b", "survives_audit", "success",
 )
+
+#: Row key holding the per-candidate values every metric's mean is taken over,
+#: which the bootstrap resamples. Kept off :data:`MATRIX_COLUMNS` (it is a
+#: 1500-element list per metric per predictor, not a cell) and stripped before
+#: ``summary.json`` is written.
+SAMPLES_KEY = "_metric_samples"
+
+
+@dataclass(frozen=True)
+class ArmScorers:
+    """The canonical reward-arm objects one predictor's triples are scored with.
+
+    Two instances exist per run -- one for the auditor (built with
+    ``ensemble_size=1``) and one for the reward ensemble (built with
+    ``ensemble_size=len(ensemble)``) -- and each is shared by EVERY row,
+    including arm_a's and arm_b's. That is what "computed identically for every
+    row" means here: the formula is fixed across rows, while the ensemble size
+    correctly describes the predictor whose triples are being scored. Feeding
+    a four-member ensemble's triples to an arm declaring ``ensemble_size=1``
+    raises in :func:`~polyt5.rewards.tg.tg_reward` rather than silently
+    treating a one-member answer as full coverage.
+    """
+
+    accuracy: Any
+    composite: Any
+    constraint: Any
 
 
 def _resolve(path: str | Path) -> Path:
@@ -235,37 +333,162 @@ def _auditor_predictions(means: Sequence[float]) -> list[tuple[float, float, int
     return [(float(mean), 0.0, 1) for mean in means]
 
 
-def _score_with_arm(
+def _arm_values(
     arm, candidates: list[str], sample_targets: list[float],
     predictions: list[tuple[float, float, int]],
-) -> float:
-    """Mean reward ``arm`` assigns across a FULL raw candidate batch.
+) -> list[float]:
+    """Per-candidate reward ``arm`` assigns across a FULL raw candidate batch.
 
-    Mirrors exactly what :meth:`~polyt5.rl.trainer.GRPOTrainer.step` computes
-    as its own ``reward_mean``: gated (structurally invalid) candidates
-    contribute their gated reward -- normally ``0.0`` -- to the mean; they are
-    not excluded from the denominator. That is "the metric it optimized", not
-    a metric computed only over survivors.
+    Mirrors exactly what :meth:`~polyt5.rl.trainer.GRPOTrainer.step` scores:
+    gated (structurally invalid) candidates contribute their gated reward --
+    normally ``0.0`` -- and are not excluded. That is "the metric it
+    optimized", not a metric computed only over survivors.
 
     Args:
         arm: An :class:`~polyt5.rewards.ArmReward`, e.g.
             ``build_reward_arm("composite", ...)``.
         candidates: Raw generated PSELFIES strings, the FULL batch (not just
-            PV survivors) -- ``CompositeArm``/``ConstraintArm`` do their own
-            structural gating internally.
+            PV survivors) -- the arms do their own structural gating.
         sample_targets: Each candidate's own conditioning target, aligned
             with ``candidates``.
         predictions: ``(mean, std, n)`` per candidate, aligned with
             ``candidates``.
 
     Returns:
-        The mean of ``arm(candidates, sample_targets, predictions)``'s
-        ``.value``, or ``0.0`` for an empty batch.
+        One float per candidate, in input order. Kept per-candidate rather than
+        pre-averaged because the success criterion bootstraps over exactly
+        these values (:func:`_bootstrap_delta`).
     """
     if not candidates:
-        return 0.0
-    results = arm(candidates, sample_targets, predictions)
-    return float(sum(result.value for result in results) / len(results))
+        return []
+    return [float(result.value) for result in arm(candidates, sample_targets, predictions)]
+
+
+def _mean(values: Sequence[float]) -> float:
+    """Mean of ``values``, or ``0.0`` for an empty sequence."""
+    return float(sum(values) / len(values)) if len(values) else 0.0
+
+
+def _abs_errors(predicted: Sequence[float], targets: Sequence[float]) -> list[float]:
+    """Per-survivor ``|predicted - target|``, dropping non-finite predictions.
+
+    Matches :func:`~polyt5.evaluation.sweep.property_columns`'s own accounting
+    (finite pairs only), so ``mean(_abs_errors(...)) == property_mae``.
+    """
+    out: list[float] = []
+    for value, target in zip(predicted, targets, strict=False):
+        value = float(value)
+        if value == value and value not in (float("inf"), float("-inf")):
+            out.append(abs(value - float(target)))
+    return out
+
+
+def _score_with_arm(
+    arm, candidates: list[str], sample_targets: list[float],
+    predictions: list[tuple[float, float, int]],
+) -> float:
+    """Mean of :func:`_arm_values` -- the aggregate that lands in the matrix."""
+    return _mean(_arm_values(arm, candidates, sample_targets, predictions))
+
+
+def _bootstrap_delta(
+    own: Sequence[float], base: Sequence[float], *, direction: str,
+    n_boot: int = N_BOOTSTRAP, seed: int = BOOTSTRAP_SEED,
+    confidence: float = BOOTSTRAP_CONFIDENCE,
+) -> tuple[float | None, float | None, float | None]:
+    """Signed improvement over ``base``, with a percentile bootstrap interval.
+
+    Args:
+        own: The arm's per-candidate metric values.
+        base: arm_b's per-candidate values of the SAME metric, measured under
+            the same protocol.
+        direction: ``"higher"`` or ``"lower"`` -- which way is better. The
+            returned delta is signed so that POSITIVE always means "better than
+            arm_b", whichever direction that is, so one comparison rule works
+            for every metric.
+        n_boot: Bootstrap resamples.
+        seed: Seed, so a recorded verdict is reproducible.
+        confidence: Interval mass, e.g. ``0.95``.
+
+    Returns:
+        ``(delta, ci_low, ci_high)``, or ``(None, None, None)`` when either
+        sample is empty -- "not measured", never a fabricated zero.
+
+    Note:
+        The two sides are resampled INDEPENDENTLY, not paired: the arms
+        generate different candidates, so there is nothing to pair. The
+        interval therefore covers sampling variation in the candidates within
+        one generation seed. It does NOT cover seed-to-seed variation of the
+        training runs themselves, which one run per arm cannot estimate; that
+        remains a stated limitation of the study rather than something this
+        interval quietly claims to have handled.
+    """
+    if len(own) == 0 or len(base) == 0:
+        return None, None, None
+    sign = 1.0 if direction == "higher" else -1.0
+    own_array = np.asarray(own, dtype=float)
+    base_array = np.asarray(base, dtype=float)
+    delta = sign * float(own_array.mean() - base_array.mean())
+
+    rng = np.random.default_rng(seed)
+    own_means = rng.choice(own_array, size=(n_boot, own_array.size), replace=True).mean(axis=1)
+    base_means = rng.choice(base_array, size=(n_boot, base_array.size), replace=True).mean(axis=1)
+    deltas = sign * (own_means - base_means)
+    alpha = (1.0 - confidence) / 2.0
+    low, high = np.quantile(deltas, [alpha, 1.0 - alpha])
+    return delta, float(low), float(high)
+
+
+def check_pre_registration(frozen: dict[str, Any]) -> list[str]:
+    """Compare :data:`ARM_METRIC` / :data:`ARM_MIN_MARGIN` against the frozen record.
+
+    The executable success criterion used to live entirely in ``ARM_METRIC`` --
+    ordinary, mutable Python that nothing bound to the pre-registration, so a
+    post-run edit produced a new ``summary.json`` that looked equally
+    authoritative. ``frozen_baseline.json``'s ``pre_registered_metrics`` is now
+    the record of what was promised, and this refuses to let the code drift
+    from it.
+
+    Args:
+        frozen: The parsed ``frozen_baseline.json``.
+
+    Returns:
+        A list of human-readable disagreements. Empty means they match.
+    """
+    problems: list[str] = []
+    registered = frozen.get("pre_registered_metrics")
+    if not isinstance(registered, dict):
+        return ["frozen_baseline.json has no pre_registered_metrics block"]
+
+    coded = set(ARM_METRIC)
+    pinned = {key for key in registered if not key.startswith("_")}
+    if coded != pinned:
+        problems.append(f"arms differ: code has {sorted(coded)}, frozen record has "
+                        f"{sorted(pinned)}")
+    for arm in sorted(coded & pinned):
+        metric, direction = ARM_METRIC[arm]
+        entry = registered[arm]
+        if entry.get("metric") != metric:
+            problems.append(f"{arm}: code metric {metric!r} != frozen {entry.get('metric')!r}")
+        if entry.get("direction") != direction:
+            problems.append(
+                f"{arm}: code direction {direction!r} != frozen {entry.get('direction')!r}")
+        if float(entry.get("min_margin", -1.0)) != float(ARM_MIN_MARGIN.get(arm, -1.0)):
+            problems.append(
+                f"{arm}: code min_margin {ARM_MIN_MARGIN.get(arm)!r} != frozen "
+                f"{entry.get('min_margin')!r}")
+
+    frozen_structural = frozen.get("structural_metrics")
+    if frozen_structural is not None and sorted(STRUCTURAL_METRICS) != sorted(frozen_structural):
+        problems.append(f"structural_metrics differ: code {sorted(STRUCTURAL_METRICS)} != frozen "
+                        f"{sorted(frozen_structural)}")
+
+    statistics = frozen.get("success_criterion_statistics", {})
+    for key, coded_value in (("n_bootstrap", N_BOOTSTRAP), ("confidence", BOOTSTRAP_CONFIDENCE),
+                             ("bootstrap_seed", BOOTSTRAP_SEED)):
+        if key in statistics and statistics[key] != coded_value:
+            problems.append(f"{key}: code {coded_value!r} != frozen {statistics[key]!r}")
+    return problems
 
 
 def _latest_checkpoint(run_dir: Path) -> Path | None:
@@ -353,7 +576,8 @@ def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger):
 def evaluate_arm(
     model, tokenizer, *, arm_key: str, label: str, kind: str, point: SweepPoint,
     targets: list[float], n_samples: int, training_index, auditor, ensemble,
-    composite_arm, constraint_arm, device, batch_size: int, max_length: int, seed: int,
+    auditor_scorers: ArmScorers, ensemble_scorers: ArmScorers,
+    device, batch_size: int, max_length: int, seed: int,
     tolerance: float, checkpoint_label: str | None, checkpoint_sha256: str | None,
     novelty_index_sha256: str | None,
 ) -> dict[str, Any]:
@@ -380,10 +604,12 @@ def evaluate_arm(
         training_index: TSD reference index, or ``None``.
         auditor: The held-out confirmation predictor (single model).
         ensemble: The reward-ensemble predictor.
-        composite_arm: The CANONICAL ``build_reward_arm("composite", ...)``,
-            shared across every row.
-        constraint_arm: The CANONICAL ``build_reward_arm("constraint", ...)``,
-            shared across every row.
+        auditor_scorers: The CANONICAL arm objects for scoring the auditor's
+            ``(mean, 0.0, 1)`` triples (``ensemble_size=1``), shared across
+            every row.
+        ensemble_scorers: The CANONICAL arm objects for scoring the reward
+            ensemble's triples (``ensemble_size=len(ensemble)``), shared
+            across every row.
         device: Torch device.
         batch_size: Decoding batch size.
         max_length: Maximum generated tokens.
@@ -394,9 +620,13 @@ def evaluate_arm(
         novelty_index_sha256: Novelty index content hash recorded in the row.
 
     Returns:
-        One flat row dict, matching :data:`MATRIX_COLUMNS` minus the
-        ``beats_arm_b``/``survives_audit``/``success`` verdict columns, which
-        the caller fills in once every row (arm_b's included) exists.
+        One flat row dict, matching :data:`MATRIX_COLUMNS` minus the verdict
+        columns (``sampling_matches_arm_b``, the ``delta_*`` pairs,
+        ``beats_arm_b``/``survives_audit``/``success``), which
+        :func:`apply_success_criterion` fills in once every row (arm_b's
+        included) exists. The row also carries :data:`SAMPLES_KEY` -- the
+        per-candidate values behind every metric's mean, which the bootstrap
+        resamples; it is stripped before ``summary.json`` is written.
     """
     batch = screen_candidates(
         model, tokenizer, point=point, targets=targets, n_samples=n_samples,
@@ -431,18 +661,37 @@ def evaluate_arm(
         None, tolerance,
     )
 
-    composite_score_auditor = _score_with_arm(
-        composite_arm, candidates, sample_targets, auditor_predictions
-    )
-    composite_score_ensemble = _score_with_arm(
-        composite_arm, candidates, sample_targets, ensemble_predictions
-    )
-    constraint_satisfaction_rate_auditor = _score_with_arm(
-        constraint_arm, candidates, sample_targets, auditor_predictions
-    )
-    constraint_satisfaction_rate_ensemble = _score_with_arm(
-        constraint_arm, candidates, sample_targets, ensemble_predictions
-    )
+    # Per-candidate values, kept rather than pre-averaged: every matrix cell
+    # below is their mean, and the success criterion's bootstrap resamples
+    # exactly these. The auditor's are computed before the ensemble's for both
+    # arms (see test_evaluate_arm_auditor_predictions_are_wired_through_the_helper).
+    accuracy_values_auditor = _arm_values(
+        auditor_scorers.accuracy, candidates, sample_targets, auditor_predictions)
+    accuracy_values_ensemble = _arm_values(
+        ensemble_scorers.accuracy, candidates, sample_targets, ensemble_predictions)
+    composite_values_auditor = _arm_values(
+        auditor_scorers.composite, candidates, sample_targets, auditor_predictions)
+    composite_values_ensemble = _arm_values(
+        ensemble_scorers.composite, candidates, sample_targets, ensemble_predictions)
+    constraint_values_auditor = _arm_values(
+        auditor_scorers.constraint, candidates, sample_targets, auditor_predictions)
+    constraint_values_ensemble = _arm_values(
+        ensemble_scorers.constraint, candidates, sample_targets, ensemble_predictions)
+
+    # pv_rate is structural: one 0/1 indicator per generated candidate, over
+    # the full batch, whose mean IS batch.counts' pv_rate. Both predictor
+    # slots share it, exactly as _metric_column already says.
+    pv_indicators = [float(record.passed_pv) for record in batch.records]
+    # property_mae's samples are per-SURVIVOR absolute errors -- the same
+    # finite pairs property_columns averages -- which is precisely why it is
+    # not any arm's success metric: its denominator moves with validity.
+    mae_values_auditor = _abs_errors(auditor_screened, screened_targets)
+    mae_values_ensemble = _abs_errors(ensemble_screened, screened_targets)
+
+    composite_score_auditor = _mean(composite_values_auditor)
+    composite_score_ensemble = _mean(composite_values_ensemble)
+    constraint_satisfaction_rate_auditor = _mean(constraint_values_auditor)
+    constraint_satisfaction_rate_ensemble = _mean(constraint_values_ensemble)
 
     row: dict[str, Any] = {
         "arm": arm_key,
@@ -463,15 +712,29 @@ def evaluate_arm(
         "property_mean_ensemble": property_mean_ensemble,
         "property_mae_ensemble": property_mae_ensemble,
         "tp_rate_ensemble": tp_rate_ensemble,
+        "accuracy_score_auditor": _mean(accuracy_values_auditor),
+        "accuracy_score_ensemble": _mean(accuracy_values_ensemble),
         "composite_score_auditor": composite_score_auditor,
         "composite_score_ensemble": composite_score_ensemble,
         "constraint_satisfaction_rate_auditor": constraint_satisfaction_rate_auditor,
         "constraint_satisfaction_rate_ensemble": constraint_satisfaction_rate_ensemble,
         "novelty_index_sha256": novelty_index_sha256,
+        SAMPLES_KEY: {
+            "accuracy_score": {"auditor": accuracy_values_auditor,
+                               "ensemble": accuracy_values_ensemble},
+            "composite_score": {"auditor": composite_values_auditor,
+                                "ensemble": composite_values_ensemble},
+            "constraint_satisfaction_rate": {"auditor": constraint_values_auditor,
+                                             "ensemble": constraint_values_ensemble},
+            "pv_rate": {"auditor": pv_indicators, "ensemble": pv_indicators},
+            "property_mae": {"auditor": mae_values_auditor,
+                             "ensemble": mae_values_ensemble},
+        },
     }
 
     metric_name, _direction = ARM_METRIC.get(arm_key, (None, None))
     row["optimized_metric"] = metric_name
+    row["optimized_min_margin"] = ARM_MIN_MARGIN.get(arm_key)
     row["optimized_value_auditor"] = (
         row.get(_metric_column(metric_name, "auditor")) if metric_name else None
     )
@@ -481,31 +744,100 @@ def evaluate_arm(
     return row
 
 
-def apply_success_criterion(rows: list[dict[str, Any]]) -> None:
-    """Fill in ``beats_arm_b`` / ``survives_audit`` / ``success`` in place.
+#: Recorded in ``survives_audit`` for an arm whose optimized metric is purely
+#: structural -- see Ruling D in the module docstring.
+STRUCTURAL_AUDIT_NOTE = "N/A - structural metric, no predictor involved"
 
-    Reads arm_b's comparison value directly from the column its own row
-    already has for the metric in question (e.g. ``property_mae_auditor``),
-    NOT from arm_b's ``optimized_value_*`` -- arm_b has no entry in
-    :data:`ARM_METRIC` (it optimizes nothing; it is supervised), so that
-    column is always ``None`` on arm_b's own row.
+
+def _samples_for(row: dict[str, Any], metric_name: str, predictor: str) -> list[float]:
+    """The per-candidate values behind one metric cell, or ``[]`` if absent."""
+    samples = row.get(SAMPLES_KEY) or {}
+    return list((samples.get(metric_name) or {}).get(predictor) or [])
+
+
+def _clause(
+    row: dict[str, Any], arm_b: dict[str, Any], metric_name: str, direction: str,
+    predictor: str, min_margin: float, *, n_boot: int, seed: int, confidence: float,
+) -> tuple[bool | None, float | None, float | None, float | None]:
+    """Decide one clause of the success criterion, and return its evidence.
+
+    Args:
+        row: The RLVR arm's row.
+        arm_b: arm_b's row.
+        metric_name: The pre-registered metric.
+        direction: ``"higher"`` or ``"lower"``.
+        predictor: ``"auditor"`` or ``"ensemble"``.
+        min_margin: The pre-registered minimum effect size.
+        n_boot: Bootstrap resamples.
+        seed: Bootstrap seed.
+        confidence: Interval mass.
+
+    Returns:
+        ``(verdict, delta, ci_low, ci_high)``. ``verdict`` is ``None`` -- not
+        ``False`` -- when the clause could not be evaluated at all, because
+        "not measured" and "measured and lost" are different facts.
+    """
+    own = _samples_for(row, metric_name, predictor)
+    base = _samples_for(arm_b, metric_name, predictor)
+    delta, low, high = _bootstrap_delta(
+        own, base, direction=direction, n_boot=n_boot, seed=seed, confidence=confidence)
+    if delta is None or low is None:
+        return None, delta, low, high
+    # BOTH conditions, deliberately: the CI alone would call a 0.001 win
+    # significant at n=1500, and the margin alone would call a large but
+    # entirely noise-driven difference a win.
+    return bool(delta >= min_margin and low > 0.0), delta, low, high
+
+
+def apply_success_criterion(
+    rows: list[dict[str, Any]], *, n_boot: int = N_BOOTSTRAP, seed: int = BOOTSTRAP_SEED,
+    confidence: float = BOOTSTRAP_CONFIDENCE,
+) -> None:
+    """Fill in the verdict columns in place, with their statistical evidence.
+
+    Each clause requires BOTH an improvement over arm_b of at least the arm's
+    pre-registered :data:`ARM_MIN_MARGIN` AND a bootstrap confidence interval
+    on that improvement that excludes zero. A bare inequality on point
+    estimates from one generation seed cannot separate an 0.1 K win from
+    sampling noise, and the study's whole premise is a trustworthy comparison.
+
+    arm_b's comparison values come from the per-candidate samples on its own
+    row (and its aggregate from its own metric column), NOT from arm_b's
+    ``optimized_value_*`` -- arm_b has no entry in :data:`ARM_METRIC` (it
+    optimizes nothing; it is supervised), so that column is always ``None`` on
+    its row.
 
     Structural metrics (:data:`STRUCTURAL_METRICS`) are a special case
-    (Ruling D): ``survives_audit`` is recorded as the literal string
-    ``"N/A - structural metric, no predictor involved"`` rather than a
-    computed boolean, because both predictor columns for a structural metric
-    ARE the same value by construction -- comparing them would manufacture an
-    independently-confirmed pass out of a tautology. ``success`` then reduces
-    to ``beats_arm_b`` alone for those arms.
+    (Ruling D): ``survives_audit`` is recorded as
+    :data:`STRUCTURAL_AUDIT_NOTE` rather than a computed boolean, because both
+    predictor columns for a structural metric ARE the same value by
+    construction -- comparing them would manufacture an independently-confirmed
+    pass out of a tautology. ``success`` then reduces to ``beats_arm_b`` alone
+    for those arms.
+
+    ``sampling_matches_arm_b`` is the third clause (finding 11). An RLVR arm is
+    resampled at whatever temperature/``top_p`` its own run trained with, so a
+    ``--set train.temperature=1.0`` run yields a row that is not comparable to
+    arm_b on any column. ``success`` is then left ``None``, not ``False``: the
+    arm has not lost, it has not been measured against the same operating
+    point.
 
     Args:
         rows: Rows produced by :func:`evaluate_arm`, arm_b's included.
             RLVR-arm rows are updated in place; Arm A/B rows get ``None`` for
-            all three columns since the success criterion is not defined for
+            the verdict columns since the success criterion is not defined for
             them.
+        n_boot: Bootstrap resamples.
+        seed: Bootstrap seed, so a recorded verdict is reproducible.
+        confidence: Interval mass.
     """
     arm_b = next((row for row in rows if row["arm"] == "arm_b"), None)
     for row in rows:
+        row["sampling_matches_arm_b"] = _sampling_matches(row, arm_b)
+        for column in ("delta_ensemble", "delta_ensemble_ci_low", "delta_ensemble_ci_high",
+                       "delta_auditor", "delta_auditor_ci_low", "delta_auditor_ci_high"):
+            row.setdefault(column, None)
+
         metric_name, direction = ARM_METRIC.get(row["arm"], (None, None))
         if metric_name is None or arm_b is None:
             row["beats_arm_b"] = None
@@ -513,28 +845,52 @@ def apply_success_criterion(rows: list[dict[str, Any]]) -> None:
             row["success"] = None
             continue
 
-        better = (lambda a, b: a < b) if direction == "lower" else (lambda a, b: a > b)
-        own_ensemble = row.get(_metric_column(metric_name, "ensemble"))
-        arm_b_ensemble = arm_b.get(_metric_column(metric_name, "ensemble"))
-        beats_arm_b = (better(own_ensemble, arm_b_ensemble)
-                       if own_ensemble is not None and arm_b_ensemble is not None else None)
+        min_margin = float(ARM_MIN_MARGIN.get(row["arm"], 0.0))
+        row["optimized_min_margin"] = min_margin
+        beats_arm_b, delta, low, high = _clause(
+            row, arm_b, metric_name, direction, "ensemble", min_margin,
+            n_boot=n_boot, seed=seed, confidence=confidence)
+        row["delta_ensemble"] = delta
+        row["delta_ensemble_ci_low"] = low
+        row["delta_ensemble_ci_high"] = high
 
         if metric_name in STRUCTURAL_METRICS:
-            row["beats_arm_b"] = beats_arm_b
-            row["survives_audit"] = "N/A - structural metric, no predictor involved"
-            row["success"] = beats_arm_b
-            continue
+            survives_audit: Any = STRUCTURAL_AUDIT_NOTE
+            audit_clause: bool | None = True
+        else:
+            audit_clause, delta_a, low_a, high_a = _clause(
+                row, arm_b, metric_name, direction, "auditor", min_margin,
+                n_boot=n_boot, seed=seed, confidence=confidence)
+            row["delta_auditor"] = delta_a
+            row["delta_auditor_ci_low"] = low_a
+            row["delta_auditor_ci_high"] = high_a
+            survives_audit = audit_clause
 
-        own_auditor = row.get(_metric_column(metric_name, "auditor"))
-        arm_b_auditor = arm_b.get(_metric_column(metric_name, "auditor"))
-        survives_audit = (better(own_auditor, arm_b_auditor)
-                          if own_auditor is not None and arm_b_auditor is not None else None)
         row["beats_arm_b"] = beats_arm_b
         row["survives_audit"] = survives_audit
-        row["success"] = (
-            bool(beats_arm_b and survives_audit)
-            if beats_arm_b is not None and survives_audit is not None else None
-        )
+        if beats_arm_b is None or audit_clause is None or row["sampling_matches_arm_b"] is None:
+            row["success"] = None
+        elif not row["sampling_matches_arm_b"]:
+            # Refused, not failed: an incomparable sampling point says nothing
+            # about whether the arm worked.
+            row["success"] = None
+        else:
+            row["success"] = bool(beats_arm_b and audit_clause)
+
+
+def _sampling_matches(row: dict[str, Any], arm_b: dict[str, Any] | None) -> bool | None:
+    """Whether this row was sampled at arm_b's operating point.
+
+    Returns ``None`` when either point is unknown (an untrained arm's
+    placeholder row, or a missing arm_b), and ``True`` on arm_b's own row.
+    """
+    if arm_b is None:
+        return None
+    own = (row.get("temperature"), row.get("top_p"))
+    base = (arm_b.get("temperature"), arm_b.get("top_p"))
+    if None in own or None in base:
+        return None
+    return float(own[0]) == float(base[0]) and float(own[1]) == float(base[1])
 
 
 def skipped_arm_row(arm_name: str) -> dict[str, Any]:
@@ -550,6 +906,7 @@ def skipped_arm_row(arm_name: str) -> dict[str, Any]:
         "label": f"Arm {arm_name}",
         "kind": "rlvr",
         "optimized_metric": ARM_METRIC.get(arm_name, (None, None))[0],
+        "optimized_min_margin": ARM_MIN_MARGIN.get(arm_name),
     })
     return row
 
@@ -635,6 +992,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
+    # The success criterion is pre-registered in the frozen record, not in this
+    # file. If the two have drifted apart, every verdict below would be
+    # computed against a criterion nobody promised -- refuse before measuring.
+    pre_registration_problems = check_pre_registration(frozen)
+    if pre_registration_problems:
+        print(
+            "ERROR: ARM_METRIC / ARM_MIN_MARGIN disagree with the pre-registered criterion in "
+            f"{frozen_path}:\n  " + "\n  ".join(pre_registration_problems)
+            + "\nThe frozen record is the pre-registration. Changing the criterion after "
+              "seeing results is post-hoc metric selection; fix the code, not the record.",
+            file=sys.stderr,
+        )
+        return 1
+
     device = select_device(args.device)
     out_root = args.out.parent if args.out else REPO_ROOT / "results"
     out_name = args.out.name if args.out else "arm_comparison"
@@ -702,14 +1073,31 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("auditor=%s (held out of every reward path) ensemble=%s", auditor_key,
                frozen["reward_ensemble"])
 
-    # composite_score / constraint_satisfaction_rate must be computed
-    # IDENTICALLY for every row -- see the module docstring -- so the two arm
-    # objects are built ONCE here, from the canonical repo configs, and
-    # reused for every row including arm_a and arm_b.
-    composite_cfg = load_config(REPO_ROOT / "configs" / "rl" / "composite.yaml")
-    constraint_cfg = load_config(REPO_ROOT / "configs" / "rl" / "constraint.yaml")
-    composite_arm = build_reward_arm("composite", composite_cfg, novelty_index=training_index)
-    constraint_arm = build_reward_arm("constraint", constraint_cfg, novelty_index=training_index)
+    # accuracy_score / composite_score / constraint_satisfaction_rate must be
+    # computed IDENTICALLY for every row -- see the module docstring -- so the
+    # arm objects are built ONCE here, from the canonical repo configs, and
+    # reused for every row including arm_a and arm_b. Two sets, differing only
+    # in the ensemble_size that describes the predictor whose triples they will
+    # score: the auditor is one model (n=1 of 1 is full coverage), the reward
+    # ensemble is four (n=1 of 4 means three members could not read the
+    # candidate, which is the opposite situation -- see polyt5.rewards.tg).
+    ensemble_size = len(ensemble)
+    arm_configs = {
+        name: load_config(REPO_ROOT / "configs" / "rl" / f"{name}.yaml")
+        for name in ("accuracy", "composite", "constraint")
+    }
+
+    def _scorers(size: int) -> ArmScorers:
+        return ArmScorers(**{
+            name: build_reward_arm(name, arm_configs[name], novelty_index=training_index,
+                                   ensemble_size=size)
+            for name in ("accuracy", "composite", "constraint")
+        })
+
+    auditor_scorers = _scorers(1)
+    ensemble_scorers = _scorers(ensemble_size)
+    logger.info("reward-arm scorers: auditor ensemble_size=1, ensemble ensemble_size=%d",
+                ensemble_size)
 
     rows: list[dict[str, Any]] = []
     for arm_key, label, sampling_key in (
@@ -723,8 +1111,8 @@ def main(argv: list[str] | None = None) -> int:
         row = evaluate_arm(
             generation_model, tokenizer, arm_key=arm_key, label=label, kind="baseline",
             point=point, targets=targets, n_samples=n_samples, training_index=training_index,
-            auditor=auditor, ensemble=ensemble, composite_arm=composite_arm,
-            constraint_arm=constraint_arm, device=device, batch_size=args.batch_size,
+            auditor=auditor, ensemble=ensemble, auditor_scorers=auditor_scorers,
+            ensemble_scorers=ensemble_scorers, device=device, batch_size=args.batch_size,
             max_length=args.max_length, seed=args.seed, tolerance=tolerance,
             checkpoint_label=str(frozen["artifacts"]["generation"]["path"]),
             checkpoint_sha256=frozen["artifacts"]["generation"]["sha256"],
@@ -741,8 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
         row = evaluate_arm(
             model, tokenizer, arm_key=arm_name, label=f"Arm {arm_name}", kind="rlvr",
             point=point, targets=targets, n_samples=n_samples, training_index=training_index,
-            auditor=auditor, ensemble=ensemble, composite_arm=composite_arm,
-            constraint_arm=constraint_arm, device=device, batch_size=args.batch_size,
+            auditor=auditor, ensemble=ensemble, auditor_scorers=auditor_scorers,
+            ensemble_scorers=ensemble_scorers, device=device, batch_size=args.batch_size,
             max_length=args.max_length, seed=args.seed, tolerance=tolerance,
             checkpoint_label=str(checkpoint_path), checkpoint_sha256=checkpoint_sha256,
             novelty_index_sha256=novelty_index_sha256,
@@ -751,21 +1139,47 @@ def main(argv: list[str] | None = None) -> int:
 
     apply_success_criterion(rows)
 
+    for row in rows:
+        if row.get("kind") == "rlvr" and row.get("sampling_matches_arm_b") is False:
+            logger.error(
+                "arm %s was sampled at T=%s top_p=%s but arm_b is T=%s top_p=%s -- this row is "
+                "NOT comparable to arm_b on any column (temperature alone moves MAE 7.1%% "
+                "between arm_a and arm_b). success is recorded as null, not false.",
+                row["arm"], row.get("temperature"), row.get("top_p"),
+                next((r.get("temperature") for r in rows if r["arm"] == "arm_b"), None),
+                next((r.get("top_p") for r in rows if r["arm"] == "arm_b"), None),
+            )
+
     csv_path = write_matrix_csv(rows, run_dir.root / "matrix.csv")
     md_path = write_matrix_markdown(rows, run_dir.root / "matrix.md")
+    # The per-candidate sample vectors are ~1500 floats per metric per
+    # predictor per row; they exist for the bootstrap, not for the record.
+    summary_rows = [{k: v for k, v in row.items() if k != SAMPLES_KEY} for row in rows]
     summary = {
         "frozen_baseline": str(frozen_path),
         "auditor": auditor_key,
+        "auditor_note": frozen.get("auditor_note"),
         "reward_ensemble": list(frozen["reward_ensemble"]),
+        "reward_ensemble_size": ensemble_size,
         "success_criterion": frozen["success_criterion"],
+        "success_criterion_statistics": {
+            "test": "percentile bootstrap over candidates",
+            "n_bootstrap": N_BOOTSTRAP,
+            "confidence": BOOTSTRAP_CONFIDENCE,
+            "bootstrap_seed": BOOTSTRAP_SEED,
+            "rule": "clause holds iff delta >= min_margin AND ci_low > 0; success also "
+                    "requires sampling_matches_arm_b",
+        },
         "evaluation_protocol": {"targets_k": targets, "n_per_target": n_per_target,
                                 "n_samples": n_samples, "tolerance": tolerance},
         "novelty_index": {"path": str(novelty_path), "sha256": novelty_index_sha256,
                           "present": training_index is not None},
-        "arm_metric": {arm: {"metric": metric, "direction": direction}
+        "arm_metric": {arm: {"metric": metric, "direction": direction,
+                             "min_margin": ARM_MIN_MARGIN.get(arm)}
                       for arm, (metric, direction) in ARM_METRIC.items()},
+        "pre_registration_verified_against": str(frozen_path),
         "structural_metrics": sorted(STRUCTURAL_METRICS),
-        "rows": rows,
+        "rows": summary_rows,
     }
     summary_path = run_dir.root / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
@@ -777,8 +1191,11 @@ def main(argv: list[str] | None = None) -> int:
         if row["kind"] == "rlvr":
             print(f"  {row['arm']:<12} success={row.get('success')} "
                   f"metric={row.get('optimized_metric')} "
-                  f"auditor={row.get('optimized_value_auditor')} "
-                  f"ensemble={row.get('optimized_value_ensemble')}")
+                  f"margin={row.get('optimized_min_margin')} "
+                  f"delta_ensemble={row.get('delta_ensemble')} "
+                  f"ci=[{row.get('delta_ensemble_ci_low')}, "
+                  f"{row.get('delta_ensemble_ci_high')}] "
+                  f"sampling_matches_arm_b={row.get('sampling_matches_arm_b')}")
     return 0
 
 
