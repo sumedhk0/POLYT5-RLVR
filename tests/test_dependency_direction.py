@@ -34,14 +34,36 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The supervised packages that must never import ``polyt5.rl`` or
-#: ``polyt5.rewards`` -- the exact directory list from the plan's Step 3 grep
-#: command (``.superpowers/sdd/2026-08-20-grpo-rlvr/task-9-brief.md``).
+#: ``polyt5.rewards``. This used to be the plan's Step 3 grep list, which was
+#: written from a partial survey and covered only seven of the ten supervised
+#: packages -- ``app``, ``inference`` and ``utils`` were unguarded, and
+#: ``inference`` is precisely the package ``rl/`` depends on for the predictor
+#: and therefore the most plausible future back-edge. The README's and spec
+#: section 6's contract is unqualified ("nothing outside ``rl/`` imports
+#: ``rl/``"), so the list is now everything under ``src/polyt5/`` except the
+#: two exempt packages, and
+#: :func:`test_supervised_packages_covers_every_package_on_disk` fails if a new
+#: package appears and is not classified either way.
 SUPERVISED_PACKAGES: tuple[str, ...] = (
-    "model", "data", "chemistry", "generation", "evaluation", "training", "tokenization",
+    "app", "chemistry", "data", "evaluation", "generation", "inference", "model",
+    "tokenization", "training", "utils",
 )
+
+#: The Phase-3 packages the rule is ABOUT; they are deliberately not checked
+#: against themselves.
+EXEMPT_PACKAGES: tuple[str, ...] = ("rl", "rewards")
 
 #: Module roots the supervised codebase may not import, or import from.
 FORBIDDEN_ROOTS: tuple[str, ...] = ("polyt5.rl", "polyt5.rewards")
+
+
+def _packages_on_disk() -> list[str]:
+    """Every importable package directory directly under ``src/polyt5``."""
+    root = REPO_ROOT / "src" / "polyt5"
+    return sorted(
+        path.name for path in root.iterdir()
+        if path.is_dir() and (path / "__init__.py").is_file()
+    )
 
 
 def _imported_module_names(path: Path) -> list[str]:
@@ -84,6 +106,24 @@ def test_supervised_package_dirs_exist():
         assert (REPO_ROOT / "src" / "polyt5" / package).is_dir(), package
 
 
+def test_supervised_packages_covers_every_package_on_disk():
+    """Finding 10: the guard must not silently cover only part of the codebase.
+
+    The original list was the plan's grep list -- 7 of the 10 supervised
+    packages -- so ``app``, ``inference`` and ``utils`` were unguarded while
+    the stated contract was unqualified. Enumerating the filesystem means a
+    NEW package is a test failure until someone classifies it, rather than an
+    unguarded hole nobody notices.
+    """
+    on_disk = set(_packages_on_disk())
+    classified = set(SUPERVISED_PACKAGES) | set(EXEMPT_PACKAGES)
+    assert on_disk == classified, (
+        "every package under src/polyt5 must be either guarded (SUPERVISED_PACKAGES) or "
+        f"explicitly exempt (EXEMPT_PACKAGES). Unclassified: {sorted(on_disk - classified)}; "
+        f"listed but absent: {sorted(classified - on_disk)}"
+    )
+
+
 def test_no_supervised_package_imports_rl_or_rewards():
     """The supervised codebase must never import ``polyt5.rl``/``polyt5.rewards``.
 
@@ -109,6 +149,7 @@ def test_rl_package_itself_is_exempt_from_its_own_check():
     """
     assert "rl" not in SUPERVISED_PACKAGES
     assert "rewards" not in SUPERVISED_PACKAGES
+    assert set(EXEMPT_PACKAGES) == {"rl", "rewards"}
 
 
 def test_checker_detects_the_from_package_import_module_form(tmp_path):
