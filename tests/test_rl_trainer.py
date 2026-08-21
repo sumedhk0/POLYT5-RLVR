@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -549,3 +553,39 @@ def test_train_loop_logs_and_checkpoints(tmp_path):
     assert run_dir.metrics_jsonl.exists()
     checkpoints = list(run_dir.checkpoints.glob("*.pt"))
     assert len(checkpoints) == 2, checkpoints
+
+
+# -- Task 8: CLI, configs, and the arm comparison matrix --
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def test_frozen_baseline_is_present_and_complete():
+    """The entry gate: RL may not run against an unrecorded baseline."""
+    frozen = json.loads((REPO / "artifacts/baseline/frozen_baseline.json")
+                        .read_text(encoding="utf-8"))
+    for key in ("artifacts", "reward_ensemble", "auditor", "arm_b_tuned_sampling",
+                "evaluation_protocol", "success_criterion"):
+        assert key in frozen, key
+    assert len(frozen["reward_ensemble"]) == 4
+    assert frozen["auditor"] not in frozen["reward_ensemble"], \
+        "the auditor must never appear in a reward path"
+    for name, meta in frozen["artifacts"].items():
+        assert len(meta["sha256"]) == 64, name
+
+
+def test_every_arm_config_loads_and_names_a_known_arm():
+    from polyt5.utils import load_config
+
+    for name in ("accuracy", "validity", "composite", "constraint"):
+        cfg = load_config(REPO / "configs" / "rl" / f"{name}.yaml")
+        assert cfg["arm"] == name
+        assert cfg["train"]["group_size"] >= 2
+        assert 250 <= cfg["train"]["target_min"] < cfg["train"]["target_max"] <= 600
+
+
+def test_train_grpo_cli_help_runs():
+    result = subprocess.run([sys.executable, str(REPO / "scripts/train_grpo.py"), "--help"],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0
+    assert "--arm" in result.stdout

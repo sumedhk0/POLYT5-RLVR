@@ -1,0 +1,33 @@
+# Arm C1 - reward optimizes closeness to the requested Tg.
+# Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
+experiment_name: grpo_accuracy
+arm: accuracy
+seed: 0
+
+baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
+
+reward:
+  tolerance: 100.0        # Kelvin at which closeness reaches zero (TgRewardConfig.tolerance)
+  sigma0: 17.0            # observed mean ensemble disagreement (TgRewardConfig.sigma0)
+  sa_max: 6.0             # unused by this arm; kept so configs stay comparable
+
+train:
+  group_size: 16          # candidates per prompt; the GRPO baseline
+  prompts_per_step: 32    # 512 candidates per step
+  max_steps: 2000
+  max_length: 200         # [PAPER] the paper's sequence limit
+  target_min: 250.0       # uniform sampling forces genuine conditioning
+  target_max: 600.0
+  temperature: 0.7        # arm B's tuned operating point
+  top_p: 0.95
+  learning_rate: 1.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.02           # primary knob; KL is logged every step
+  max_grad_norm: 1.0
+  rollout_batch_size: 128 # measured optimum; 512 is 3.5x slower
+  log_every: 10
+  save_every: 250
+  device: auto
+
+output:
+  results_root: results
