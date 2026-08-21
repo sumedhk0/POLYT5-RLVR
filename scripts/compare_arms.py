@@ -135,6 +135,36 @@ C1's own reward). ``property_mae`` is KEPT as a reported column for every row --
 it is the paper's headline conditioning metric and arm_b's frozen number is one
 -- it is simply not C1's pre-registered success criterion.
 
+Pre-registration integrity: hashed reward configs, not just a hashed record
+-----------------------------------------------------------------------------
+``frozen_baseline.json`` pins the metric/direction/min_margin per arm, but the
+metric DEFINITIONS -- ``tolerance``, ``sigma0``, ``sigma_unknown``,
+``min_coverage``, ``sa_max``, ``window_tolerance`` and (composite) ``weights``
+-- live in ``configs/rl/accuracy.yaml`` / ``composite.yaml`` /
+``constraint.yaml``, which are git-tracked but otherwise unfrozen. Editing one
+silently changes what the pre-registered criterion MEANS, with no trace. This
+script hashes exactly those three files (:func:`reward_config_paths`,
+:func:`hash_reward_configs`) once, when it builds :class:`ArmScorers` from
+them, and records the hash on every row (``*_reward_config_sha256``) and in
+``summary.json`` (``reward_config_sha256``) -- so a run is auditable after the
+fact for which reward definitions actually produced it. ``validity`` is not
+included: its optimized metric (``pv_rate``) is structural RDKit chemistry
+with no ``reward:`` block in the loop at all.
+
+Drift columns for every row (adjudication (d))
+-----------------------------------------------
+``max_tanimoto_mean`` and ``near_copy_fraction`` used to exist only in the
+training-time log (:mod:`polyt5.rl.drift`); arm_a and arm_b never ran under a
+drift monitor, so the matrix had no memorisation signal for them at all. Since
+novelty here is exact-canonical-match, a one-atom edit of a memorised polymer
+scores full novelty -- these two columns are how a reader catches that. This
+script builds one :class:`~polyt5.rl.drift.DriftMonitor` (reference
+fingerprints only, no auditor) and calls it for EVERY row, arm_a's and arm_b's
+included, reusing the same ``ensemble_predictions`` :func:`evaluate_arm`
+already computed. They are diagnostic, not a success metric: neither is in
+:data:`ARM_METRIC`, :data:`STRUCTURAL_METRICS`, or read by
+:func:`apply_success_criterion`.
+
 Outputs (always ``results/arm_comparison/`` unless ``--out`` overrides it):
     matrix.csv     one row per arm, every measured column
     matrix.md      the same table, human-readable
@@ -168,12 +198,16 @@ if str(REPO_ROOT / "scripts") not in sys.path:
 from polyt5.chemistry import ScalableNoveltyIndex, index_paths  # noqa: E402
 from polyt5.evaluation.sweep import SweepPoint, property_columns, screen_candidates  # noqa: E402
 from polyt5.inference import PolyT5PropertyPredictor  # noqa: E402
+from polyt5.rl import DriftMonitor  # noqa: E402
+from polyt5.rl.drift import DEFAULT_MAX_REFERENCE  # noqa: E402
 from polyt5.training import load_checkpoint  # noqa: E402
 from polyt5.utils import RunDirectory, get_logger, load_config, select_device  # noqa: E402
 from train_grpo import (  # noqa: E402
+    DEFAULT_DRIFT_REFERENCE,
     build_reward_arm,
     build_reward_ensemble,
     build_verified_tokenizer,
+    load_drift_reference,
     load_frozen_baseline,
     load_verified_model,
     sha256_of_file,
@@ -241,17 +275,24 @@ N_BOOTSTRAP = 2000
 BOOTSTRAP_CONFIDENCE = 0.95
 BOOTSTRAP_SEED = 0
 
+#: ``max_tanimoto_mean`` / ``near_copy_fraction`` (adjudication (d)) and the
+#: three ``*_reward_config_sha256`` columns (pre-registration integrity, see
+#: the module docstring) are DIAGNOSTIC / provenance columns computed
+#: identically for every row, arm_a's and arm_b's included -- they are never
+#: read by :data:`ARM_METRIC` or :func:`apply_success_criterion`.
 MATRIX_COLUMNS: tuple[str, ...] = (
     "arm", "kind", "checkpoint", "checkpoint_sha256", "temperature", "top_p",
     "sampling_matches_arm_b", "n_requested",
     "n_sv", "sv_rate", "n_tsd", "tsd_rate", "n_dd", "dd_rate", "n_pv", "pv_rate",
-    "sr_rate", "duplicate_rate", "mean_length",
+    "sr_rate", "duplicate_rate", "max_tanimoto_mean", "near_copy_fraction", "mean_length",
     "property_mean_auditor", "property_mae_auditor", "tp_rate_auditor",
     "property_mean_ensemble", "property_mae_ensemble", "tp_rate_ensemble",
     "accuracy_score_auditor", "accuracy_score_ensemble",
     "composite_score_auditor", "composite_score_ensemble",
     "constraint_satisfaction_rate_auditor", "constraint_satisfaction_rate_ensemble",
     "novelty_index_sha256",
+    "accuracy_reward_config_sha256", "composite_reward_config_sha256",
+    "constraint_reward_config_sha256",
     "optimized_metric", "optimized_min_margin",
     "optimized_value_auditor", "optimized_value_ensemble",
     "delta_ensemble", "delta_ensemble_ci_low", "delta_ensemble_ci_high",
@@ -290,6 +331,35 @@ def _resolve(path: str | Path) -> Path:
     """Resolve ``path`` relative to the repo root unless it is already absolute."""
     path = Path(path)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+#: The three arms whose reward IS scored by an :class:`ArmScorers` object here.
+#: ``validity`` is deliberately excluded: its optimized metric (``pv_rate``) is
+#: structural RDKit chemistry with no ``reward:`` block involved at all -- see
+#: :data:`STRUCTURAL_METRICS`.
+REWARD_CONFIG_ARMS: tuple[str, ...] = ("accuracy", "composite", "constraint")
+
+
+def reward_config_paths(repo_root: Path = REPO_ROOT) -> dict[str, Path]:
+    """Canonical reward-definition YAMLs :func:`evaluate_arm`'s scorers are built from.
+
+    [DECISION] These three files' ``tolerance``, ``sigma0``, ``sigma_unknown``,
+    ``min_coverage``, ``sa_max``, ``window_tolerance`` and (composite only)
+    ``weights`` are exactly what ``accuracy_score`` / ``composite_score`` /
+    ``constraint_satisfaction_rate`` MEAN -- the pre-registered success metric
+    for three of the four RLVR arms. Unlike ``frozen_baseline.json``, they are
+    unhashed, unfrozen, git-tracked YAML: editing one silently changes what
+    the pre-registered criterion measures, with no trace. Hashing them
+    (:func:`hash_reward_configs`) and recording the hash in ``summary.json``
+    and the matrix makes a run auditable after the fact for which reward
+    definitions actually produced it.
+    """
+    return {name: repo_root / "configs" / "rl" / f"{name}.yaml" for name in REWARD_CONFIG_ARMS}
+
+
+def hash_reward_configs(paths: dict[str, Path]) -> dict[str, str]:
+    """SHA-256 of each canonical reward config in ``paths``, keyed by arm name."""
+    return {name: sha256_of_file(path) for name, path in paths.items()}
 
 
 def _metric_column(metric_name: str, predictor: str) -> str:
@@ -577,9 +647,10 @@ def evaluate_arm(
     model, tokenizer, *, arm_key: str, label: str, kind: str, point: SweepPoint,
     targets: list[float], n_samples: int, training_index, auditor, ensemble,
     auditor_scorers: ArmScorers, ensemble_scorers: ArmScorers,
+    similarity_monitor: DriftMonitor,
     device, batch_size: int, max_length: int, seed: int,
     tolerance: float, checkpoint_label: str | None, checkpoint_sha256: str | None,
-    novelty_index_sha256: str | None,
+    novelty_index_sha256: str | None, reward_config_sha256: dict[str, str],
 ) -> dict[str, Any]:
     """Sample, screen and score one arm under the fixed protocol.
 
@@ -610,6 +681,12 @@ def evaluate_arm(
         ensemble_scorers: The CANONICAL arm objects for scoring the reward
             ensemble's triples (``ensemble_size=len(ensemble)``), shared
             across every row.
+        similarity_monitor: A :class:`~polyt5.rl.drift.DriftMonitor` built
+            with no auditor (only the reference fingerprints), shared across
+            every row -- see the module docstring's adjudication (d).
+            Supplies ``max_tanimoto_mean`` / ``near_copy_fraction``, computed
+            here for EVERY row, arm_a's and arm_b's included, since neither
+            ran under a drift monitor during its own (Phase 1/2) evaluation.
         device: Torch device.
         batch_size: Decoding batch size.
         max_length: Maximum generated tokens.
@@ -618,6 +695,11 @@ def evaluate_arm(
         checkpoint_label: Checkpoint path recorded in the row, for provenance.
         checkpoint_sha256: Checkpoint content hash recorded in the row.
         novelty_index_sha256: Novelty index content hash recorded in the row.
+        reward_config_sha256: ``{"accuracy": ..., "composite": ...,
+            "constraint": ...}`` SHA-256 of the canonical
+            ``configs/rl/*.yaml`` files ``auditor_scorers`` /
+            ``ensemble_scorers`` were built from (:func:`hash_reward_configs`),
+            recorded verbatim on every row for pre-registration provenance.
 
     Returns:
         One flat row dict, matching :data:`MATRIX_COLUMNS` minus the verdict
@@ -693,6 +775,14 @@ def evaluate_arm(
     constraint_satisfaction_rate_auditor = _mean(constraint_values_auditor)
     constraint_satisfaction_rate_ensemble = _mean(constraint_values_ensemble)
 
+    # Adjudication (d): diagnostic only, computed identically for every row
+    # (arm_a's and arm_b's included -- neither ran under a drift monitor
+    # during its own Phase 1/2 evaluation) via the SAME module the training-
+    # time drift monitor uses. `ensemble_predictions` is reused, not
+    # recomputed -- the auditor-gap half is unused here (this monitor was
+    # built with no auditor) and its keys come back `None`.
+    drift_stats = similarity_monitor.observe(candidates, ensemble_predictions)
+
     row: dict[str, Any] = {
         "arm": arm_key,
         "label": label,
@@ -705,6 +795,8 @@ def evaluate_arm(
         **batch.counts.to_dict(),
         "sr_rate": batch.sr_rate,
         "duplicate_rate": batch.duplicate_rate,
+        "max_tanimoto_mean": drift_stats["max_tanimoto_mean"],
+        "near_copy_fraction": drift_stats["near_copy_fraction"],
         "mean_length": batch.mean_length,
         "property_mean_auditor": property_mean_auditor,
         "property_mae_auditor": property_mae_auditor,
@@ -719,6 +811,9 @@ def evaluate_arm(
         "constraint_satisfaction_rate_auditor": constraint_satisfaction_rate_auditor,
         "constraint_satisfaction_rate_ensemble": constraint_satisfaction_rate_ensemble,
         "novelty_index_sha256": novelty_index_sha256,
+        "accuracy_reward_config_sha256": reward_config_sha256.get("accuracy"),
+        "composite_reward_config_sha256": reward_config_sha256.get("composite"),
+        "constraint_reward_config_sha256": reward_config_sha256.get("constraint"),
         SAMPLES_KEY: {
             "accuracy_score": {"auditor": accuracy_values_auditor,
                                "ensemble": accuracy_values_ensemble},
@@ -973,6 +1068,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "no-op for every row. Off by default: a missing index silently "
                              "inflates novelty across the entire matrix behind nothing but a "
                              "warning, so the run aborts unless this is explicitly passed.")
+    parser.add_argument("--drift-reference", type=Path, default=None,
+                        help="Labelled Tg polymers to compute max_tanimoto_mean/"
+                             "near_copy_fraction against (diagnostic columns only -- see "
+                             "STRUCTURAL_METRICS and the module docstring; never wired into "
+                             "ARM_METRIC or the success criterion). Defaults to "
+                             "train_grpo.DEFAULT_DRIFT_REFERENCE, the same file every arm's "
+                             "drift: block points at. Missing/unusable degrades the two columns "
+                             "to None for every row rather than aborting -- this is a diagnostic, "
+                             "not a gate.")
+    parser.add_argument("--max-drift-reference", type=int, default=DEFAULT_MAX_REFERENCE)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None,
@@ -1082,10 +1187,18 @@ def main(argv: list[str] | None = None) -> int:
     # ensemble is four (n=1 of 4 means three members could not read the
     # candidate, which is the opposite situation -- see polyt5.rewards.tg).
     ensemble_size = len(ensemble)
+    # Pre-registration integrity: these three YAMLs are what accuracy_score /
+    # composite_score / constraint_satisfaction_rate MEAN, and they are
+    # unhashed, unfrozen, git-tracked files -- see reward_config_paths's
+    # docstring. Hashed here, ONCE, alongside loading them, so the hash on
+    # every row is provably the hash of the file the scorers below were
+    # actually built from.
+    reward_config_paths_map = reward_config_paths()
+    reward_config_sha256 = hash_reward_configs(reward_config_paths_map)
     arm_configs = {
-        name: load_config(REPO_ROOT / "configs" / "rl" / f"{name}.yaml")
-        for name in ("accuracy", "composite", "constraint")
+        name: load_config(path) for name, path in reward_config_paths_map.items()
     }
+    logger.info("reward config hashes: %s", reward_config_sha256)
 
     def _scorers(size: int) -> ArmScorers:
         return ArmScorers(**{
@@ -1098,6 +1211,29 @@ def main(argv: list[str] | None = None) -> int:
     ensemble_scorers = _scorers(ensemble_size)
     logger.info("reward-arm scorers: auditor ensemble_size=1, ensemble ensemble_size=%d",
                 ensemble_size)
+
+    # Adjudication (d): max_tanimoto_mean / near_copy_fraction, computed
+    # identically for every row (arm_a's and arm_b's included) via the same
+    # DriftMonitor the training-time monitor uses -- built with NO auditor
+    # (only the reference fingerprints), so it costs zero extra predictor
+    # calls; ensemble_predictions is reused from what evaluate_arm already
+    # computes. A missing/unusable reference degrades the two columns to
+    # None for every row rather than aborting -- this is a diagnostic, not a
+    # pre-registered success metric (see STRUCTURAL_METRICS and ARM_METRIC).
+    drift_reference_path = args.drift_reference or DEFAULT_DRIFT_REFERENCE
+    drift_reference = load_drift_reference(
+        _resolve(drift_reference_path), limit=args.max_drift_reference)
+    similarity_monitor = DriftMonitor(
+        reference_psmiles=drift_reference, max_reference=args.max_drift_reference,
+        seed=args.seed,
+    )
+    if similarity_monitor.has_similarity:
+        logger.info("drift reference: %s (%d fingerprints)", drift_reference_path,
+                    similarity_monitor.n_reference)
+    else:
+        logger.warning(
+            "drift reference unusable (%s) -- max_tanimoto_mean/near_copy_fraction will be "
+            "None for every row (diagnostic only, does not block the run)", drift_reference_path)
 
     rows: list[dict[str, Any]] = []
     for arm_key, label, sampling_key in (
@@ -1112,11 +1248,13 @@ def main(argv: list[str] | None = None) -> int:
             generation_model, tokenizer, arm_key=arm_key, label=label, kind="baseline",
             point=point, targets=targets, n_samples=n_samples, training_index=training_index,
             auditor=auditor, ensemble=ensemble, auditor_scorers=auditor_scorers,
-            ensemble_scorers=ensemble_scorers, device=device, batch_size=args.batch_size,
+            ensemble_scorers=ensemble_scorers, similarity_monitor=similarity_monitor,
+            device=device, batch_size=args.batch_size,
             max_length=args.max_length, seed=args.seed, tolerance=tolerance,
             checkpoint_label=str(frozen["artifacts"]["generation"]["path"]),
             checkpoint_sha256=frozen["artifacts"]["generation"]["sha256"],
             novelty_index_sha256=novelty_index_sha256,
+            reward_config_sha256=reward_config_sha256,
         )
         rows.append(row)
 
@@ -1130,10 +1268,12 @@ def main(argv: list[str] | None = None) -> int:
             model, tokenizer, arm_key=arm_name, label=f"Arm {arm_name}", kind="rlvr",
             point=point, targets=targets, n_samples=n_samples, training_index=training_index,
             auditor=auditor, ensemble=ensemble, auditor_scorers=auditor_scorers,
-            ensemble_scorers=ensemble_scorers, device=device, batch_size=args.batch_size,
+            ensemble_scorers=ensemble_scorers, similarity_monitor=similarity_monitor,
+            device=device, batch_size=args.batch_size,
             max_length=args.max_length, seed=args.seed, tolerance=tolerance,
             checkpoint_label=str(checkpoint_path), checkpoint_sha256=checkpoint_sha256,
             novelty_index_sha256=novelty_index_sha256,
+            reward_config_sha256=reward_config_sha256,
         )
         rows.append(row)
 
@@ -1179,6 +1319,24 @@ def main(argv: list[str] | None = None) -> int:
                       for arm, (metric, direction) in ARM_METRIC.items()},
         "pre_registration_verified_against": str(frozen_path),
         "structural_metrics": sorted(STRUCTURAL_METRICS),
+        # Pre-registration integrity (see reward_config_paths's docstring):
+        # accuracy_score / composite_score / constraint_satisfaction_rate's
+        # DEFINITIONS -- tolerance, sigma0, sigma_unknown, min_coverage,
+        # sa_max, window_tolerance, weights -- live in these three unfrozen
+        # YAMLs. This hash makes a run auditable after the fact for exactly
+        # which reward definitions produced it; editing a config changes it.
+        "reward_config_sha256": {
+            name: {"path": str(path), "sha256": reward_config_sha256[name]}
+            for name, path in reward_config_paths_map.items()
+        },
+        # Adjudication (d): diagnostic only, never a success metric -- see
+        # STRUCTURAL_METRICS / ARM_METRIC and the max_tanimoto_mean /
+        # near_copy_fraction columns on every row.
+        "drift_reference": {
+            "path": str(drift_reference_path),
+            "n_reference_fingerprints": similarity_monitor.n_reference,
+            "has_similarity": similarity_monitor.has_similarity,
+        },
         "rows": summary_rows,
     }
     summary_path = run_dir.root / "summary.json"

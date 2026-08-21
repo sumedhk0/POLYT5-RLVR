@@ -22,6 +22,7 @@ import compare_arms  # noqa: E402
 from compare_arms import (  # noqa: E402
     ARM_METRIC,
     MATRIX_COLUMNS,
+    STRUCTURAL_METRICS,
     ArmScorers,
     _auditor_predictions,
     _bootstrap_delta,
@@ -29,6 +30,8 @@ from compare_arms import (  # noqa: E402
     _score_with_arm,
     apply_success_criterion,
     check_pre_registration,
+    hash_reward_configs,
+    reward_config_paths,
     skipped_arm_row,
     write_matrix_csv,
     write_matrix_markdown,
@@ -124,6 +127,68 @@ def test_frozen_record_pins_a_margin_for_every_arm():
     registered = _frozen()["pre_registered_metrics"]
     for arm in ARM_METRIC:
         assert float(registered[arm]["min_margin"]) > 0.0, arm
+
+
+# -------------------------------------------------- reward config provenance (item 1)
+
+
+def test_reward_config_paths_covers_exactly_the_three_scorer_arms():
+    """``validity`` is deliberately excluded -- its optimized metric
+    (``pv_rate``) is structural RDKit chemistry with no ``reward:`` block in
+    the loop at all; see :data:`STRUCTURAL_METRICS`.
+    """
+    paths = reward_config_paths()
+    assert set(paths) == {"accuracy", "composite", "constraint"}
+    for name, path in paths.items():
+        assert path.is_file(), (name, path)
+        assert path == REPO_ROOT / "configs" / "rl" / f"{name}.yaml"
+
+
+def test_hash_reward_configs_matches_sha256_of_file():
+    paths = reward_config_paths()
+    hashes = hash_reward_configs(paths)
+    for name, path in paths.items():
+        assert hashes[name] == compare_arms.sha256_of_file(path)
+        assert len(hashes[name]) == 64
+
+
+def test_hash_reward_configs_changes_when_a_config_is_edited(tmp_path):
+    """The whole point: an unhashed config can be edited with no trace. This
+    pins that editing one DOES change the recorded hash.
+    """
+    path = tmp_path / "accuracy.yaml"
+    path.write_text("reward:\n  sigma0: 17.0\n", encoding="utf-8")
+    before = hash_reward_configs({"accuracy": path})
+
+    path.write_text("reward:\n  sigma0: 99.0\n", encoding="utf-8")
+    after = hash_reward_configs({"accuracy": path})
+
+    assert before["accuracy"] != after["accuracy"]
+
+
+def test_reward_config_sha256_columns_exist_for_every_scorer_arm():
+    for name in ("accuracy", "composite", "constraint"):
+        assert f"{name}_reward_config_sha256" in MATRIX_COLUMNS
+
+
+# --------------------------------------------------------- drift columns (item 3)
+
+
+def test_drift_columns_are_in_the_matrix():
+    assert "max_tanimoto_mean" in MATRIX_COLUMNS
+    assert "near_copy_fraction" in MATRIX_COLUMNS
+
+
+def test_drift_columns_are_diagnostic_never_a_success_metric():
+    """Adjudication (d): novelty is exact-canonical-match, so these two
+    columns exist to let a reader catch a one-atom-edit near-copy -- they must
+    never become part of what an arm is judged to have succeeded at.
+    """
+    metric_names = {metric for metric, _direction in ARM_METRIC.values()}
+    assert "max_tanimoto_mean" not in metric_names
+    assert "near_copy_fraction" not in metric_names
+    assert "max_tanimoto_mean" not in STRUCTURAL_METRICS
+    assert "near_copy_fraction" not in STRUCTURAL_METRICS
 
 
 # ------------------------------------------------------------------ _bootstrap_delta
@@ -499,13 +564,23 @@ def test_evaluate_arm_auditor_predictions_are_wired_through_the_helper(monkeypat
     ensemble_scorers = ArmScorers(
         accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
 
+    class _NullSimilarityMonitor:
+        def observe(self, candidates, ensemble_predictions):
+            return {"max_tanimoto_mean": None, "near_copy_fraction": None,
+                    "max_tanimoto_p90": None, "max_tanimoto_n": None,
+                    "auditor_gap_mean": None, "auditor_gap_signed_mean": None,
+                    "auditor_gap_n": None}
+
     row = compare_arms.evaluate_arm(
         None, None, arm_key="composite", label="test", kind="rlvr",
         point=SweepPoint(temperature=0.7, top_p=0.95), targets=[300.0, 400.0], n_samples=2,
         training_index=None, auditor=fake_auditor, ensemble=_FakeEnsemble(),
-        auditor_scorers=auditor_scorers, ensemble_scorers=ensemble_scorers, device="cpu",
+        auditor_scorers=auditor_scorers, ensemble_scorers=ensemble_scorers,
+        similarity_monitor=_NullSimilarityMonitor(), device="cpu",
         batch_size=2, max_length=200, seed=0, tolerance=50.0,
         checkpoint_label=None, checkpoint_sha256=None, novelty_index_sha256=None,
+        reward_config_sha256={"accuracy": "a" * 64, "composite": "b" * 64,
+                              "constraint": "c" * 64},
     )
 
     # The auditor-side scorers receive the (mean, 0.0, 1) triples and the
@@ -519,6 +594,89 @@ def test_evaluate_arm_auditor_predictions_are_wired_through_the_helper(monkeypat
         assert scorer.calls[0] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
     assert row["composite_score_auditor"] == pytest.approx(1.0)
     assert row["accuracy_score_ensemble"] == pytest.approx(1.0)
+    assert row["accuracy_reward_config_sha256"] == "a" * 64
+    assert row["composite_reward_config_sha256"] == "b" * 64
+    assert row["constraint_reward_config_sha256"] == "c" * 64
+    assert row["max_tanimoto_mean"] is None
+    assert row["near_copy_fraction"] is None
+
+
+def test_evaluate_arm_computes_drift_columns_for_baseline_and_rlvr_rows(monkeypatch):
+    """Adjudication (d): arm_a/arm_b never ran under a drift monitor, so
+    today these columns exist only in the training log. ``evaluate_arm`` must
+    compute them for EVERY row -- baseline (``kind="baseline"``, e.g. arm_a)
+    included, not just RLVR rows -- reusing the exact ``ensemble_predictions``
+    already computed, not a second predictor call.
+    """
+    from polyt5.evaluation.filters import CandidateRecord, FilterCounts
+    from polyt5.evaluation.sweep import ScreenedBatch, SweepPoint
+
+    def _record(canonical_psmiles):
+        return CandidateRecord(
+            raw_pselfies="raw", psmiles=canonical_psmiles, canonical_psmiles=canonical_psmiles,
+            passed_sv=True, passed_tsd=True, passed_dd=True, passed_pv=True,
+            reproducible=True, failure_stage=None, sa_score=None,
+        )
+
+    fixed_batch = ScreenedBatch(
+        point=SweepPoint(temperature=0.7, top_p=0.95),
+        candidates=["cand0", "cand1"],
+        sample_targets=[300.0, 400.0],
+        records=[_record("A"), _record("B")],
+        counts=FilterCounts(n_input=2, n_sv=2, n_tsd=2, n_dd=2, n_pv=2),
+        sr_rate=1.0, duplicate_rate=0.0, mean_length=5.0,
+    )
+
+    def fake_screen_candidates(model, tokenizer, **kwargs):
+        return fixed_batch
+
+    monkeypatch.setattr(compare_arms, "screen_candidates", fake_screen_candidates)
+
+    def fake_auditor(candidates):
+        return [111.0, 222.0]
+
+    class _FakeEnsemble:
+        def predict_with_uncertainty(self, candidates):
+            return [(111.0, 9.0, 4), (222.0, 8.0, 4)]
+
+    class _NullArm:
+        def __call__(self, candidates, targets, predictions):
+            return [_FakeResult(0.0) for _ in candidates]
+
+    class _RecordingSimilarityMonitor:
+        def __init__(self):
+            self.calls: list[tuple[list[str], list[tuple[float, float, int]]]] = []
+
+        def observe(self, candidates, ensemble_predictions):
+            self.calls.append((list(candidates), list(ensemble_predictions)))
+            return {"max_tanimoto_mean": 0.42, "near_copy_fraction": 0.5,
+                    "max_tanimoto_p90": 0.9, "max_tanimoto_n": 2.0,
+                    "auditor_gap_mean": None, "auditor_gap_signed_mean": None,
+                    "auditor_gap_n": None}
+
+    scorers = ArmScorers(accuracy=_NullArm(), composite=_NullArm(), constraint=_NullArm())
+    monitor = _RecordingSimilarityMonitor()
+    reward_hashes = {"accuracy": "a" * 64, "composite": "b" * 64, "constraint": "c" * 64}
+
+    rows = {}
+    for kind, arm_key in (("baseline", "arm_a"), ("rlvr", "accuracy")):
+        rows[arm_key] = compare_arms.evaluate_arm(
+            None, None, arm_key=arm_key, label="test", kind=kind,
+            point=SweepPoint(temperature=0.7, top_p=0.95), targets=[300.0, 400.0], n_samples=2,
+            training_index=None, auditor=fake_auditor, ensemble=_FakeEnsemble(),
+            auditor_scorers=scorers, ensemble_scorers=scorers, similarity_monitor=monitor,
+            device="cpu", batch_size=2, max_length=200, seed=0, tolerance=50.0,
+            checkpoint_label=None, checkpoint_sha256=None, novelty_index_sha256=None,
+            reward_config_sha256=reward_hashes,
+        )
+
+    for arm_key, row in rows.items():
+        assert row["max_tanimoto_mean"] == pytest.approx(0.42), arm_key
+        assert row["near_copy_fraction"] == pytest.approx(0.5), arm_key
+
+    assert len(monitor.calls) == 2
+    assert monitor.calls[0] == (["cand0", "cand1"], [(111.0, 9.0, 4), (222.0, 8.0, 4)])
+    assert monitor.calls[1] == monitor.calls[0]
 
 
 # ------------------------------------------------------------------ matrix writers
