@@ -268,12 +268,92 @@ def test_score_with_arm_empty_batch_is_zero():
 def test_auditor_predictions_always_carries_zero_std():
     """Ruling C: a single-model auditor has no ensemble disagreement to
     report; ``std`` must always be ``0.0``, never fabricated.
-    """
-    def fake_auditor(candidates):
-        return [123.4, 567.8]
 
-    predictions = _auditor_predictions(fake_auditor, ["a", "b"])
+    Takes already-computed means (not an auditor callable) -- see
+    ``test_evaluate_arm_auditor_predictions_are_wired_through_the_helper``
+    below for why: ``evaluate_arm`` must build ``auditor_means`` with exactly
+    ONE call to the auditor (it also needs the raw means for the screened
+    slice), so this helper cannot own the call itself without doubling it.
+    """
+    predictions = _auditor_predictions([123.4, 567.8])
     assert predictions == [(123.4, 0.0, 1), (567.8, 0.0, 1)]
+
+
+def test_evaluate_arm_auditor_predictions_are_wired_through_the_helper(monkeypatch):
+    """Task 8 review finding: ``evaluate_arm`` used to inline its own
+    ``[(float(mean), 0.0, 1) for mean in auditor_means]`` instead of calling
+    ``_auditor_predictions``, so a mutant changing that inlined ``0.0`` to a
+    nonzero std broke nothing -- ``_auditor_predictions`` was dead code in
+    the production path and the whole 869-test suite still passed.
+
+    This exercises ``evaluate_arm`` itself end to end (``screen_candidates``
+    is the only thing stubbed out; ``property_columns`` and the reward arms
+    run for real) and pins the EXACT ``(mean, std, n)`` triples the arms are
+    called with, so it fails if that wiring ever regresses -- see
+    ``.superpowers/sdd/2026-08-20-grpo-rlvr/task-9-report.md`` for the mutant
+    re-introduction that proves this.
+    """
+    from polyt5.evaluation.filters import CandidateRecord, FilterCounts
+    from polyt5.evaluation.sweep import ScreenedBatch, SweepPoint
+
+    def _record(canonical_psmiles):
+        return CandidateRecord(
+            raw_pselfies="raw", psmiles=canonical_psmiles, canonical_psmiles=canonical_psmiles,
+            passed_sv=True, passed_tsd=True, passed_dd=True, passed_pv=True,
+            reproducible=True, failure_stage=None, sa_score=None,
+        )
+
+    fixed_batch = ScreenedBatch(
+        point=SweepPoint(temperature=0.7, top_p=0.95),
+        candidates=["cand0", "cand1"],
+        sample_targets=[300.0, 400.0],
+        records=[_record("A"), _record("B")],
+        counts=FilterCounts(n_input=2, n_sv=2, n_tsd=2, n_dd=2, n_pv=2),
+        sr_rate=1.0,
+        duplicate_rate=0.0,
+        mean_length=5.0,
+    )
+
+    def fake_screen_candidates(model, tokenizer, **kwargs):
+        return fixed_batch
+
+    monkeypatch.setattr(compare_arms, "screen_candidates", fake_screen_candidates)
+
+    def fake_auditor(candidates):
+        return [111.0, 222.0]
+
+    class _FakeEnsemble:
+        def predict_with_uncertainty(self, candidates):
+            return [(111.0, 9.0, 4), (222.0, 8.0, 4)]
+
+    class _RecordingArm:
+        def __init__(self):
+            self.calls: list[list[tuple[float, float, int]]] = []
+
+        def __call__(self, candidates, targets, predictions):
+            self.calls.append(list(predictions))
+            return [_FakeResult(1.0) for _ in candidates]
+
+    composite_arm = _RecordingArm()
+    constraint_arm = _RecordingArm()
+
+    row = compare_arms.evaluate_arm(
+        None, None, arm_key="composite", label="test", kind="rlvr",
+        point=SweepPoint(temperature=0.7, top_p=0.95), targets=[300.0, 400.0], n_samples=2,
+        training_index=None, auditor=fake_auditor, ensemble=_FakeEnsemble(),
+        composite_arm=composite_arm, constraint_arm=constraint_arm, device="cpu",
+        batch_size=2, max_length=200, seed=0, tolerance=50.0,
+        checkpoint_label=None, checkpoint_sha256=None, novelty_index_sha256=None,
+    )
+
+    # evaluate_arm computes the auditor-scored column before the
+    # ensemble-scored one, for both arms (see its body) -- calls[0] is
+    # therefore always the auditor-built triples, calls[1] the ensemble's.
+    assert composite_arm.calls[0] == [(111.0, 0.0, 1), (222.0, 0.0, 1)]
+    assert composite_arm.calls[1] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
+    assert constraint_arm.calls[0] == [(111.0, 0.0, 1), (222.0, 0.0, 1)]
+    assert constraint_arm.calls[1] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
+    assert row["composite_score_auditor"] == pytest.approx(1.0)
 
 
 # ------------------------------------------------------------------ matrix writers

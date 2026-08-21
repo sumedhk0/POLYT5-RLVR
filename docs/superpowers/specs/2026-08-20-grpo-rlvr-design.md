@@ -166,6 +166,16 @@ src/polyt5/rewards/
 inference}`. Nothing in the supervised codebase imports `rl/`. `training/checkpoint.py` is reused
 unchanged.
 
+**[CORRECTION] Torch is not, and was never meant to be, confined to `rl/` and `model/`.** `training/`,
+`generation/`, `data/`, `inference/` and `evaluation/sweep.py` have imported `torch` since Phase 1/2 and
+still do — that is correct, existing behaviour, not something Task 9 changed. The two contracts this
+project actually verifies (Task 9, `tests/test_dependency_direction.py` and the pre-existing torch-purity
+tests in `tests/test_chemistry.py` / `tests/test_rewards.py`) are narrower and both hold: (1) no
+`transformers` dependency anywhere in the repo, and (2) nothing outside `rl/` imports `rl/` (checked by
+AST, package by package). `polyt5.chemistry` and `polyt5.rewards` specifically are torch-free — that is a
+real, narrower guarantee (reward workers must run CPU-only) — but that is not the same claim as "torch only
+appears in `rl/` and `model/`", which is false and must not be repeated.
+
 Rejected alternatives: **pipelined async reward workers** (~30–40% faster, but introduces a queue and
 nondeterminism in a study whose whole point is trustworthy comparison — the torch-free chemistry layer
 leaves this seam open for later); **an external RL library** (our model is not a HuggingFace model, the

@@ -64,6 +64,24 @@ sides ARE the same measurement by construction), which is worse than admitting
 the check does not apply. ``success`` then reduces to ``beats_arm_b`` alone.
 See ``STRUCTURAL_METRICS`` and :func:`apply_success_criterion`.
 
+[DECISION] (Ruling D, constraint arm) ``constraint``'s optimized metric
+(``constraint_satisfaction_rate``) is NOT structural -- it gets both an
+``_auditor`` and an ``_ensemble`` column, unlike ``pv_rate`` above -- but it
+is not a pure closeness score either, and its clause-2 comparison is
+therefore a MIXED measurement, not a clean re-scoring of the same quantity by
+a different predictor. :class:`~polyt5.rewards.composite.ConstraintArm`
+evaluates a three-way conjunction (Tg window AND synthesisable AND novel) per
+candidate: only the Tg clause reads from the injected ``predictions`` triple,
+so ``constraint_satisfaction_rate_auditor`` uses the AUDITOR's mean for that
+clause while its SA and novelty clauses are computed identically to the
+ensemble-scored column -- straight from the candidate's own structure via
+RDKit/the novelty index, not from either predictor. That is intentional: SA
+and novelty have no predictor-side disagreement to audit (they are facts
+about the SAME candidate regardless of which predictor scored the Tg clause),
+so the only part of the conjunction clause 2 can independently confirm is Tg,
+and it does. See :func:`_score_with_arm` and
+:class:`~polyt5.rewards.composite.ConstraintArm`.
+
 See ``ARM_METRIC`` for which column each arm is judged on and why; ``composite``
 and ``constraint`` need PER-CANDIDATE scoring (not an aggregate the paper's
 sweep machinery already returns), so this script reuses the actual
@@ -92,6 +110,7 @@ import argparse
 import csv
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -188,8 +207,8 @@ def _metric_column(metric_name: str, predictor: str) -> str:
     return f"{metric_name}_{predictor}"
 
 
-def _auditor_predictions(auditor, candidates: list[str]) -> list[tuple[float, float, int]]:
-    """Build ``(mean, std, n)`` triples for a single-model predictor.
+def _auditor_predictions(means: Sequence[float]) -> list[tuple[float, float, int]]:
+    """Build ``(mean, std, n)`` triples from a single-model predictor's raw means.
 
     [DECISION] (Ruling C) ``std`` is always ``0.0`` here -- the auditor is one
     model with nothing to disagree with itself about, so this is not a stand-in
@@ -200,18 +219,19 @@ def _auditor_predictions(auditor, candidates: list[str]) -> list[tuple[float, fl
     that is the deliberate, and appropriately stricter, choice for clause 2 of
     the success criterion.
 
+    Takes already-computed means rather than the auditor callable itself, so
+    :func:`evaluate_arm` -- the only real caller -- can build these from the
+    SAME ``auditor(candidates)`` call it also slices for ``auditor_screened``,
+    instead of invoking the auditor a second time.
+
     Args:
-        auditor: A single-model predictor (``Callable[[Sequence[str]],
-            Sequence[float]]``, e.g. :class:`~polyt5.inference.
-            PolyT5PropertyPredictor`).
-        candidates: Raw generated PSELFIES strings.
+        means: Raw auditor predictions, one per candidate.
 
     Returns:
-        One ``(mean, 0.0, 1)`` triple per candidate, matching the
+        One ``(mean, 0.0, 1)`` triple per input, matching the
         ``EnsemblePropertyPredictor.predict_with_uncertainty`` contract that
         :mod:`polyt5.rewards` arms expect.
     """
-    means = list(auditor(candidates))
     return [(float(mean), 0.0, 1) for mean in means]
 
 
@@ -387,7 +407,7 @@ def evaluate_arm(
     sample_targets = batch.sample_targets
 
     auditor_means = list(auditor(candidates))
-    auditor_predictions = [(float(mean), 0.0, 1) for mean in auditor_means]
+    auditor_predictions = _auditor_predictions(auditor_means)
     ensemble_predictions = list(ensemble.predict_with_uncertainty(candidates))
 
     screened_indices = [

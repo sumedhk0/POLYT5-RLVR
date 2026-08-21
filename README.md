@@ -16,7 +16,7 @@ generative polymer design — plus a **separate, clearly-labelled** research ext
 |---|---|---|
 | What | Span-corruption pretraining → supervised fine-tuning → sampling and screening | GRPO with verifiable rewards, initialized from the supervised checkpoint |
 | Source | The published polyT5 method | **Ours. Not in the paper.** |
-| Status | In progress | Designed only — **no code** (see [`docs/rlvr_plan.md`](docs/rlvr_plan.md)) |
+| Status | In progress; Arm A/B measured and frozen for RLVR comparison (see [`docs/baseline.md`](docs/baseline.md)) | Apparatus built and tested; **no arm has been trained yet** (see [RLVR extension](#phase-3-grporlvr-our-extension) below) |
 
 The published polyT5 work is **entirely supervised**. It contains no reinforcement learning. Nothing in
 this repository may describe GRPO or RLVR as part of the paper.
@@ -140,8 +140,8 @@ src/polyt5/
     chemistry/      PSMILES ↔ PSELFIES, validity, canonicalization, novelty  (no torch dependency)
     evaluation/     SV/TSD/DD/PV, SELFIES reproducibility, SA, property metrics
     utils/          seeding, device, config, run directories, metric logging
-    rl/             Phase 3 — empty by design
-    rewards/        Phase 3 — empty by design
+    rl/             Phase 3 (ours) — group rollout, advantages, clipped GRPO surrogate, trainer
+    rewards/        Phase 3 (ours) — verifiable reward components + the four arm definitions
 
 configs/            every experimental setting; no settings live in Python
 scripts/            CLI entry points
@@ -153,14 +153,56 @@ artifacts/          the tokenizer artifact
 
 Architectural rules that make the Phase-3 extension possible without rewriting Phase 1:
 
-- **Chemistry never imports torch.** Reward workers must run without a model in the process.
+- **Chemistry and rewards never import torch.** Reward workers must run without a model in the process
+  (verified by a subprocess test — see `tests/test_chemistry.py`, `tests/test_rewards.py`). This is
+  narrower than "torch is confined to `rl/`/`model/`" — it is not, and never has been: `training/`,
+  `generation/`, `data/`, `inference/` and `evaluation/sweep.py` all import torch too, same as `rl/` and
+  `model/` do. No `transformers` dependency exists anywhere in this repository.
 - **Model code never imports chemistry.** Validity is an evaluation concern, not a layer of the network.
-- **Dependencies point one way:** `rl/ → {model, tokenization, chemistry, generation, evaluation}`, never
-  the reverse. The supervised code does not know RL exists.
+- **Dependencies point one way:** `rl/ → {model, tokenization, chemistry, generation, evaluation,
+  inference, training}`, never the reverse — nothing outside `rl/` imports `rl/`, verified by
+  `tests/test_dependency_direction.py`. The supervised code does not know RL exists.
 - **The tokenizer is a hashed on-disk artifact**, identical across pretraining, fine-tuning, evaluation,
   generation, and future rollouts.
 - **Checkpoints always carry their config and tokenizer identity.** A checkpoint without its configuration
   is not a checkpoint.
+
+---
+
+## Phase 3: GRPO/RLVR (our extension)
+
+**This is our research extension, not part of the published polyT5 method.** polyT5 (Sahu et al., npj
+Artificial Intelligence 2026) is supervised throughout — span-corruption pretraining, supervised
+fine-tuning, then sampling and screening. It contains no reinforcement learning of any kind, no reward
+ensemble, no uncertainty estimate, and never releases a Tg predictor. Nothing here may be described as part
+of the paper's method; results from it are reported as **"our RLVR extension obtains …"** — a third
+category, distinct from *"the paper reports …"* and *"our reproduction obtains …"* (see
+[Scientific integrity](#scientific-integrity)).
+
+**Status: apparatus built and tested, no arm trained yet.** The entry gate (`docs/rlvr_plan.md` §8) is
+satisfied — the supervised baseline is frozen (`artifacts/baseline/frozen_baseline.json`, verified
+SHA-256) and Arm A / Arm B are measured against it. What is built on top of that baseline:
+
+- **Reward components** (`src/polyt5/rewards/`) — validity gate, Tg closeness with confidence weighting,
+  novelty, synthetic accessibility, and the four reward arms (`accuracy`, `validity`, `composite`,
+  `constraint`). Deliberately torch-free, so reward workers run CPU-only.
+- **RL core** (`src/polyt5/rl/`) — group rollout, group-relative advantages, the clipped GRPO surrogate
+  with a k3 KL anchor to a frozen reference policy, and `GRPOTrainer`, the synchronous training loop.
+- **Training CLI** (`scripts/train_grpo.py`) and **four arm configs** (`configs/rl/*.yaml`) — one GRPO run
+  per arm, differing only in reward.
+- **Arm-comparison matrix** (`scripts/compare_arms.py`) — samples fresh candidates from every trained arm
+  under the frozen evaluation protocol and scores them twice: once by the reward ensemble (splits 0–3,
+  "the metric it optimized") and once by a held-out auditor (split 4, never used in any reward path).
+
+**Pre-registered success criterion** (`frozen_baseline.json`'s `success_criterion`, unchanged since the
+freeze): an RLVR arm succeeds only if it beats Arm B on the metric it optimized under the reward ensemble
+*and* that gain survives independent scoring by the auditor. This is `[OURS]` — the paper defines no such
+criterion, ensembles nothing, and never audits with a held-out model.
+
+**No outcome is claimed here.** No arm has been trained; this section describes the apparatus and the
+criterion it will be measured against, not a result. See `docs/rlvr_plan.md` for the original design
+record, `docs/superpowers/specs/2026-08-20-grpo-rlvr-design.md` for the as-built spec, and
+`docs/superpowers/plans/2026-08-20-grpo-rlvr.md` for the task-by-task plan.
 
 ---
 
@@ -195,7 +237,9 @@ Things this reproduction established that the paper does not state. Each is reco
 | [`docs/ambiguity_register.md`](docs/ambiguity_register.md) | Every unspecified detail, our choice, and its justification |
 | [`docs/data.md`](docs/data.md) | The withheld datasets, the public substitutes, their licenses and provenance |
 | [`docs/baseline.md`](docs/baseline.md) | Staged build plan, hardware reality, fidelity ledger, results tables |
-| [`docs/rlvr_plan.md`](docs/rlvr_plan.md) | The Phase-3 GRPO/RLVR design — **not implemented** |
+| [`docs/rlvr_plan.md`](docs/rlvr_plan.md) | The original Phase-3 GRPO/RLVR design record; entry gate now satisfied |
+| [`docs/superpowers/specs/2026-08-20-grpo-rlvr-design.md`](docs/superpowers/specs/2026-08-20-grpo-rlvr-design.md) | The as-built Phase-3 spec — algorithm, architecture, and pre-registered success criterion |
+| [`docs/superpowers/plans/2026-08-20-grpo-rlvr.md`](docs/superpowers/plans/2026-08-20-grpo-rlvr.md) | The task-by-task Phase-3 implementation plan (Tasks 1–9) |
 
 ---
 
