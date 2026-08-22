@@ -32,7 +32,7 @@ train:
   max_grad_norm: 1.0
   rollout_batch_size: 128 # measured optimum; 512 is 3.5x slower
   log_every: 10
-  save_every: 250
+  save_every: 100
   device: auto
 
 # Spec 4.4 drift monitoring. LOGGING ONLY: the auditor loaded here is handed to
