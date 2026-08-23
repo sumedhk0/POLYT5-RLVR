@@ -201,6 +201,39 @@ def test_check_pre_registration_catches_unanimity_being_silently_dropped(monkeyp
     assert any("across_seed_requires_unanimity" in p for p in problems), problems
 
 
+@pytest.mark.parametrize("key", [
+    "across_seed_bootstrap",
+    "across_seed_min_margin_source",
+    "across_seed_requires_unanimity",
+])
+def test_check_pre_registration_rejects_a_DELETED_across_seed_key(key):
+    """Deleting a key must fail, not silently skip its own comparison.
+
+    A compared-if-present check hands anyone a one-line way to disable the
+    check on themselves, which is exactly the drift check_pre_registration
+    exists to prevent. These three define a criterion pre-registered before
+    any second seed ran, so no legitimate older record can lack them -- unlike
+    the bootstrap keys, which stay optional precisely because records predating
+    the bootstrap genuinely do not carry them.
+    """
+    frozen = _frozen()
+    del frozen["success_criterion_statistics"][key]
+    problems = check_pre_registration(frozen)
+    assert any(key in p and "missing" in p for p in problems), problems
+
+
+def test_check_pre_registration_still_accepts_a_record_without_the_bootstrap_keys():
+    """The counterpart: the three ORIGINAL bootstrap keys stay soft.
+
+    Hard-requiring those would reject a valid baseline written before the
+    bootstrap existed. This pins the asymmetry as deliberate.
+    """
+    frozen = _frozen()
+    for key in ("n_bootstrap", "confidence", "bootstrap_seed"):
+        frozen["success_criterion_statistics"].pop(key, None)
+    assert check_pre_registration(frozen) == []
+
+
 def test_check_pre_registration_passes_against_the_real_frozen_record_with_across_seed_fields():
     """The real file, unmutated, must still pass -- this is the binding
     actually landing cleanly, not just the mutants being catchable.

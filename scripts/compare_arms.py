@@ -664,14 +664,29 @@ def check_pre_registration(frozen: dict[str, Any]) -> list[str]:
                         f"{sorted(frozen_structural)}")
 
     statistics = frozen.get("success_criterion_statistics", {})
-    for key, coded_value in (
-        ("n_bootstrap", N_BOOTSTRAP), ("confidence", BOOTSTRAP_CONFIDENCE),
-        ("bootstrap_seed", BOOTSTRAP_SEED),
-        ("across_seed_bootstrap", ACROSS_SEED_BOOTSTRAP),
-        ("across_seed_min_margin_source", ACROSS_SEED_MIN_MARGIN_SOURCE),
-        ("across_seed_requires_unanimity", ACROSS_SEED_REQUIRES_UNANIMITY),
+    # The three across-seed keys are REQUIRED, not merely compared-if-present.
+    # A soft check lets a key be deleted to silently disable its own comparison,
+    # which is precisely the drift this function exists to prevent -- and these
+    # three define a criterion pre-registered before any second seed ran, so
+    # there is no legacy record that could legitimately lack them. The first
+    # three stay soft: records predating the bootstrap genuinely do not carry
+    # them, and hard-requiring those would reject a valid older baseline.
+    for key, coded_value, required in (
+        ("n_bootstrap", N_BOOTSTRAP, False),
+        ("confidence", BOOTSTRAP_CONFIDENCE, False),
+        ("bootstrap_seed", BOOTSTRAP_SEED, False),
+        ("across_seed_bootstrap", ACROSS_SEED_BOOTSTRAP, True),
+        ("across_seed_min_margin_source", ACROSS_SEED_MIN_MARGIN_SOURCE, True),
+        ("across_seed_requires_unanimity", ACROSS_SEED_REQUIRES_UNANIMITY, True),
     ):
-        if key in statistics and statistics[key] != coded_value:
+        if key not in statistics:
+            if required:
+                problems.append(
+                    f"{key} missing from frozen success_criterion_statistics -- the across-seed "
+                    f"criterion is unregistered, and its absence must fail rather than skip"
+                )
+            continue
+        if statistics[key] != coded_value:
             problems.append(f"{key}: code {coded_value!r} != frozen {statistics[key]!r}")
 
     # Review finding 2: presence, not just value-on-match -- a DELETED key
