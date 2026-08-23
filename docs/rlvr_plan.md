@@ -3,31 +3,41 @@
 > **⚠️ PARTLY SUPERSEDED — 2026-08-23.** Two premises in this document did not survive measurement, and
 > the sections resting on them should be read as the original design record, not as current practice.
 >
-> **1. "Verifiable" does not cover the Tg arms.** A generated polymer has no experimental Tg and never
-> will, so a Tg reward is a learned model's opinion about a molecule nobody has synthesised. Only
-> `validity` (RDKit cascade) and `control` (candidate-independent noise) have rewards that can actually
-> be checked. `accuracy`, `composite` and `constraint` are **reinforcement learning against a learned
-> reward** — a legitimate method, and what the paper's own screening does, but it is not RLVR and is no
-> longer labelled as such. See the README's verifiability table.
+> **1. "Verifiable" does not cover the Tg arms — RESOLVED the same day by dropping Tg, not by relabelling
+> it.** A generated polymer has no experimental Tg and never will, so a Tg reward is a learned model's
+> opinion about a molecule nobody has synthesised. This document originally noted that only `validity`
+> and `control` had checkable rewards while `accuracy`/`composite`/`constraint` were "RL against a learned
+> reward, not RLVR" (see the README's verifiability table for that first cut). Later the same day, Tg was
+> removed from every reward still being trained: `accuracy` (C1) **retired** — it had already trained to
+> completion, and its result (diversity collapsed 0.951 → 0.535 while reward-scored error fell) stands as
+> the motivating negative finding for this whole change; `composite` (C3) and `constraint` (C4) **redefined**
+> to fully verifiable, Tg-free rewards (weighted PV/novelty/SA/diversity, and SA-AND-novel respectively);
+> and two new arms, `novelty` and `synthesisability`, added. See
+> [`src/polyt5/rewards/composite.py`](../src/polyt5/rewards/composite.py)'s module docstring and the
+> 2026-08-23 amendment in `artifacts/baseline/frozen_baseline.json` for the full rationale — including why
+> `composite`/`constraint` were redefined rather than deleted (the off-diagonal, whether optimising one
+> verifiable axis damages another, is the actual open question). **Neither `composite` nor `constraint`
+> has been trained under its new definition; no data exists for either.**
 >
 > **2. The reward ensemble and its σ are weaker than assumed.**
 > [`instrument_audit.md`](instrument_audit.md) measured: the 4-model ensemble adds nothing over a single
 > model (28.82 K honest vs 28.67 K), it appears 41% better than it is when scored on data three of four
 > members trained on, and σ explains ~2% of error variance — so §4.2's confidence weight is weakly
-> justified rather than load-bearing. It was left in place because changing a reward mid-round would
-> invalidate the round in flight, not because the audit vindicated it.
+> justified rather than load-bearing. This affected only `accuracy`'s reward, and `accuracy` is now
+> retired (see point 1); the ensemble and σ remain relevant to `compare_arms.py`'s auditor-vs-ensemble
+> scoring of `accuracy`'s completed run, but no longer to any arm's reward.
 >
-> **What replaced them.** A fifth arm, `control`, was added — a uniform random reward independent of the
+> **What replaced them.** A `control` arm was added — a uniform random reward independent of the
 > candidate, without which no other arm's movement is attributable to its own reward design. Success
-> moved to an across-seed criterion requiring unanimity. And Phase 4
-> (`superpowers/specs/2026-08-23-phase4-group-a-design.md`) exists to rebuild the Tg instrument these
-> arms depend on.
+> moved to an across-seed criterion requiring unanimity. Phase 4
+> (`superpowers/specs/2026-08-23-phase4-group-a-design.md`) still exists to rebuild the Tg instrument, for
+> whatever future work chooses to use it again; no current arm depends on it.
 >
-> **⚠️ ROUND 1 PARTIALLY TRAINED. NOT PART OF THE PUBLISHED polyT5 METHOD.** `accuracy` is complete
-> (and collapsed diversity 0.951 → 0.535 while its reward-scored error fell — a verified cost for an
-> unverified gain, reported as a motivating negative result). `validity` is training. `composite`,
-> `constraint` and `control` have not started. No arm has been through `compare_arms.py`, so **no final
-> RLVR result exists.**
+> **⚠️ ROUND 1 PARTIALLY TRAINED. NOT PART OF THE PUBLISHED polyT5 METHOD.** `accuracy` is complete and
+> retired (and collapsed diversity 0.951 → 0.535 while its reward-scored error fell — a verified cost for
+> an unverified gain, reported as a motivating negative result). `validity` is training. `novelty`,
+> `synthesisability`, `composite`, `constraint` and `control` have not started. No arm has been through
+> `compare_arms.py`, so **no final RLVR result exists.**
 >
 > polyT5 (Sahu et al., npj Artificial Intelligence 2026) is **supervised throughout**: span-corruption
 > pretraining, supervised fine-tuning, then sampling and screening. It contains no reinforcement learning

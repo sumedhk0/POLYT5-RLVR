@@ -8,15 +8,24 @@ Everything here is recoverable from disk; nothing depends on a live session.
 
 ## The study
 
-Two rounds, four arms each, run sequentially on one GPU.
+Round 1 started with four arms (`accuracy`, `validity`, `composite`, `constraint`), run
+sequentially on one GPU. **2026-08-23: Tg was dropped from every reward still being
+trained** — see [`rlvr_plan.md`](rlvr_plan.md)'s superseded banner and
+[`src/polyt5/rewards/composite.py`](../src/polyt5/rewards/composite.py)'s module
+docstring. `accuracy` had already completed (below) and is now **retired**, not
+re-run; `composite` and `constraint` were **redefined** to fully verifiable, Tg-free
+rewards; two new arms, `novelty` and `synthesisability`, were added. The Tg-reward-source
+table below describes ONLY `accuracy`'s already-completed run — no arm still to be
+trained reads a Tg prediction at all.
 
 | Round | Tg reward source | Scored by |
 |---|---|---|
-| 1 | the 4-model learned ensemble (splits 0–3) | split-4 auditor, untouched |
-| 2 | the same 4 models **plus** the group-contribution oracle | the same split-4 auditor |
+| 1 (`accuracy` only, complete) | the 4-model learned ensemble (splits 0–3) | split-4 auditor, untouched |
+| 2 (not started; would need a Tg-reading arm to exist again) | the same 4 models **plus** the group-contribution oracle | the same split-4 auditor |
 
-Arms: `accuracy`, `validity`, `composite`, `constraint`. Run directory per arm is
-`results/grpo_<arm>/`.
+Current arms: `validity`, `novelty`, `synthesisability`, `composite`, `constraint`,
+`control` (plus the retired `accuracy`, kept only for reproducibility — see
+`configs/rl/accuracy.yaml`). Run directory per arm is `results/grpo_<arm>/`.
 
 **Measured cost:** ~21–23 s/step, so ~12–13 h per arm at the configured 2000 steps.
 Checkpoints are written every `train.save_every` steps (see the arm's `config.yaml`).
@@ -34,8 +43,8 @@ file is not a failure mode you need to check for.
 ## Checking where a run got to
 
 ```bash
-python -c "import csv;rows=list(csv.DictReader(open('results/grpo_accuracy/metrics.csv')));print(max(int(r['step']) for r in rows))"
-ls results/grpo_accuracy/checkpoints/
+python -c "import csv;rows=list(csv.DictReader(open('results/grpo_validity/metrics.csv')));print(max(int(r['step']) for r in rows))"
+ls results/grpo_validity/checkpoints/
 ```
 
 `metrics.csv` may be ahead of the newest checkpoint — that is normal, and the gap is
@@ -48,10 +57,10 @@ continues rather than restarting:
 
 ```bash
 # resume from the newest checkpoint in the run directory
-python scripts/train_grpo.py --arm accuracy --resume results/grpo_accuracy/checkpoints
+python scripts/train_grpo.py --arm validity --resume results/grpo_validity/checkpoints
 
 # or from one specific checkpoint
-python scripts/train_grpo.py --arm accuracy --resume results/grpo_accuracy/checkpoints/step_001000.pt
+python scripts/train_grpo.py --arm validity --resume results/grpo_validity/checkpoints/step_001000.pt
 ```
 
 Determinism note: a step's RNG is seeded from `(config.seed, step_index)` alone, so a
@@ -66,17 +75,17 @@ advancing for `--stall-minutes` aborts the chain instead of handing a dead GPU j
 the next arm.
 
 ```bash
-# after `accuracy` finishes, run the other three back to back
-python scripts/run_round1.py --wait-for accuracy --then validity composite constraint
+# after `validity` finishes, run the rest of the current arm set back to back
+python scripts/run_round1.py --wait-for validity --then novelty synthesisability composite constraint control
 
 # nothing in flight — just run them in order
-python scripts/run_round1.py --then validity composite constraint
+python scripts/run_round1.py --then novelty synthesisability composite constraint control
 ```
 
 Launch it in the background so it survives the terminal:
 
 ```bash
-python -u scripts/run_round1.py --wait-for accuracy --then validity composite constraint \
+python -u scripts/run_round1.py --wait-for validity --then novelty synthesisability composite constraint control \
     > results/round1_driver.log 2>&1 &
 ```
 
@@ -101,13 +110,17 @@ Stop a run and investigate if any of these appear:
 |---|---|---|
 | `clip_fraction` | ~0.0 early | climbing early — ratio drifting for non-policy reasons |
 | `zero_variance_group_fraction` | ~0.0 | → 1.0: groups all score alike, steps are no-ops |
-| `ensemble_partial_fraction` | low | rising: drifting toward chemistry the ensemble cannot parse |
-| `ensemble_backed_rate` (C4) | stable | → 0: the constraint arm is starving under `min_coverage` |
-| `max_tanimoto_mean` | stable | falling: leaving the predictor's support |
-| `reward_mean` | rising | rising *while* `abs_error_mean` also rises — reward hacking |
+| `ensemble_partial_fraction` | low | rising: drifting toward chemistry the ensemble cannot parse (only meaningful for `accuracy`'s completed run; no current arm reads the ensemble) |
+| `max_tanimoto_mean` | stable | falling: leaving the training distribution's support |
+| `reward_mean` | rising | rising *while* `duplicate_rate`/`unique_fraction` moves the wrong way (e.g. mode collapse, as `accuracy` showed) or `max_tanimoto_mean` rises toward near-copies — reward hacking |
 
-That last row is the one that matters. Reward rising while the thing it proxies gets
-worse is the failure this whole apparatus exists to detect.
+That last row is the one that matters. Reward rising while a diagnostic OUTSIDE the
+reward gets worse is the failure this whole apparatus exists to detect. Every current
+arm's reward is fully verifiable (see `rlvr_plan.md`'s superseded banner), so this is
+no longer specifically about a Tg proxy diverging from the truth — it is the general
+GRPO risk that optimising the reward exactly as specified still damages an axis the
+reward does not measure at all (e.g. `composite`'s diversity term exists precisely to
+watch for the collapse `accuracy` showed on an axis its own reward never priced in).
 
 ## After round 1
 

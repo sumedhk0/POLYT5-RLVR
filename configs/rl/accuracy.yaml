@@ -1,4 +1,13 @@
 # Arm C1 - reward optimizes closeness to the requested Tg.
+#
+# RETIRED 2026-08-23: NOT RLVR. Tg has no ground truth for a generated
+# candidate, so this reward is a learned model's opinion, not a computed
+# fact -- see src/polyt5/rewards/composite.py's module docstring. This arm
+# already trained to completion (round-1, 2000 steps) BEFORE that cut, and
+# its result is kept as the motivating negative finding for dropping Tg
+# everywhere else. Every value below is UNCHANGED from the config that
+# actually produced that run -- only these comments were added -- so the
+# completed run stays reproducible. Do not choose this arm for a new run.
 # Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
 experiment_name: grpo_accuracy
 arm: accuracy

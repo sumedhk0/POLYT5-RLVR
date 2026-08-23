@@ -1,7 +1,15 @@
-"""Arm-comparison matrix: Arm A/B (Phase 1/2, supervised) vs the four Phase-3
-GRPO/RLVR arms (Task 6's ``accuracy``/``validity``/``composite``/``constraint``).
+"""Arm-comparison matrix: Arm A/B (Phase 1/2, supervised) vs the Phase-3
+GRPO/RLVR arms.
 
 Phase 3. NOT part of the published polyT5 method - see ``docs/rlvr_plan.md``.
+
+2026-08-23: Tg was dropped from every RLVR reward -- see
+``polyt5.rewards.composite``'s module docstring. The current arm set is
+``validity``/``novelty``/``synthesisability``/``composite``/``control``, all
+fully verifiable; ``constraint`` is kept as a redefined multi-criterion
+conjunction; ``accuracy`` (Task 6's original C1) is RETIRED but stays
+reportable here because its round-1 run completed before the cut. See
+:data:`RLVR_ARMS`.
 
 For every arm this script SAMPLES FRESH candidates under the fixed evaluation
 protocol recorded in ``artifacts/baseline/frozen_baseline.json``
@@ -13,7 +21,7 @@ the only way the columns are actually comparable:
 * **Arm A / Arm B** -- the frozen ``generation`` checkpoint (SHA-256 verified),
   resampled at the ``arm_a_default_sampling`` / ``arm_b_tuned_sampling``
   temperature and ``top_p`` recorded in the frozen baseline.
-* **The four RLVR arms** -- each arm's own GRPO-trained policy checkpoint
+* **The RLVR arms** -- each arm's own GRPO-trained policy checkpoint
   (latest ``step_*.pt`` under ``results/grpo_<arm>/checkpoints/``, written by
   ``scripts/train_grpo.py``), resampled at the temperature/``top_p`` the RUN
   ITSELF was trained with (read from ``<run_dir>/config.yaml`` -- the fully
@@ -95,33 +103,33 @@ sides ARE the same measurement by construction), which is worse than admitting
 the check does not apply. ``success`` then reduces to ``beats_arm_b`` alone.
 See ``STRUCTURAL_METRICS`` and :func:`apply_success_criterion`.
 
-[DECISION] (Ruling D, constraint arm) ``constraint``'s optimized metric
-(``constraint_satisfaction_rate``) is NOT structural -- it gets both an
-``_auditor`` and an ``_ensemble`` column, unlike ``pv_rate`` above -- but it
-is not a pure closeness score either, and its clause-2 comparison is
-therefore a MIXED measurement, not a clean re-scoring of the same quantity by
-a different predictor. :class:`~polyt5.rewards.composite.ConstraintArm`
-evaluates a three-way conjunction (Tg window AND synthesisable AND novel) per
-candidate: only the Tg clause reads from the injected ``predictions`` triple,
-so ``constraint_satisfaction_rate_auditor`` uses the AUDITOR's mean for that
-clause while its SA and novelty clauses are computed identically to the
-ensemble-scored column -- straight from the candidate's own structure via
-RDKit/the novelty index, not from either predictor. That is intentional: SA
-and novelty have no predictor-side disagreement to audit (they are facts
-about the SAME candidate regardless of which predictor scored the Tg clause),
-so the only part of the conjunction clause 2 can independently confirm is Tg,
-and it does. See :func:`_score_with_arm` and
-:class:`~polyt5.rewards.composite.ConstraintArm`.
+[DECISION] (Ruling D, constraint arm -- SUPERSEDED 2026-08-23) ``constraint``'s
+optimized metric (``constraint_satisfaction_rate``) still gets both an
+``_auditor`` and an ``_ensemble`` column, unlike ``pv_rate`` above, but the
+MIXED-measurement reasoning this decision originally recorded no longer
+applies: :class:`~polyt5.rewards.composite.ConstraintArm` was redefined the
+same date to drop its Tg clause entirely (synthesisable AND novel only), so
+it reads neither of ``predictions``'s Tg-carrying elements at all any more.
+``constraint_satisfaction_rate_auditor`` and ``constraint_satisfaction_rate_
+ensemble`` are therefore expected to be NUMERICALLY IDENTICAL for every row
+-- both columns are kept, rather than collapsed into one structural column
+like ``pv_rate``, purely so every arm's row has the same shape; a divergence
+between them would itself be evidence the arm regained a predictor
+dependency. ``novelty``, ``synthesisability`` and ``composite`` are the same
+situation: none of the three reads a predictor triple either. See
+:data:`SCORED_ARM_NAMES`, :class:`ArmScorers`, and each arm's own docstring
+in :mod:`polyt5.rewards.composite`.
 
-See ``ARM_METRIC`` for which column each arm is judged on and why. ``accuracy``,
-``composite`` and ``constraint`` all need PER-CANDIDATE scoring (not an
-aggregate the paper's sweep machinery already returns), so this script reuses
-the actual ``polyt5.rewards`` arm objects -- ``build_reward_arm("accuracy",
-...)`` / ``("composite", ...)`` / ``("constraint", ...)`` -- built ONCE from the
-CANONICAL ``configs/rl/*.yaml`` and applied identically to every row, never
-from an RLVR arm's own (possibly ``--set``-overridden) training config. That is
-what "computed identically for every row" requires: the formula must be the
-same across rows, independent of how any one arm was actually trained.
+See ``ARM_METRIC`` for which column each arm is judged on and why. Every arm
+in :data:`SCORED_ARM_NAMES` (``accuracy``, ``novelty``, ``synthesisability``,
+``composite``, ``constraint``) needs PER-CANDIDATE scoring (not an aggregate
+the paper's sweep machinery already returns), so this script reuses the
+actual ``polyt5.rewards`` arm objects -- ``build_reward_arm(name, ...)`` for
+each -- built ONCE from the CANONICAL ``configs/rl/*.yaml`` and applied
+identically to every row, never from an RLVR arm's own (possibly
+``--set``-overridden) training config. That is what "computed identically
+for every row" requires: the formula must be the same across rows,
+independent of how any one arm was actually trained.
 
 ``accuracy_score`` was added for exactly the reason Task 8 added
 ``composite_score``: ``ARM_METRIC["accuracy"]`` used to be ``property_mae``,
@@ -138,18 +146,21 @@ it is the paper's headline conditioning metric and arm_b's frozen number is one
 Pre-registration integrity: hashed reward configs, not just a hashed record
 -----------------------------------------------------------------------------
 ``frozen_baseline.json`` pins the metric/direction/min_margin per arm, but the
-metric DEFINITIONS -- ``tolerance``, ``sigma0``, ``sigma_unknown``,
-``min_coverage``, ``sa_max``, ``window_tolerance`` and (composite) ``weights``
--- live in ``configs/rl/accuracy.yaml`` / ``composite.yaml`` /
-``constraint.yaml``, which are git-tracked but otherwise unfrozen. Editing one
+metric DEFINITIONS -- ``sa_max``, ``novelty_index``, (composite) ``weights``,
+plus the now-unused-but-still-present ``tolerance``/``sigma0``/
+``sigma_unknown``/``min_coverage``/``window_tolerance`` -- live in
+``configs/rl/<arm>.yaml`` for every arm in :data:`SCORED_ARM_NAMES`
+(``accuracy``, ``novelty``, ``synthesisability``, ``composite``,
+``constraint``), which are git-tracked but otherwise unfrozen. Editing one
 silently changes what the pre-registered criterion MEANS, with no trace. This
-script hashes exactly those three files (:func:`reward_config_paths`,
+script hashes exactly those five files (:func:`reward_config_paths`,
 :func:`hash_reward_configs`) once, when it builds :class:`ArmScorers` from
 them, and records the hash on every row (``*_reward_config_sha256``) and in
 ``summary.json`` (``reward_config_sha256``) -- so a run is auditable after the
-fact for which reward definitions actually produced it. ``validity`` is not
-included: its optimized metric (``pv_rate``) is structural RDKit chemistry
-with no ``reward:`` block in the loop at all.
+fact for which reward definitions actually produced it. ``validity`` and
+``control`` are not included: ``validity``'s optimized metric (``pv_rate``)
+is structural RDKit chemistry with no ``reward:`` block in the loop at all,
+and ``control`` optimizes nothing.
 
 Drift columns for every row (adjudication (d))
 -----------------------------------------------
@@ -229,12 +240,19 @@ from train_grpo import (  # noqa: E402
     verify_artifact,
 )
 
-#: The four Phase-3 arms this script can score, in the paper's C1-C4 order,
-#: plus the ``control`` negative control (Addition 1 -- see
-#: ``polyt5.rewards.composite.ControlArm``). ``control`` has no entry in
-#: :data:`ARM_METRIC`: it optimizes nothing, so its matrix row's ``success``
-#: is always ``None``/N-A, exactly like arm_a/arm_b's.
-RLVR_ARMS: tuple[str, ...] = ("accuracy", "validity", "composite", "constraint", "control")
+#: Every Phase-3 arm this script can score. 2026-08-23: Tg was dropped from
+#: every RLVR reward (see ``polyt5.rewards.composite``'s module docstring).
+#: ``accuracy`` is RETIRED -- its round-1 run completed BEFORE that cut and
+#: is kept reportable for reproducibility, but is not part of the arm set a
+#: new run should choose from. ``novelty`` and ``synthesisability`` are new;
+#: ``composite`` and ``constraint`` keep their names but score REDEFINED,
+#: Tg-free rewards -- neither has been trained under its new definition.
+#: ``control`` (Addition 1 -- see ``polyt5.rewards.composite.ControlArm``)
+#: has no entry in :data:`ARM_METRIC`: it optimizes nothing, so its matrix
+#: row's ``success`` is always ``None``/N-A, exactly like arm_a/arm_b's.
+RLVR_ARMS: tuple[str, ...] = (
+    "accuracy", "validity", "novelty", "synthesisability", "composite", "constraint", "control",
+)
 
 #: Default novelty index (see ``scripts/train_grpo.py``'s copy of this constant
 #: -- deliberately not imported from there, so a change to what an ARM trains
@@ -252,21 +270,35 @@ STRUCTURAL_METRICS: frozenset[str] = frozenset({"pv_rate"})
 
 #: The metric each RLVR arm is compared against arm_b on, and which direction
 #: is "better", matched against each arm's actual reward definition in
-#: ``polyt5.rewards.composite``:
-#:   accuracy   - AccuracyArm's reward IS mean(closeness x confidence) over the
-#:                FULL batch, so it is scored directly with the arm object ->
-#:                accuracy_score (higher). NOT property_mae; see the module
-#:                docstring.
-#:   validity   - ValidityArm's reward IS "cleared the full SV->TSD->DD->PV
-#:                cascade" -> pv_rate (higher); STRUCTURAL (see above).
-#:   composite  - CompositeArm's reward is w_tg*r_tg + w_pv*pv_pass +
-#:                w_novelty*novel -- a three-term objective with no existing
-#:                aggregate column, so it is scored directly with the arm
-#:                object itself -> composite_score (higher).
-#:   constraint - ConstraintArm's reward is a conjunction over (|Tg-target| <=
-#:                tolerance) AND (SA <= sa_max) AND novel AND ensemble-backed --
-#:                again no existing aggregate captures the joint, so it is
-#:                scored directly -> constraint_satisfaction_rate (higher).
+#: ``polyt5.rewards.composite``. 2026-08-23: Tg dropped from every reward
+#: below except the retired ``accuracy``; see that module's docstring.
+#:   accuracy         - RETIRED. AccuracyArm's reward IS mean(closeness x
+#:                      confidence) over the FULL batch, so it is scored
+#:                      directly with the arm object -> accuracy_score
+#:                      (higher). NOT property_mae; see the module docstring.
+#:                      Kept only so the completed round-1 run stays
+#:                      reportable.
+#:   validity         - ValidityArm's reward IS "cleared the full
+#:                      SV->TSD->DD->PV cascade" -> pv_rate (higher);
+#:                      STRUCTURAL (see above).
+#:   novelty          - NEW. NoveltyArm's reward is "cleared the gate AND
+#:                      novel" -> novelty_rate (higher). No predictor
+#:                      involved.
+#:   synthesisability - NEW. SynthesisabilityArm's reward is "cleared the
+#:                      gate AND SA <= sa_max" -> sa_pass_rate (higher). No
+#:                      predictor involved.
+#:   composite        - REDEFINED. CompositeArm's reward is now
+#:                      w_pv*pv_pass + w_novelty*novel + w_sa*sa_pass +
+#:                      w_diversity*first_occurrence -- no Tg term, no
+#:                      predictor involved -- scored directly with the arm
+#:                      object -> composite_score (higher). Never trained
+#:                      under this definition.
+#:   constraint       - REDEFINED. ConstraintArm's reward is now a
+#:                      conjunction over (SA <= sa_max) AND novel -- the Tg
+#:                      window and ensemble-backed clauses are gone, no
+#:                      predictor involved -- scored directly ->
+#:                      constraint_satisfaction_rate (higher). Never trained
+#:                      under this definition.
 #:
 #: This mapping is ordinary mutable Python and therefore is NOT the
 #: pre-registration. ``frozen_baseline.json``'s ``pre_registered_metrics`` is;
@@ -274,6 +306,8 @@ STRUCTURAL_METRICS: frozenset[str] = frozenset({"pv_rate"})
 ARM_METRIC: dict[str, tuple[str, str]] = {
     "accuracy": ("accuracy_score", "higher"),
     "validity": ("pv_rate", "higher"),
+    "novelty": ("novelty_rate", "higher"),
+    "synthesisability": ("sa_pass_rate", "higher"),
     "composite": ("composite_score", "higher"),
     "constraint": ("constraint_satisfaction_rate", "higher"),
 }
@@ -284,6 +318,8 @@ ARM_METRIC: dict[str, tuple[str, str]] = {
 ARM_MIN_MARGIN: dict[str, float] = {
     "accuracy": 0.01,
     "validity": 0.02,
+    "novelty": 0.02,
+    "synthesisability": 0.02,
     "composite": 0.02,
     "constraint": 0.02,
 }
@@ -328,10 +364,13 @@ MATRIX_COLUMNS: tuple[str, ...] = (
     "property_mean_auditor", "property_mae_auditor", "tp_rate_auditor",
     "property_mean_ensemble", "property_mae_ensemble", "tp_rate_ensemble",
     "accuracy_score_auditor", "accuracy_score_ensemble",
+    "novelty_rate_auditor", "novelty_rate_ensemble",
+    "sa_pass_rate_auditor", "sa_pass_rate_ensemble",
     "composite_score_auditor", "composite_score_ensemble",
     "constraint_satisfaction_rate_auditor", "constraint_satisfaction_rate_ensemble",
     "novelty_index_sha256",
-    "accuracy_reward_config_sha256", "composite_reward_config_sha256",
+    "accuracy_reward_config_sha256", "novelty_reward_config_sha256",
+    "synthesisability_reward_config_sha256", "composite_reward_config_sha256",
     "constraint_reward_config_sha256",
     "optimized_metric", "optimized_min_margin",
     "optimized_value_auditor", "optimized_value_ensemble",
@@ -369,7 +408,8 @@ SAMPLES_KEY = "_metric_samples"
 _SEED_AGGREGATE_EXCLUDE: frozenset[str] = frozenset({
     "arm", "kind", "checkpoint", "checkpoint_sha256", "seed", "temperature", "top_p",
     "sampling_matches_arm_b", "n_requested", "novelty_index_sha256",
-    "accuracy_reward_config_sha256", "composite_reward_config_sha256",
+    "accuracy_reward_config_sha256", "novelty_reward_config_sha256",
+    "synthesisability_reward_config_sha256", "composite_reward_config_sha256",
     "constraint_reward_config_sha256", "optimized_metric", "optimized_min_margin",
     "optimized_value_auditor", "optimized_value_ensemble",
     "delta_ensemble", "delta_ensemble_ci_low", "delta_ensemble_ci_high",
@@ -418,11 +458,29 @@ class ArmScorers:
     a four-member ensemble's triples to an arm declaring ``ensemble_size=1``
     raises in :func:`~polyt5.rewards.tg.tg_reward` rather than silently
     treating a one-member answer as full coverage.
+
+    2026-08-23: ``novelty`` and ``synthesisability`` joined ``accuracy``,
+    ``composite`` and ``constraint`` here. Only ``accuracy``'s reward still
+    reads a predictor triple at all -- the other four ignore ``predictions``
+    entirely (see ``polyt5.rewards.composite``'s module docstring) -- so their
+    auditor-scored and ensemble-scored columns are computed via two SEPARATE
+    arm objects purely for uniformity with ``accuracy``'s row shape, and are
+    expected to come out numerically IDENTICAL; a divergence between them
+    would itself be evidence one of the four regained a predictor dependency.
     """
 
     accuracy: Any
+    novelty: Any
+    synthesisability: Any
     composite: Any
     constraint: Any
+
+
+#: Every field name on :class:`ArmScorers`, in the order :func:`evaluate_arm`
+#: scores them. A single source of truth for that iteration order, so the
+#: dataclass and the loop over it cannot silently drift apart.
+SCORED_ARM_NAMES: tuple[str, ...] = ("accuracy", "novelty", "synthesisability", "composite",
+                                    "constraint")
 
 
 def _resolve(path: str | Path) -> Path:
@@ -431,23 +489,30 @@ def _resolve(path: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-#: The three arms whose reward IS scored by an :class:`ArmScorers` object here.
-#: ``validity`` is deliberately excluded: its optimized metric (``pv_rate``) is
-#: structural RDKit chemistry with no ``reward:`` block involved at all -- see
-#: :data:`STRUCTURAL_METRICS`.
-REWARD_CONFIG_ARMS: tuple[str, ...] = ("accuracy", "composite", "constraint")
+#: The arms whose reward IS scored by an :class:`ArmScorers` object here --
+#: exactly :data:`SCORED_ARM_NAMES`, and therefore also the arms whose
+#: ``configs/rl/<arm>.yaml`` defines what its metric MEANS (``tolerance``,
+#: ``sa_max``, ``novelty_index``, ``weights``, ...), hashed for provenance --
+#: see :func:`reward_config_paths`. ``validity`` and ``control`` are
+#: deliberately excluded: ``validity``'s optimized metric (``pv_rate``) is
+#: structural RDKit chemistry computed directly from the screened batch, with
+#: no ``reward:`` block or arm object involved at all -- see
+#: :data:`STRUCTURAL_METRICS`; ``control`` optimizes nothing and has no entry
+#: in :data:`ARM_METRIC`.
+REWARD_CONFIG_ARMS: tuple[str, ...] = SCORED_ARM_NAMES
 
 
 def reward_config_paths(repo_root: Path = REPO_ROOT) -> dict[str, Path]:
     """Canonical reward-definition YAMLs :func:`evaluate_arm`'s scorers are built from.
 
-    [DECISION] These three files' ``tolerance``, ``sigma0``, ``sigma_unknown``,
-    ``min_coverage``, ``sa_max``, ``window_tolerance`` and (composite only)
-    ``weights`` are exactly what ``accuracy_score`` / ``composite_score`` /
-    ``constraint_satisfaction_rate`` MEAN -- the pre-registered success metric
-    for three of the four RLVR arms. Unlike ``frozen_baseline.json``, they are
-    unhashed, unfrozen, git-tracked YAML: editing one silently changes what
-    the pre-registered criterion measures, with no trace. Hashing them
+    [DECISION] These five files' ``sa_max``, ``novelty_index`` and (composite
+    only) ``weights`` are exactly what ``accuracy_score`` / ``novelty_rate`` /
+    ``sa_pass_rate`` / ``composite_score`` / ``constraint_satisfaction_rate``
+    MEAN -- the pre-registered success metric for five of the six RLVR arms
+    (``validity``'s ``pv_rate`` is structural; ``control`` optimizes nothing).
+    Unlike ``frozen_baseline.json``, they are unhashed, unfrozen, git-tracked
+    YAML: editing one silently changes what the pre-registered criterion
+    measures, with no trace. Hashing them
     (:func:`hash_reward_configs`) and recording the hash in ``summary.json``
     and the matrix makes a run auditable after the fact for which reward
     definitions actually produced it.
@@ -932,8 +997,8 @@ def evaluate_arm(
         checkpoint_label: Checkpoint path recorded in the row, for provenance.
         checkpoint_sha256: Checkpoint content hash recorded in the row.
         novelty_index_sha256: Novelty index content hash recorded in the row.
-        reward_config_sha256: ``{"accuracy": ..., "composite": ...,
-            "constraint": ...}`` SHA-256 of the canonical
+        reward_config_sha256: ``{name: sha256, ...}`` for every arm in
+            :data:`SCORED_ARM_NAMES` -- SHA-256 of the canonical
             ``configs/rl/*.yaml`` files ``auditor_scorers`` /
             ``ensemble_scorers`` were built from (:func:`hash_reward_configs`),
             recorded verbatim on every row for pre-registration provenance.
@@ -987,20 +1052,24 @@ def evaluate_arm(
 
     # Per-candidate values, kept rather than pre-averaged: every matrix cell
     # below is their mean, and the success criterion's bootstrap resamples
-    # exactly these. The auditor's are computed before the ensemble's for both
-    # arms (see test_evaluate_arm_auditor_predictions_are_wired_through_the_helper).
-    accuracy_values_auditor = _arm_values(
-        auditor_scorers.accuracy, candidates, sample_targets, auditor_predictions)
-    accuracy_values_ensemble = _arm_values(
-        ensemble_scorers.accuracy, candidates, sample_targets, ensemble_predictions)
-    composite_values_auditor = _arm_values(
-        auditor_scorers.composite, candidates, sample_targets, auditor_predictions)
-    composite_values_ensemble = _arm_values(
-        ensemble_scorers.composite, candidates, sample_targets, ensemble_predictions)
-    constraint_values_auditor = _arm_values(
-        auditor_scorers.constraint, candidates, sample_targets, auditor_predictions)
-    constraint_values_ensemble = _arm_values(
-        ensemble_scorers.constraint, candidates, sample_targets, ensemble_predictions)
+    # exactly these. The auditor's are computed before the ensemble's for
+    # every arm (see
+    # test_evaluate_arm_auditor_predictions_are_wired_through_the_helper).
+    #
+    # 2026-08-23: only ``accuracy`` still reads a predictor triple at all --
+    # ``novelty``/``synthesisability``/``composite``/``constraint`` ignore
+    # ``predictions`` entirely (see ``polyt5.rewards.composite``'s module
+    # docstring). They are still scored via BOTH scorer sets, for uniformity
+    # with ``accuracy``'s row shape: the two columns are expected to come out
+    # numerically identical, and a divergence would itself be evidence one of
+    # the four regained a predictor dependency.
+    values_auditor: dict[str, list[float]] = {}
+    values_ensemble: dict[str, list[float]] = {}
+    for name in SCORED_ARM_NAMES:
+        values_auditor[name] = _arm_values(
+            getattr(auditor_scorers, name), candidates, sample_targets, auditor_predictions)
+        values_ensemble[name] = _arm_values(
+            getattr(ensemble_scorers, name), candidates, sample_targets, ensemble_predictions)
 
     # pv_rate is structural: one 0/1 indicator per generated candidate, over
     # the full batch, whose mean IS batch.counts' pv_rate. Both predictor
@@ -1011,11 +1080,6 @@ def evaluate_arm(
     # not any arm's success metric: its denominator moves with validity.
     mae_values_auditor = _abs_errors(auditor_screened, screened_targets)
     mae_values_ensemble = _abs_errors(ensemble_screened, screened_targets)
-
-    composite_score_auditor = _mean(composite_values_auditor)
-    composite_score_ensemble = _mean(composite_values_ensemble)
-    constraint_satisfaction_rate_auditor = _mean(constraint_values_auditor)
-    constraint_satisfaction_rate_ensemble = _mean(constraint_values_ensemble)
 
     # Adjudication (d): diagnostic only, computed identically for every row
     # (arm_a's and arm_b's included -- neither ran under a drift monitor
@@ -1047,23 +1111,33 @@ def evaluate_arm(
         "property_mean_ensemble": property_mean_ensemble,
         "property_mae_ensemble": property_mae_ensemble,
         "tp_rate_ensemble": tp_rate_ensemble,
-        "accuracy_score_auditor": _mean(accuracy_values_auditor),
-        "accuracy_score_ensemble": _mean(accuracy_values_ensemble),
-        "composite_score_auditor": composite_score_auditor,
-        "composite_score_ensemble": composite_score_ensemble,
-        "constraint_satisfaction_rate_auditor": constraint_satisfaction_rate_auditor,
-        "constraint_satisfaction_rate_ensemble": constraint_satisfaction_rate_ensemble,
+        "accuracy_score_auditor": _mean(values_auditor["accuracy"]),
+        "accuracy_score_ensemble": _mean(values_ensemble["accuracy"]),
+        "novelty_rate_auditor": _mean(values_auditor["novelty"]),
+        "novelty_rate_ensemble": _mean(values_ensemble["novelty"]),
+        "sa_pass_rate_auditor": _mean(values_auditor["synthesisability"]),
+        "sa_pass_rate_ensemble": _mean(values_ensemble["synthesisability"]),
+        "composite_score_auditor": _mean(values_auditor["composite"]),
+        "composite_score_ensemble": _mean(values_ensemble["composite"]),
+        "constraint_satisfaction_rate_auditor": _mean(values_auditor["constraint"]),
+        "constraint_satisfaction_rate_ensemble": _mean(values_ensemble["constraint"]),
         "novelty_index_sha256": novelty_index_sha256,
         "accuracy_reward_config_sha256": reward_config_sha256.get("accuracy"),
+        "novelty_reward_config_sha256": reward_config_sha256.get("novelty"),
+        "synthesisability_reward_config_sha256": reward_config_sha256.get("synthesisability"),
         "composite_reward_config_sha256": reward_config_sha256.get("composite"),
         "constraint_reward_config_sha256": reward_config_sha256.get("constraint"),
         SAMPLES_KEY: {
-            "accuracy_score": {"auditor": accuracy_values_auditor,
-                               "ensemble": accuracy_values_ensemble},
-            "composite_score": {"auditor": composite_values_auditor,
-                                "ensemble": composite_values_ensemble},
-            "constraint_satisfaction_rate": {"auditor": constraint_values_auditor,
-                                             "ensemble": constraint_values_ensemble},
+            "accuracy_score": {"auditor": values_auditor["accuracy"],
+                               "ensemble": values_ensemble["accuracy"]},
+            "novelty_rate": {"auditor": values_auditor["novelty"],
+                             "ensemble": values_ensemble["novelty"]},
+            "sa_pass_rate": {"auditor": values_auditor["synthesisability"],
+                             "ensemble": values_ensemble["synthesisability"]},
+            "composite_score": {"auditor": values_auditor["composite"],
+                                "ensemble": values_ensemble["composite"]},
+            "constraint_satisfaction_rate": {"auditor": values_auditor["constraint"],
+                                             "ensemble": values_ensemble["constraint"]},
             "pv_rate": {"auditor": pv_indicators, "ensemble": pv_indicators},
             "property_mae": {"auditor": mae_values_auditor,
                              "ensemble": mae_values_ensemble},
@@ -1781,21 +1855,24 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("auditor=%s (held out of every reward path) ensemble=%s", auditor_key,
                frozen["reward_ensemble"])
 
-    # accuracy_score / composite_score / constraint_satisfaction_rate must be
-    # computed IDENTICALLY for every row -- see the module docstring -- so the
-    # arm objects are built ONCE here, from the canonical repo configs, and
-    # reused for every row including arm_a and arm_b. Two sets, differing only
-    # in the ensemble_size that describes the predictor whose triples they will
-    # score: the auditor is one model (n=1 of 1 is full coverage), the reward
-    # ensemble is four (n=1 of 4 means three members could not read the
-    # candidate, which is the opposite situation -- see polyt5.rewards.tg).
+    # accuracy_score / novelty_rate / sa_pass_rate / composite_score /
+    # constraint_satisfaction_rate must be computed IDENTICALLY for every row
+    # -- see the module docstring -- so the arm objects are built ONCE here,
+    # from the canonical repo configs, and reused for every row including
+    # arm_a and arm_b. Two sets, differing only in the ensemble_size that
+    # describes the predictor whose triples they will score: the auditor is
+    # one model (n=1 of 1 is full coverage), the reward ensemble is four
+    # (n=1 of 4 means three members could not read the candidate, which is
+    # the opposite situation -- see polyt5.rewards.tg). Only ``accuracy``'s
+    # reward actually reads a triple; the other four ignore it entirely (see
+    # SCORED_ARM_NAMES / ArmScorers above).
     ensemble_size = len(ensemble)
-    # Pre-registration integrity: these three YAMLs are what accuracy_score /
-    # composite_score / constraint_satisfaction_rate MEAN, and they are
-    # unhashed, unfrozen, git-tracked files -- see reward_config_paths's
-    # docstring. Hashed here, ONCE, alongside loading them, so the hash on
-    # every row is provably the hash of the file the scorers below were
-    # actually built from.
+    # Pre-registration integrity: these five YAMLs are what accuracy_score /
+    # novelty_rate / sa_pass_rate / composite_score /
+    # constraint_satisfaction_rate MEAN, and they are unhashed, unfrozen,
+    # git-tracked files -- see reward_config_paths's docstring. Hashed here,
+    # ONCE, alongside loading them, so the hash on every row is provably the
+    # hash of the file the scorers below were actually built from.
     reward_config_paths_map = reward_config_paths()
     reward_config_sha256 = hash_reward_configs(reward_config_paths_map)
     arm_configs = {
@@ -1807,7 +1884,7 @@ def main(argv: list[str] | None = None) -> int:
         return ArmScorers(**{
             name: build_reward_arm(name, arm_configs[name], novelty_index=training_index,
                                    ensemble_size=size)
-            for name in ("accuracy", "composite", "constraint")
+            for name in SCORED_ARM_NAMES
         })
 
     auditor_scorers = _scorers(1)
@@ -1962,11 +2039,13 @@ def main(argv: list[str] | None = None) -> int:
         "pre_registration_verified_against": str(frozen_path),
         "structural_metrics": sorted(STRUCTURAL_METRICS),
         # Pre-registration integrity (see reward_config_paths's docstring):
-        # accuracy_score / composite_score / constraint_satisfaction_rate's
-        # DEFINITIONS -- tolerance, sigma0, sigma_unknown, min_coverage,
-        # sa_max, window_tolerance, weights -- live in these three unfrozen
-        # YAMLs. This hash makes a run auditable after the fact for exactly
-        # which reward definitions produced it; editing a config changes it.
+        # accuracy_score / novelty_rate / sa_pass_rate / composite_score /
+        # constraint_satisfaction_rate's DEFINITIONS -- sa_max,
+        # novelty_index, weights, plus the now-unused tolerance/sigma0/
+        # sigma_unknown/min_coverage/window_tolerance -- live in these five
+        # unfrozen YAMLs. This hash makes a run auditable after the fact for
+        # exactly which reward definitions produced it; editing a config
+        # changes it.
         "reward_config_sha256": {
             name: {"path": str(path), "sha256": reward_config_sha256[name]}
             for name, path in reward_config_paths_map.items()

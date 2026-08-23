@@ -244,13 +244,14 @@ def test_check_pre_registration_passes_against_the_real_frozen_record_with_acros
 # -------------------------------------------------- reward config provenance (item 1)
 
 
-def test_reward_config_paths_covers_exactly_the_three_scorer_arms():
-    """``validity`` is deliberately excluded -- its optimized metric
-    (``pv_rate``) is structural RDKit chemistry with no ``reward:`` block in
-    the loop at all; see :data:`STRUCTURAL_METRICS`.
+def test_reward_config_paths_covers_exactly_the_five_scorer_arms():
+    """``validity`` and ``control`` are deliberately excluded -- ``validity``'s
+    optimized metric (``pv_rate``) is structural RDKit chemistry with no
+    ``reward:`` block in the loop at all, and ``control`` optimizes nothing;
+    see :data:`STRUCTURAL_METRICS` / :data:`compare_arms.SCORED_ARM_NAMES`.
     """
     paths = reward_config_paths()
-    assert set(paths) == {"accuracy", "composite", "constraint"}
+    assert set(paths) == {"accuracy", "novelty", "synthesisability", "composite", "constraint"}
     for name, path in paths.items():
         assert path.is_file(), (name, path)
         assert path == REPO_ROOT / "configs" / "rl" / f"{name}.yaml"
@@ -279,7 +280,7 @@ def test_hash_reward_configs_changes_when_a_config_is_edited(tmp_path):
 
 
 def test_reward_config_sha256_columns_exist_for_every_scorer_arm():
-    for name in ("accuracy", "composite", "constraint"):
+    for name in ("accuracy", "novelty", "synthesisability", "composite", "constraint"):
         assert f"{name}_reward_config_sha256" in MATRIX_COLUMNS
 
 
@@ -637,7 +638,8 @@ def _minimal_evaluate_arm_fixture(monkeypatch):
             return [_FakeResult(1.0) for _ in candidates]
 
     scorers = ArmScorers(
-        accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
+        accuracy=_RecordingArm(), novelty=_RecordingArm(), synthesisability=_RecordingArm(),
+        composite=_RecordingArm(), constraint=_RecordingArm())
 
     class _NullSimilarityMonitor:
         def observe(self, candidates, ensemble_predictions):
@@ -654,7 +656,8 @@ def _minimal_evaluate_arm_fixture(monkeypatch):
         "similarity_monitor": _NullSimilarityMonitor(), "device": "cpu",
         "batch_size": 1, "max_length": 200, "seed": 0, "tolerance": 50.0,
         "checkpoint_label": None, "checkpoint_sha256": None, "novelty_index_sha256": None,
-        "reward_config_sha256": {"accuracy": "a" * 64, "composite": "b" * 64,
+        "reward_config_sha256": {"accuracy": "a" * 64, "novelty": "d" * 64,
+                                 "synthesisability": "e" * 64, "composite": "b" * 64,
                                  "constraint": "c" * 64},
     }
 
@@ -1217,9 +1220,11 @@ def test_evaluate_arm_auditor_predictions_are_wired_through_the_helper(monkeypat
             return [_FakeResult(1.0) for _ in candidates]
 
     auditor_scorers = ArmScorers(
-        accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
+        accuracy=_RecordingArm(), novelty=_RecordingArm(), synthesisability=_RecordingArm(),
+        composite=_RecordingArm(), constraint=_RecordingArm())
     ensemble_scorers = ArmScorers(
-        accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
+        accuracy=_RecordingArm(), novelty=_RecordingArm(), synthesisability=_RecordingArm(),
+        composite=_RecordingArm(), constraint=_RecordingArm())
 
     class _NullSimilarityMonitor:
         def observe(self, candidates, ensemble_predictions):
@@ -1236,22 +1241,30 @@ def test_evaluate_arm_auditor_predictions_are_wired_through_the_helper(monkeypat
         similarity_monitor=_NullSimilarityMonitor(), device="cpu",
         batch_size=2, max_length=200, seed=0, tolerance=50.0,
         checkpoint_label=None, checkpoint_sha256=None, novelty_index_sha256=None,
-        reward_config_sha256={"accuracy": "a" * 64, "composite": "b" * 64,
+        reward_config_sha256={"accuracy": "a" * 64, "novelty": "d" * 64,
+                              "synthesisability": "e" * 64, "composite": "b" * 64,
                               "constraint": "c" * 64},
     )
 
     # The auditor-side scorers receive the (mean, 0.0, 1) triples and the
     # ensemble-side scorers the real ones -- the two sets are kept separate
-    # precisely so their `ensemble_size` can differ (1 vs len(ensemble)).
-    for scorer in (auditor_scorers.accuracy, auditor_scorers.composite,
+    # precisely so their `ensemble_size` can differ (1 vs len(ensemble)). Every
+    # arm in SCORED_ARM_NAMES is scored this way now, not just three of them.
+    for scorer in (auditor_scorers.accuracy, auditor_scorers.novelty,
+                   auditor_scorers.synthesisability, auditor_scorers.composite,
                    auditor_scorers.constraint):
         assert scorer.calls[0] == [(111.0, 0.0, 1), (222.0, 0.0, 1)]
-    for scorer in (ensemble_scorers.accuracy, ensemble_scorers.composite,
+    for scorer in (ensemble_scorers.accuracy, ensemble_scorers.novelty,
+                   ensemble_scorers.synthesisability, ensemble_scorers.composite,
                    ensemble_scorers.constraint):
         assert scorer.calls[0] == [(111.0, 9.0, 4), (222.0, 8.0, 4)]
     assert row["composite_score_auditor"] == pytest.approx(1.0)
     assert row["accuracy_score_ensemble"] == pytest.approx(1.0)
+    assert row["novelty_rate_auditor"] == pytest.approx(1.0)
+    assert row["sa_pass_rate_ensemble"] == pytest.approx(1.0)
     assert row["accuracy_reward_config_sha256"] == "a" * 64
+    assert row["novelty_reward_config_sha256"] == "d" * 64
+    assert row["synthesisability_reward_config_sha256"] == "e" * 64
     assert row["composite_reward_config_sha256"] == "b" * 64
     assert row["constraint_reward_config_sha256"] == "c" * 64
     assert row["max_tanimoto_mean"] is None
@@ -1311,9 +1324,11 @@ def test_evaluate_arm_computes_drift_columns_for_baseline_and_rlvr_rows(monkeypa
                     "auditor_gap_mean": None, "auditor_gap_signed_mean": None,
                     "auditor_gap_n": None}
 
-    scorers = ArmScorers(accuracy=_NullArm(), composite=_NullArm(), constraint=_NullArm())
+    scorers = ArmScorers(accuracy=_NullArm(), novelty=_NullArm(), synthesisability=_NullArm(),
+                         composite=_NullArm(), constraint=_NullArm())
     monitor = _RecordingSimilarityMonitor()
-    reward_hashes = {"accuracy": "a" * 64, "composite": "b" * 64, "constraint": "c" * 64}
+    reward_hashes = {"accuracy": "a" * 64, "novelty": "d" * 64, "synthesisability": "e" * 64,
+                     "composite": "b" * 64, "constraint": "c" * 64}
 
     rows = {}
     for kind, arm_key in (("baseline", "arm_a"), ("rlvr", "accuracy")):

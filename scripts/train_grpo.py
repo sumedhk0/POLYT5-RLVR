@@ -1,4 +1,11 @@
-"""GRPO/RLVR training CLI for the four polyT5 arms.
+"""GRPO/RLVR training CLI for the polyT5 reward arms.
+
+2026-08-23: Tg was dropped from every RLVR reward -- see
+``polyt5.rewards.composite``'s module docstring for the full rationale and
+the current, fully verifiable arm set (``validity``, ``novelty``,
+``synthesisability``, ``composite``, ``control``; ``constraint`` kept as a
+redefined multi-criterion conjunction; ``accuracy`` retired, kept only for
+the already-completed round-1 run's reproducibility).
 
 Phase 3. NOT part of the published polyT5 method - see ``docs/rlvr_plan.md``.
 
@@ -103,15 +110,28 @@ from polyt5.utils import (  # noqa: E402
 #: the paper's C1-C4 numbering, with ``control`` last since it is not a
 #: paper arm at all -- it optimizes nothing and has no entry in
 #: ``scripts/compare_arms.py``'s ``ARM_METRIC``.
-ARMS: tuple[str, ...] = ("accuracy", "validity", "composite", "constraint", "control")
+#:
+#: 2026-08-23: Tg was dropped from every RLVR reward (see
+#: ``polyt5.rewards.composite``'s module docstring). ``accuracy`` is RETIRED
+#: -- kept only so its already-completed round-1 run stays reproducible and
+#: reportable, not part of the arm set a new run should choose from.
+#: ``novelty`` and ``synthesisability`` are new; ``composite`` and
+#: ``constraint`` keep their names but score REDEFINED, Tg-free rewards.
+ARMS: tuple[str, ...] = (
+    "accuracy", "validity", "novelty", "synthesisability", "composite", "constraint", "control",
+)
 
 #: Arms whose reward needs a TSD / novelty reference set (see
 #: ``polyt5.rewards.composite`` -- ``ValidityArm`` requires one by default,
-#: ``CompositeArm`` and ``ConstraintArm`` score a ``novelty`` term with one).
-#: ``control`` is deliberately absent: its reward never reads the candidate
-#: at all (see ``ControlArm``'s docstring), so it must not open, or accept an
-#: override for, a novelty index either.
-ARMS_NEEDING_NOVELTY_INDEX: frozenset[str] = frozenset({"validity", "composite", "constraint"})
+#: ``NoveltyArm``, ``CompositeArm`` and ``ConstraintArm`` score a ``novelty``
+#: term with one). ``synthesisability`` is deliberately absent: its reward
+#: (SA <= threshold AND valid) has no novelty clause at all. ``accuracy`` and
+#: ``control`` are deliberately absent too: ``accuracy``'s reward never read
+#: novelty, and ``control``'s reward never reads the candidate at all (see
+#: ``ControlArm``'s docstring), so neither must open, or accept an override
+#: for, a novelty index.
+ARMS_NEEDING_NOVELTY_INDEX: frozenset[str] = frozenset({"validity", "novelty", "composite",
+                                                        "constraint"})
 
 #: Checkpoint used to initialise BOTH the policy and the reference: the
 #: paper's fine-tuned Tg-conditioned generation model. GRPO refines it further;
@@ -481,12 +501,15 @@ def build_reward_arm(
         SEPARATE keys, not one key doing double duty: ``tolerance`` feeds
         :class:`~polyt5.rewards.TgRewardConfig` (the Kelvin at which the tg
         term's continuous closeness reaches zero, spec Sec 4.2, default
-        100.0), while ``window_tolerance`` feeds ``_BaseArm.tolerance`` --
-        concretely, only :class:`~polyt5.rewards.composite.ConstraintArm`
-        reads it, as C4's in-window half-width (spec Sec 4.3, default 50.0).
-        The two were previously the same key with two different defaults,
-        which could not be set independently and read as a mistake even
-        though no arm actually consumed both meanings at once.
+        100.0), while ``window_tolerance`` feeds ``_BaseArm.tolerance``, which
+        every arm's constructor accepts but which, as of the 2026-08-23 Tg
+        cut, no arm reads any more --
+        :class:`~polyt5.rewards.composite.ConstraintArm` was the last one to
+        (C4's old in-window half-width, spec Sec 4.3), and that clause was
+        removed along with the rest of C4's Tg dependence. Both keys are kept
+        wired through, unused, so a config that still sets them does not
+        raise, and so a reader auditing an old run's config sees exactly
+        which knobs it set even if this arm no longer consults one of them.
     """
     reward_cfg = cfg.get("reward", {})
     tg_config = TgRewardConfig(

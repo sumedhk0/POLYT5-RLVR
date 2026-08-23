@@ -1,4 +1,20 @@
-# Arm C4 - reward is a conjunction: Tg window AND synthesisable AND novel.
+# Arm C4 - REDEFINED 2026-08-23: reward is a conjunction, synthesisable AND
+# novel (the Tg-window clause is REMOVED). Tg was dropped from every RLVR
+# reward on this date -- see src/polyt5/rewards/composite.py's module
+# docstring and this same date's amendment in
+# artifacts/baseline/frozen_baseline.json. This arm has NEVER been trained --
+# no data exists for it under either definition; the redefinition is a
+# pre-registration made before any observation of its results.
+#
+# The name is KEPT, not renamed to `synthesisability` -- this is a different,
+# STRICTER reward than that arm (SA AND novel, vs SA alone): it preserves C4's
+# original character as the multi-criterion conjunction rather than
+# duplicating the single-axis arm. See ConstraintArm's own docstring in
+# src/polyt5/rewards/composite.py.
+#
+# Because the name is unchanged, every key below that fed the now-removed
+# Tg clause is explicitly marked dead so this file cannot be mistaken for
+# still producing the old reward.
 # Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
 experiment_name: grpo_constraint
 arm: constraint
@@ -7,16 +23,13 @@ seed: 0
 baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
 
 reward:
-  tolerance: 100.0        # unused by this arm (ConstraintArm never calls tg_reward); kept so configs stay comparable
-  sigma0: 17.0            # unused by this arm; kept so configs stay comparable
-  sigma_unknown: 45.2     # spread substituted when only ONE ensemble member could score a
-                          # candidate: its true spread is UNDEFINED, not 0.0, so our maximum
-                          # observed disagreement is used (TgRewardConfig.sigma_unknown)
-  min_coverage: 0.5       # ConstraintArm only: minimum n_contributing/n_total for the
-                          # ensemble mean to count as a consensus (TgRewardConfig.min_coverage)
-  sa_max: 6.0             # maximum acceptable SA score (constraint_reward's synthesisable test)
-  window_tolerance: 50.0  # Tg window half-width, Kelvin (constraint_reward's in_window test)
-  novelty_index: artifacts/novelty/tg_generation_train  # required: novel test needs it
+  tolerance: 100.0        # DEAD as of 2026-08-23 (fed the removed Tg clause); unused; kept so configs stay comparable
+  sigma0: 17.0            # DEAD as of 2026-08-23 (fed the removed Tg clause); unused; kept so configs stay comparable
+  sigma_unknown: 45.2     # DEAD as of 2026-08-23 (fed the removed Tg clause); unused; kept so configs stay comparable
+  min_coverage: 0.5       # DEAD as of 2026-08-23 (fed the removed ensemble_backed clause); unused; kept so configs stay comparable
+  sa_max: 6.0             # STILL LIVE: maximum acceptable SA score (constraint_reward's synthesisable test)
+  window_tolerance: 50.0  # DEAD as of 2026-08-23 (fed the removed Tg-window clause); unused; kept so configs stay comparable
+  novelty_index: artifacts/novelty/tg_generation_train  # STILL LIVE: novel test needs it
 
 train:
   group_size: 16          # candidates per prompt; the GRPO baseline

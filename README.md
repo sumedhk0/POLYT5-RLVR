@@ -14,7 +14,7 @@ generative polymer design — plus a **separate, clearly-labelled** research ext
 
 | | Phase 1–2 — **reproduction** | Phase 3 — **extension** |
 |---|---|---|
-| What | Span-corruption pretraining → supervised fine-tuning → sampling and screening | GRPO from the supervised checkpoint. Rewards are verifiable for `validity`/`control`, learned-model-scored for the Tg arms — see [below](#not-all-of-it-is-actually-verifiable--and-the-distinction-is-load-bearing) |
+| What | Span-corruption pretraining → supervised fine-tuning → sampling and screening | GRPO from the supervised checkpoint. Rewards are verifiable for every current arm (`validity`/`novelty`/`synthesisability`/`composite`/`constraint`/`control`); only the retired `accuracy` arm was learned-model-scored — see [below](#not-all-of-it-is-actually-verifiable--and-the-distinction-is-load-bearing) |
 | Source | The published polyT5 method | **Ours. Not in the paper.** |
 | Status | In progress; Arm A/B measured and frozen for RLVR comparison (see [`docs/baseline.md`](docs/baseline.md)) | Round 1 partially trained; **no final result yet** (see [RLVR extension](#phase-3-grporlvr-our-extension) below) |
 
@@ -141,7 +141,8 @@ src/polyt5/
     evaluation/     SV/TSD/DD/PV, SELFIES reproducibility, SA, property metrics
     utils/          seeding, device, config, run directories, metric logging
     rl/             Phase 3 (ours) — group rollout, advantages, clipped GRPO surrogate, trainer
-    rewards/        Phase 3 (ours) — reward components + the five arm definitions
+    rewards/        Phase 3 (ours) — reward components + the arm definitions (validity, novelty,
+                    synthesisability, composite, constraint, control, and the retired accuracy)
 
 configs/            every experimental setting; no settings live in Python
 scripts/            CLI entry points
@@ -181,55 +182,66 @@ category, distinct from *"the paper reports …"* and *"our reproduction obtains
 
 ### Not all of it is actually "verifiable" — and the distinction is load-bearing
 
-RLVR means the reward can be **checked**. Ours only partly can, and the arms differ sharply:
+RLVR means the reward can be **checked**. As of 2026-08-23, every current arm's reward can be —
+Tg was dropped from every arm still being trained:
 
 | arm | reward | checkable without a lab? |
 |---|---|---|
 | `validity` | RDKit parse, terminus valency, deduplication | **yes** — arithmetic with a right answer |
+| `novelty` | novel (absent from the training corpus) AND valid | **yes** — set membership |
+| `synthesisability` | RDKit SA score ≤ threshold AND valid | **yes** — a deterministic heuristic |
+| `composite` | weighted PV + novelty + SA + within-batch diversity | **yes** — no term is model-scored |
+| `constraint` | conjunction: SA ≤ threshold AND novel | **yes** — no term is model-scored |
 | `control` | uniform random, candidate-independent | **yes** — trivially |
-| `accuracy` | Tg closeness, from a learned predictor | **no** |
-| `composite` | weighted mix including Tg | partly |
-| `constraint` | conjunction including a Tg window | partly |
+| `accuracy` *(retired)* | Tg closeness, from a learned predictor | **no** |
 
 For a **generated** polymer there is no experimental Tg and never will be — the molecule has not been
-synthesised. So a Tg-based reward is a model's opinion about a molecule nobody has made. That is a
-legitimate and common way to do generative materials design — the paper screens its own 6.17M candidates
-with polyT5-based predictors the same way — but it is **RL against a learned reward**, not RLVR, and this
-repository labels it as such rather than letting "verifiable" cover the whole study.
+synthesised. So a Tg-based reward is a model's opinion about a molecule nobody has made — legitimate (the
+paper screens its own 6.17M candidates with polyT5-based predictors the same way), but **RL against a
+learned reward, not RLVR**. `accuracy` (the one arm that read Tg) is **retired**, not deleted: it already
+trained to completion before this cut and its result — reward-scored error falling while diversity
+collapsed — is kept as the motivating negative finding below. `composite` and `constraint` keep their
+names but were **redefined** to the fully verifiable rewards in the table above; **neither has been
+trained under its new definition, so neither has a result yet.** See
+[`src/polyt5/rewards/composite.py`](src/polyt5/rewards/composite.py)'s module docstring and the
+2026-08-23 amendment in `artifacts/baseline/frozen_baseline.json` for the full rationale, including why
+`composite`/`constraint` were redefined rather than simply deleted (the off-diagonal — does optimising
+one verifiable axis damage another — is the actual open question, and dropping to `validity` + `control`
+alone would remove it).
 
-The instrument behind those Tg arms is characterised in [`docs/instrument_audit.md`](docs/instrument_audit.md):
-the 4-model ensemble adds nothing over a single model (28.82 K honest vs 28.67 K), it appears 41% better
-than it is when scored on data three of its four members trained on, and σ explains roughly 2% of error
-variance. **Phase 4 (`docs/superpowers/specs/2026-08-23-phase4-group-a-design.md`) exists to improve that
-instrument**; until it lands, Tg-arm results are reported as model-scored secondary observations.
+The instrument behind the old Tg arms is characterised in
+[`docs/instrument_audit.md`](docs/instrument_audit.md): the 4-model ensemble adds nothing over a single
+model (28.82 K honest vs 28.67 K), it appears 41% better than it is when scored on data three of its four
+members trained on, and σ explains roughly 2% of error variance — part of why Tg was dropped rather than
+kept as a term other arms still optimise.
 
 **Status: round 1 partially trained.** The entry gate (`docs/rlvr_plan.md` §8) is satisfied — the
 supervised baseline is frozen (`artifacts/baseline/frozen_baseline.json`, verified SHA-256) and Arm A /
 Arm B are measured against it.
 
-- `accuracy` — **complete** (2000 steps). In-training diagnostics show the reward-ensemble-scored
-  conditioning error falling 52.5 → 31.4 K **while `unique_fraction` fell 0.951 → 0.535**: mode collapse.
-  The cost is verified (deduplication is structural); the benefit is not (the reward ensemble scoring the
-  policy trained to satisfy it). Reported as a motivating negative result, not a success.
+- `accuracy` — **complete** (2000 steps), then **retired**. In-training diagnostics show the
+  reward-ensemble-scored conditioning error falling 52.5 → 31.4 K **while `unique_fraction` fell
+  0.951 → 0.535**: mode collapse. The cost is verified (deduplication is structural); the benefit is not
+  (the reward ensemble scoring the policy trained to satisfy it). Reported as a motivating negative
+  result, not a success, and the reason every other arm's reward is now fully verifiable.
 - `validity` — in training.
-- `composite`, `constraint`, `control` — not started.
+- `novelty`, `synthesisability`, `composite`, `constraint`, `control` — not started.
 
 No arm has been through `compare_arms.py`, so **this repository still reports no final RLVR result.**
 
 What is built on top of the frozen baseline:
 
-- **Reward components** (`src/polyt5/rewards/`) — validity gate, Tg closeness with confidence weighting,
-  novelty, and the five reward arms (`accuracy`, `validity`, `composite`, `constraint`, `control`). Deliberately
-  torch-free, so reward workers run CPU-only. The confidence weight scales by how much of the ensemble
-  could actually score a candidate (`n_contributing / n_total`) and substitutes the maximum observed
-  disagreement, not zero, when only one member of several answered — without that, a candidate three of
-  four reward models cannot parse outscores one all four agree on.
+- **Reward components** (`src/polyt5/rewards/`) — validity gate, novelty, an SA-threshold gate
+  (`src/polyt5/rewards/sa.py`), Tg closeness with confidence weighting (read only by the retired
+  `accuracy` arm), and the reward arms themselves (`accuracy` *(retired)*, `validity`, `novelty`,
+  `synthesisability`, `composite`, `constraint`, `control`). Deliberately torch-free, so reward workers
+  run CPU-only.
 - **RL core** (`src/polyt5/rl/`) — group rollout, group-relative advantages, the clipped GRPO surrogate
   with a k3 KL anchor to a frozen reference policy, and `GRPOTrainer`, the synchronous training loop.
-- **Training CLI** (`scripts/train_grpo.py`) and **five arm configs** (`configs/rl/*.yaml`) — one GRPO run
-  per arm, differing only in reward. `control` earns a uniform random reward independent of the
+- **Training CLI** (`scripts/train_grpo.py`) and **arm configs** (`configs/rl/*.yaml`, one per arm) — one
+  GRPO run per arm, differing only in reward. `control` earns a uniform random reward independent of the
   candidate: if a meaningless reward moves the same metrics, then no other arm's movement is
-  attributable to its reward design. Without it the other four are uninterpretable.
+  attributable to its reward design. Without it the other arms are uninterpretable.
 - **Drift monitoring** (`src/polyt5/rl/drift.py`) — spec §4.4's max-Tanimoto-to-training distribution,
   logged every 50 steps, ON by default. The held-out split-4 auditor gap is OFF by default and opt-in via
   `--drift-auditor`: σ (ensemble disagreement) is itself optimized against — the Tg reward's confidence
@@ -247,8 +259,9 @@ What is built on top of the frozen baseline:
 
 **Pre-registered success criterion** (`frozen_baseline.json`'s `success_criterion` and
 `pre_registered_metrics`): an RLVR arm succeeds only if it beats Arm B on **the metric it actually
-optimized** — `accuracy_score`, `pv_rate`, `composite_score`, `constraint_satisfaction_rate`, each pinned
-in the frozen record with a minimum effect size — under the reward ensemble, *and* that gain survives
+optimized** — `accuracy_score` (retired), `pv_rate`, `novelty_rate`, `sa_pass_rate`, `composite_score`,
+`constraint_satisfaction_rate`, each pinned in the frozen record with a minimum effect size — under the
+reward ensemble, *and* that gain survives
 scoring by the auditor, *and* it was sampled at Arm B's temperature/top-p. "Beats" requires both an
 improvement of at least the pre-registered `min_margin` and a 95% bootstrap CI over candidates that
 excludes zero; a bare inequality on one generation seed cannot separate an 0.1 K win from noise.
@@ -265,14 +278,14 @@ defines no such criterion, ensembles nothing, and never audits with a held-out m
 > there. The auditor is held out of the reward **path**, not statistically independent of the reward
 > models.
 
-> **Known limitation: novelty is exact-canonical-match.** `[OURS]` The novelty term C3 rewards and C4
-> requires is the absence of the candidate's exact canonical PSMILES from the training index. **A
-> one-atom edit of a memorised training polymer therefore scores `novel = 1.0`.** No reward term anywhere
-> can distinguish that from genuinely new chemistry. This is not fixed — changing the reward now would
-> change what the arms optimize — but it is measured: the drift monitor reports max-Tanimoto to the
-> labelled set and the fraction of candidates whose nearest known neighbour is at Tanimoto ≥ 0.9, so a
-> C3/C4 arm rediscovering the training set is visible during the run rather than assumed away. Read the
-> C3 and C4 columns of the matrix with this in mind.
+> **Known limitation: novelty is exact-canonical-match.** `[OURS]` The novelty term `novelty`,
+> `composite` and `constraint` all read is the absence of the candidate's exact canonical PSMILES from the
+> training index. **A one-atom edit of a memorised training polymer therefore scores `novel = 1.0`.** No
+> reward term anywhere can distinguish that from genuinely new chemistry. This is not fixed — changing the
+> reward now would change what the arms optimize — but it is measured: the drift monitor reports
+> max-Tanimoto to the labelled set and the fraction of candidates whose nearest known neighbour is at
+> Tanimoto ≥ 0.9, so an arm rediscovering the training set is visible during the run rather than assumed
+> away. Read the `novelty`/`composite`/`constraint` columns of the matrix with this in mind.
 
 **No outcome is claimed here.** No arm has been trained; this section describes the apparatus and the
 criterion it will be measured against, not a result. See `docs/rlvr_plan.md` for the original design

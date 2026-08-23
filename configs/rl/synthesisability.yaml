@@ -1,13 +1,13 @@
-# Arm C3 - REDEFINED 2026-08-23: reward is a weighted sum of four fully
-# verifiable, structural terms -- PV pass, novelty, SA pass, and within-batch
-# diversity. Tg was dropped from every RLVR reward on this date -- see
-# src/polyt5/rewards/composite.py's module docstring and this same date's
-# amendment in artifacts/baseline/frozen_baseline.json. This arm has NEVER
-# been trained -- no data exists for it under any weighting; the redefinition
-# is a pre-registration made before any observation of its results.
+# Arm - reward is 1.0 iff the candidate clears the SV+PV gate AND its RDKit
+# SA score is <= sa_max, else 0.0. New arm, added 2026-08-23 when Tg was
+# dropped from every RLVR reward -- see src/polyt5/rewards/composite.py's
+# module docstring. Fully verifiable: SA is a deterministic RDKit heuristic
+# over the candidate's own structure, never a model's opinion. Deliberately
+# NOT the same reward as `constraint` (which ALSO requires novelty) -- this
+# arm is a single verifiable axis plus the gate, mirroring `novelty`.
 # Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
-experiment_name: grpo_composite
-arm: composite
+experiment_name: grpo_synthesisability
+arm: synthesisability
 seed: 0
 
 baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
@@ -17,14 +17,10 @@ reward:
   sigma0: 17.0            # unused by this arm; kept so configs stay comparable
   sigma_unknown: 45.2     # unused by this arm; kept so configs stay comparable
   min_coverage: 0.5       # unused by this arm; kept so configs stay comparable
-  sa_max: 6.0             # maximum acceptable RDKit SA score for the sa term
+  sa_max: 6.0             # maximum acceptable RDKit SA score -- this arm's whole reward
   window_tolerance: 50.0  # unused by this arm; kept so configs stay comparable
-  novelty_index: artifacts/novelty/tg_generation_train  # required: novelty term needs it
-  weights:                # CompositeArm.weights; DEFAULT_COMPOSITE_WEIGHTS -- pv/novelty/sa/diversity, NOT tg/pv/novelty
-    pv: 0.25
-    novelty: 0.25
-    sa: 0.25
-    diversity: 0.25
+  # No novelty_index: this arm's reward has no novelty clause at all (see
+  # ARMS_NEEDING_NOVELTY_INDEX in scripts/train_grpo.py).
 
 train:
   group_size: 16          # candidates per prompt; the GRPO baseline

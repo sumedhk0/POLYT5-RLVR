@@ -134,9 +134,11 @@ def test_build_reward_ensemble_raises_when_auditor_in_ensemble_list():
 
 
 def test_build_reward_arm_wires_composite_weights_from_config():
-    cfg = {"reward": {"weights": {"tg": 0.5, "pv": 0.3, "novelty": 0.2}}}
+    """2026-08-23: composite's weight vocabulary is pv/novelty/sa/diversity,
+    not tg/pv/novelty -- see polyt5.rewards.composite's module docstring."""
+    cfg = {"reward": {"weights": {"pv": 0.5, "novelty": 0.3, "sa": 0.1, "diversity": 0.1}}}
     arm = build_reward_arm("composite", cfg, novelty_index=None)
-    assert arm.weights == {"tg": 0.5, "pv": 0.3, "novelty": 0.2}
+    assert arm.weights == {"pv": 0.5, "novelty": 0.3, "sa": 0.1, "diversity": 0.1}
 
 
 def test_build_reward_arm_splits_tolerance_and_window_tolerance():
@@ -572,11 +574,35 @@ def test_trainer_config_reads_drift_every_from_the_config():
 def test_every_shipped_arm_config_declares_a_drift_block():
     from polyt5.utils import load_config
 
-    for arm in ("accuracy", "validity", "composite", "constraint", "control"):
+    for arm in ("accuracy", "validity", "novelty", "synthesisability", "composite",
+                "constraint", "control"):
         cfg = load_config(REPO_ROOT / "configs" / "rl" / f"{arm}.yaml")
         assert "drift" in cfg, arm
         assert cfg["drift"]["enabled"] is True, arm
         assert int(cfg["drift"]["every"]) >= 1, arm
+
+
+# --------------------------------------------- 2026-08-23 arm-set restructuring
+
+
+def test_arms_includes_the_new_and_redefined_arms():
+    for arm in ("novelty", "synthesisability", "composite", "constraint"):
+        assert arm in train_grpo.ARMS
+
+
+def test_arms_still_includes_retired_accuracy_for_reproducibility():
+    assert "accuracy" in train_grpo.ARMS
+
+
+def test_novelty_needs_a_novelty_index_synthesisability_does_not():
+    assert "novelty" in train_grpo.ARMS_NEEDING_NOVELTY_INDEX
+    assert "synthesisability" not in train_grpo.ARMS_NEEDING_NOVELTY_INDEX
+
+
+def test_build_reward_arm_synthesisability_reads_sa_max_from_config():
+    cfg = {"reward": {"sa_max": 4.5}}
+    arm = build_reward_arm("synthesisability", cfg)
+    assert arm.sa_max == 4.5
 
 
 # ------------------------------------------------- pinned reward overrides (item 2)

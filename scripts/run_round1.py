@@ -2,10 +2,18 @@
 
 Phase 3. NOT part of the published polyT5 method -- see ``docs/rlvr_plan.md``.
 
-One GPU means the four arms run sequentially, and at the measured ~23 s/step a
-round is roughly two days. This driver removes the need for anyone to be present
-at each arm boundary: it waits for the currently running arm to reach its final
-step, then launches the rest in order.
+Accepts any arm name with a ``configs/rl/<arm>.yaml`` -- this driver never
+allow-lists arm names itself (see :func:`_experiment_name_for`), so it needs
+no change to pick up new arms. 2026-08-23: Tg was dropped from every RLVR
+reward -- see ``polyt5.rewards.composite``'s module docstring -- so the
+current arm set to chain is ``validity``/``novelty``/``synthesisability``/
+``composite``/``control`` (``constraint`` kept as a redefined multi-criterion
+conjunction; ``accuracy`` retired, not chained for new runs).
+
+One GPU means the arms run sequentially, and at the measured ~23 s/step a
+round is roughly two days per arm. This driver removes the need for anyone to
+be present at each arm boundary: it waits for the currently running arm to
+reach its final step, then launches the rest in order.
 
 It refuses to chain past a failure. An arm whose metrics stop advancing for
 ``--stall-minutes`` is treated as dead, and the remaining arms are NOT started --
@@ -30,8 +38,10 @@ other seed's.
 
 Usage::
 
-    python scripts/run_round1.py --wait-for accuracy --then validity composite constraint
-    python scripts/run_round1.py --then accuracy validity composite constraint --seeds 0 1 2
+    python scripts/run_round1.py --wait-for validity \\
+        --then novelty synthesisability composite control
+    python scripts/run_round1.py --then novelty synthesisability composite constraint \\
+        --seeds 0 1 2
 """
 
 from __future__ import annotations

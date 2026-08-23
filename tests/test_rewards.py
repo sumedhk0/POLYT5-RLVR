@@ -8,11 +8,14 @@ from polyt5.chemistry.canonicalization import canonical_psmiles
 from polyt5.chemistry.conversion import pselfies_to_psmiles
 from polyt5.chemistry.metrics import synthetic_accessibility
 from polyt5.rewards import (
+    DEFAULT_COMPOSITE_WEIGHTS,
     DEFAULT_SIGMA_UNKNOWN,
     RewardResult,
     TgRewardConfig,
     build_arm,
     effective_sigma,
+    sa_pass,
+    sa_reward,
     tg_reward,
     validity_gate,
 )
@@ -212,7 +215,8 @@ def test_accuracy_arm_uses_only_the_tg_term():
 
 
 def test_every_arm_zeroes_an_invalid_candidate():
-    for name in ("accuracy", "validity", "composite", "constraint"):
+    for name in ("accuracy", "validity", "novelty", "synthesisability",
+                 "composite", "constraint"):
         arm = build_arm(name, novelty_index=_FakeIndex([]), ensemble_size=4)
         out = arm([INVALID], [500.0], [(500.0, 1.0, 4)])
         assert out[0].value == 0.0, name
@@ -295,51 +299,206 @@ def test_validity_arm_opt_out_still_enforces_sv_dd_pv():
 
 
 def test_constraint_arm_requires_every_condition():
-    arm = build_arm("constraint", novelty_index=_FakeIndex([]),
-                    tolerance=50.0, sa_max=6.0, ensemble_size=4)
-    on_target = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0].value
-    off_target = arm([VALID], [500.0], [(700.0, 2.0, 4)])[0].value
-    assert on_target == 1.0
-    assert off_target == 0.0, "conjunction: missing one condition scores zero"
+    """REDEFINED 2026-08-23: synthesisable AND novel, no Tg clause at all."""
+    actual_sa = synthetic_accessibility(VALID_CANONICAL)
+    assert actual_sa is not None, "SA scorer must be available for this test to mean anything"
+    on_target = build_arm("constraint", novelty_index=_FakeIndex([]),
+                          sa_max=actual_sa + 1.0)
+    off_target = build_arm("constraint", novelty_index=_FakeIndex([]),
+                           sa_max=actual_sa - 0.5)
+    assert on_target([VALID], [500.0], [(999.0, 99.0, 4)])[0].value == 1.0
+    assert off_target([VALID], [500.0], [(999.0, 99.0, 4)])[0].value == 0.0, (
+        "conjunction: missing one condition scores zero"
+    )
 
 
 def test_constraint_arm_sa_leg_can_fail_alone():
-    """Tg on-target and novel, but not synthesisable, must still score zero -
-    otherwise an implementation could drop the SA leg and this suite would not
-    notice."""
+    """Novel, but not synthesisable, must still score zero - otherwise an
+    implementation could drop the SA leg and this suite would not notice."""
     actual_sa = synthetic_accessibility(VALID_CANONICAL)
     assert actual_sa is not None, "SA scorer must be available for this test to mean anything"
-    arm = build_arm("constraint", novelty_index=_FakeIndex([]),
-                    tolerance=50.0, sa_max=actual_sa - 0.5, ensemble_size=4)
-    out = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0]
+    arm = build_arm("constraint", novelty_index=_FakeIndex([]), sa_max=actual_sa - 0.5)
+    out = arm([VALID], [500.0], [(999.0, 99.0, 4)])[0]
     assert out.value == 0.0
-    assert out.components["in_window"] == 1.0
     assert out.components["novel"] == 1.0
     assert out.components["synthesisable"] == 0.0
 
 
 def test_constraint_arm_novelty_leg_can_fail_alone():
-    """Tg on-target and synthesisable, but already in the reference set, must
-    still score zero - otherwise an implementation could drop the novelty leg
-    and this suite would not notice."""
-    arm = build_arm("constraint", novelty_index=_FakeIndex([VALID_CANONICAL]),
-                    tolerance=50.0, sa_max=6.0, ensemble_size=4)
-    out = arm([VALID], [500.0], [(510.0, 2.0, 4)])[0]
+    """Synthesisable, but already in the reference set, must still score zero
+    - otherwise an implementation could drop the novelty leg and this suite
+    would not notice."""
+    arm = build_arm("constraint", novelty_index=_FakeIndex([VALID_CANONICAL]), sa_max=6.0)
+    out = arm([VALID], [500.0], [(999.0, 99.0, 4)])[0]
     assert out.value == 0.0
-    assert out.components["in_window"] == 1.0
     assert out.components["synthesisable"] == 1.0
     assert out.components["novel"] == 0.0
 
 
+def test_constraint_arm_ignores_predictions_entirely():
+    """REDEFINED 2026-08-23: no Tg clause survives, so a deliberately absurd
+    predictor triple must change nothing about the reward."""
+    arm = build_arm("constraint", novelty_index=_FakeIndex([]), sa_max=6.0)
+    sane = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    absurd = arm([VALID], [500.0], [(float("nan"), float("inf"), 999_999)])[0]
+    assert sane.value == absurd.value
+    assert sane.components == absurd.components
+
+
 def test_composite_arm_weights_are_configurable_not_hardcoded():
+    """REDEFINED 2026-08-23: weights select among pv/novelty/sa/diversity,
+    not tg/pv/novelty."""
     idx = _FakeIndex([])
-    a = build_arm("composite", novelty_index=idx, ensemble_size=4,
-                  weights={"tg": 1.0, "pv": 0.0, "novelty": 0.0})
-    b = build_arm("composite", novelty_index=idx, ensemble_size=4,
-                  weights={"tg": 0.0, "pv": 1.0, "novelty": 0.0})
+    a = build_arm("composite", novelty_index=idx,
+                  weights={"pv": 1.0, "novelty": 0.0, "sa": 0.0, "diversity": 0.0})
+    b = build_arm("composite", novelty_index=idx,
+                  weights={"pv": 0.0, "novelty": 1.0, "sa": 0.0, "diversity": 0.0})
     va = a([VALID], [500.0], [(600.0, 2.0, 4)])[0].value
     vb = b([VALID], [500.0], [(600.0, 2.0, 4)])[0].value
-    assert va != vb
+    assert va == 1.0
+    assert vb == 1.0, "VALID is absent from the empty fake index, so it is novel"
+    # Different candidate, already in the index: pv-only weighting is
+    # unaffected by novelty, novelty-only weighting drops to zero.
+    idx_known = _FakeIndex([VALID_CANONICAL])
+    a2 = build_arm("composite", novelty_index=idx_known,
+                   weights={"pv": 1.0, "novelty": 0.0, "sa": 0.0, "diversity": 0.0})
+    b2 = build_arm("composite", novelty_index=idx_known,
+                   weights={"pv": 0.0, "novelty": 1.0, "sa": 0.0, "diversity": 0.0})
+    assert a2([VALID], [500.0], [(600.0, 2.0, 4)])[0].value == 1.0
+    assert b2([VALID], [500.0], [(600.0, 2.0, 4)])[0].value == 0.0
+
+
+def test_composite_arm_default_weights_cover_four_verifiable_terms():
+    assert set(DEFAULT_COMPOSITE_WEIGHTS) == {"pv", "novelty", "sa", "diversity"}
+    assert "tg" not in DEFAULT_COMPOSITE_WEIGHTS
+
+
+def test_composite_arm_ignores_predictions_entirely():
+    arm = build_arm("composite", novelty_index=_FakeIndex([]))
+    sane = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    absurd = arm([VALID], [500.0], [(float("nan"), float("inf"), 999_999)])[0]
+    assert sane.value == absurd.value
+    assert sane.components == absurd.components
+
+
+def test_composite_arm_diversity_term_penalises_within_batch_duplicates():
+    arm = build_arm("composite", novelty_index=_FakeIndex([]),
+                    weights={"pv": 0.0, "novelty": 0.0, "sa": 0.0, "diversity": 1.0})
+    out = arm([VALID, VALID], [500.0, 500.0],
+              [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+    assert out[0].value == 1.0, "first occurrence is diverse"
+    assert out[1].value == 0.0, "second occurrence of the same polymer is not"
+
+
+# --------------------------------------------------------------------- NoveltyArm
+
+
+def test_novelty_arm_scores_a_novel_valid_candidate():
+    arm = build_arm("novelty", novelty_index=_FakeIndex([]))
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 1.0
+    assert out.components["novel"] == 1.0
+
+
+def test_novelty_arm_zeroes_a_known_candidate():
+    arm = build_arm("novelty", novelty_index=_FakeIndex([VALID_CANONICAL]))
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 0.0
+    assert out.gated is False, "a known but chemically valid candidate is a reward miss, "\
+        "not structural invalidity"
+
+
+def test_novelty_arm_ignores_predictions_entirely():
+    arm = build_arm("novelty", novelty_index=_FakeIndex([]))
+    sane = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    absurd = arm([VALID], [500.0], [(float("nan"), float("inf"), 999_999)])[0]
+    assert sane.value == absurd.value
+    assert sane.components == absurd.components
+
+
+def test_novelty_arm_tolerates_a_missing_index_by_degrading_to_not_novel():
+    """Unlike ValidityArm's TSD stage, a missing index here does not raise -
+    it must stay safe to build under compare_arms.py's
+    --allow-missing-novelty-index, which passes novelty_index=None on purpose."""
+    arm = build_arm("novelty", novelty_index=None)
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 0.0
+
+
+def test_novelty_arm_rejects_misaligned_inputs_like_every_other_arm():
+    arm = build_arm("novelty", novelty_index=_FakeIndex([]))
+    with pytest.raises(ValueError):
+        arm([VALID, VALID], [500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+
+
+# ------------------------------------------------------------- SynthesisabilityArm
+
+
+def test_synthesisability_arm_passes_an_easy_structure():
+    actual_sa = synthetic_accessibility(VALID_CANONICAL)
+    assert actual_sa is not None
+    arm = build_arm("synthesisability", sa_max=actual_sa + 1.0)
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 1.0
+    assert out.components["synthesisable"] == 1.0
+
+
+def test_synthesisability_arm_fails_a_hard_structure():
+    actual_sa = synthetic_accessibility(VALID_CANONICAL)
+    assert actual_sa is not None
+    arm = build_arm("synthesisability", sa_max=actual_sa - 0.5)
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value == 0.0
+
+
+def test_synthesisability_arm_does_not_need_a_novelty_index():
+    """Per the arm's own definition -- SA <= threshold AND valid, no novelty
+    clause -- build_arm must not require one, unlike novelty/composite/
+    constraint/validity."""
+    arm = build_arm("synthesisability", sa_max=6.0)  # no novelty_index kwarg at all
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    assert out.value in (0.0, 1.0)
+
+
+def test_synthesisability_arm_ignores_predictions_entirely():
+    arm = build_arm("synthesisability", sa_max=6.0)
+    sane = arm([VALID], [500.0], [(500.0, 1.0, 4)])[0]
+    absurd = arm([VALID], [500.0], [(float("nan"), float("inf"), 999_999)])[0]
+    assert sane.value == absurd.value
+    assert sane.components == absurd.components
+
+
+def test_synthesisability_arm_rejects_misaligned_inputs_like_every_other_arm():
+    arm = build_arm("synthesisability", sa_max=6.0)
+    with pytest.raises(ValueError):
+        arm([VALID, VALID], [500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+
+
+# ----------------------------------------------------------------------- sa.py
+
+
+def test_sa_pass_is_false_for_a_missing_score():
+    assert sa_pass(None, sa_max=6.0) is False
+
+
+def test_sa_pass_thresholds_inclusively():
+    assert sa_pass(6.0, sa_max=6.0) is True
+    assert sa_pass(6.01, sa_max=6.0) is False
+
+
+def test_sa_reward_computes_the_real_sa_score():
+    actual_sa = synthetic_accessibility(VALID_CANONICAL)
+    assert actual_sa is not None
+    result = sa_reward(VALID_CANONICAL, sa_max=actual_sa + 1.0)
+    assert result.value == 1.0
+    assert result.components["sa_score"] == pytest.approx(actual_sa)
+    assert result.components["synthesisable"] == 1.0
+
+
+def test_sa_reward_none_candidate_fails_without_raising():
+    result = sa_reward(None, sa_max=6.0)
+    assert result.value == 0.0
+    assert "sa_score" not in result.components, "no score exists to report for a None candidate"
 
 
 def test_rewards_package_imports_without_torch():
@@ -360,50 +519,20 @@ def test_rewards_package_imports_without_torch():
 
 
 def test_every_tg_reading_arm_penalises_a_partial_ensemble():
-    """Ruling F: ``n_contributing`` must reach C1, C3 AND C4, not just
-    ``tg_reward``. Each arm is scored twice on the SAME candidate at the SAME
-    target -- once with all four members agreeing, once with a single member's
-    unopposed guess.
+    """Ruling F: ``n_contributing`` must reach every arm that still reads Tg.
+
+    2026-08-23: only ``accuracy`` (retired) still reads it at all -
+    ``composite`` and ``constraint`` were redefined to drop the Tg term
+    entirely, so this pins accuracy alone rather than looping over the three
+    arms it used to cover.
     """
-    idx = _FakeIndex([])
-    cases = {
-        "accuracy": build_arm("accuracy", ensemble_size=4),
-        "composite": build_arm("composite", novelty_index=idx, ensemble_size=4),
-        "constraint": build_arm("constraint", novelty_index=idx, ensemble_size=4,
-                                tolerance=50.0, sa_max=6.0),
-    }
-    for name, arm in cases.items():
-        consensus = arm([VALID], [400.0], [(400.0, 4.0, 4)])[0].value
-        partial = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0].value
-        assert partial < consensus, (
-            f"{name}: a one-of-four prediction scored {partial} against a full-consensus "
-            f"{consensus} -- this arm is still reading a single member's guess as a consensus"
-        )
-
-
-def test_constraint_arm_requires_the_ensemble_to_have_actually_scored_it():
-    """C4 carries no continuous confidence weight by spec, so coverage enters
-    as a fourth conjunct instead. One member of four is below ``min_coverage``
-    and the conjunction fails even though Tg, SA and novelty all pass.
-    """
-    arm = build_arm("constraint", novelty_index=_FakeIndex([]), ensemble_size=4,
-                    tolerance=50.0, sa_max=6.0)
-    out = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0]
-    assert out.value == 0.0
-    assert out.components["in_window"] == 1.0
-    assert out.components["synthesisable"] == 1.0
-    assert out.components["novel"] == 1.0
-    assert out.components["ensemble_backed"] == 0.0
-    assert out.components["coverage"] == pytest.approx(0.25)
-
-
-def test_constraint_arm_accepts_a_single_model_predictor():
-    """Ruling C again: the auditor is one model, so 1 of 1 is full coverage."""
-    arm = build_arm("constraint", novelty_index=_FakeIndex([]), ensemble_size=1,
-                    tolerance=50.0, sa_max=6.0)
-    out = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0]
-    assert out.value == 1.0
-    assert out.components["ensemble_backed"] == 1.0
+    arm = build_arm("accuracy", ensemble_size=4)
+    consensus = arm([VALID], [400.0], [(400.0, 4.0, 4)])[0].value
+    partial = arm([VALID], [400.0], [(400.0, 0.0, 1)])[0].value
+    assert partial < consensus, (
+        f"accuracy: a one-of-four prediction scored {partial} against a full-consensus "
+        f"{consensus} -- this arm is still reading a single member's guess as a consensus"
+    )
 
 
 def test_validity_arm_rejects_misaligned_inputs_like_every_other_arm():
@@ -416,16 +545,16 @@ def test_validity_arm_rejects_misaligned_inputs_like_every_other_arm():
         arm([VALID, VALID], [500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
 
 
-def test_sa_reward_is_no_longer_a_public_symbol():
-    """Minor 13: the branch's one unwired public symbol. No arm called it --
-    ``ConstraintArm`` reads the raw SA score and ``constraint_reward`` applies
-    the threshold -- and wiring it would have changed C4's reward at the
-    boundary, which is a spec change, not a review fix.
-    """
+def test_sa_reward_is_a_public_symbol():
+    """2026-08-23: restored and wired in, unlike the earlier removal (Minor
+    13) - ``SynthesisabilityArm`` and ``CompositeArm`` both use it now, so it
+    is no longer dead code."""
     import polyt5.rewards as rewards
 
-    assert not hasattr(rewards, "sa_reward")
-    assert "sa_reward" not in rewards.__all__
+    assert hasattr(rewards, "sa_reward")
+    assert "sa_reward" in rewards.__all__
+    assert hasattr(rewards, "sa_pass")
+    assert "sa_pass" in rewards.__all__
 
 
 # ------------------------------------------------------------------- ControlArm

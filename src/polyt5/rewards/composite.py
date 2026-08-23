@@ -1,16 +1,54 @@
-"""The four real arms, plus a negative control. Weights live in config, never
-in code.
+"""The RLVR reward arms. Weights live in config, never in code.
+
+[PRE-REGISTRATION NOTE, dated 2026-08-23] Tg was dropped from every RLVR
+reward on this date. A generated polymer has no experimental Tg and never
+will -- nobody has synthesised it -- so a Tg reward is a learned model's
+opinion about the candidate, not a computed fact about it, and an arm built
+on one is not RLVR (see :mod:`polyt5.rewards.tg`'s own warning, which predates
+this change and is the reason for it). The new arm set is fully verifiable:
+every reward below is either a deterministic structural check (RDKit parse,
+terminus valency, an SA score against a fixed threshold) or a set-membership
+test (novelty against the training corpus) -- never a model's prediction.
+
+Two arms existed already and are affected differently by this cut:
+
+* ``accuracy`` (C1) is **RETIRED, not deleted**. It trained to completion (a
+  full round-1 run) BEFORE this change, and its result -- reward-scored error
+  fell while diversity collapsed 0.951 -> 0.535 -- is kept as the motivating
+  negative finding for dropping Tg everywhere else. Its class and config are
+  unchanged and it stays registered under :func:`build_arm` so the completed
+  run remains reproducible (e.g. via ``--resume``) and reportable by
+  ``scripts/compare_arms.py``; it is simply no longer part of the arm set a
+  NEW run should choose from.
+* ``composite`` (C3) and ``constraint`` (C4) are **REDEFINED, not deleted**.
+  Deleting them would leave only ``validity`` + ``control`` -- one objective
+  and its control, with no off-diagonal at all. The off-diagonal (does
+  optimising one verifiable axis damage another?) is the actual science here;
+  it is what made ``accuracy``'s diversity collapse a finding rather than an
+  anecdote. The redefinitions below preserve that question using only
+  checkable quantities. **Neither arm has been trained under its new
+  definition -- no data exists for either.** Redefining their rewards now is
+  therefore a scope change made BEFORE any observation, not a criterion
+  chosen after seeing results; see this same date's amendment in
+  ``artifacts/baseline/frozen_baseline.json`` for the dated record of that
+  distinction, and each redefined class's own docstring below.
+
+Two new arms, ``novelty`` and ``synthesisability``, complete the set: each is
+a single verifiable axis plus the validity gate, structurally mirroring how
+``accuracy`` and ``constraint`` used to add exactly one axis on top of the
+same gate.
 
 Every real arm rejects a structure that RDKit cannot parse before scoring
 anything else: a structure that is not a polymer earns nothing on any axis.
-Three arms (accuracy, composite, constraint) apply the combined SV+PV
-validity gate up front and score the rest of their terms only on survivors.
-``ValidityArm`` is the exception: its whole job is to *measure* the paper's
-nested SV -> TSD -> DD -> PV cascade, so it checks SV first but defers PV
-until after TSD and DD, in the cascade's own order - see its docstring.
+Every arm except ``ValidityArm`` and ``ControlArm`` applies the combined
+SV+PV validity gate up front (:meth:`_BaseArm._prepare`) and scores the rest
+of its terms only on survivors. ``ValidityArm`` is the exception: its whole
+job is to *measure* the paper's nested SV -> TSD -> DD -> PV cascade, so it
+checks SV first but defers PV until after TSD and DD, in the cascade's own
+order - see its docstring.
 
-``ControlArm`` is not one of the four: it is the study's negative control,
-scoring every candidate with reward drawn uniformly at random from
+``ControlArm`` is not one of the verifiable arms: it is the study's negative
+control, scoring every candidate with reward drawn uniformly at random from
 ``[0, 1)``, independent of the candidate's content entirely - no gate, no
 chemistry, nothing read from ``pselfies`` at all. It exists to separate "this
 specific reward design changed the metrics" from "training against ANY
@@ -34,13 +72,25 @@ from polyt5.evaluation import has_valid_termini
 from polyt5.rewards.base import RewardResult
 from polyt5.rewards.constraints import constraint_reward
 from polyt5.rewards.novelty import novelty_reward
+from polyt5.rewards.sa import sa_reward
 from polyt5.rewards.tg import TgRewardConfig, tg_reward
 from polyt5.rewards.validity import validity_gate
 
 #: (mean, std, n_contributing_members) as returned by the ensemble predictor.
+#: Retained for arms that still read it (``accuracy``, retired but kept
+#: functional). Every other arm's ``ArmReward.__call__`` still accepts a
+#: ``predictions`` sequence -- it is part of the shared three-argument
+#: contract, and every arm still zips it against ``candidates`` for an
+#: alignment check -- but does not read a single value out of it. See
+#: ``tests/test_rewards.py``'s predictor-invariance tests.
 Prediction = tuple[float, float, int]
 
-DEFAULT_COMPOSITE_WEIGHTS = {"tg": 1.0, "pv": 0.5, "novelty": 0.25}
+#: ``CompositeArm``'s default weights, REDEFINED 2026-08-23 (see this
+#: module's docstring): four fully verifiable terms -- PV (constant 1.0 for
+#: every gate survivor), novelty, SA-pass, and within-batch diversity -- in
+#: place of the old tg/pv/novelty mix. Equal weighting, not tuned: no data
+#: exists yet for this arm under any weighting.
+DEFAULT_COMPOSITE_WEIGHTS = {"pv": 0.25, "novelty": 0.25, "sa": 0.25, "diversity": 0.25}
 
 
 class ArmReward(Protocol):
@@ -90,7 +140,24 @@ class _BaseArm:
 
 
 class AccuracyArm(_BaseArm):
-    """C1: closeness to the requested Tg, discounted by ensemble disagreement."""
+    """C1: closeness to the requested Tg, discounted by ensemble disagreement.
+
+    .. warning::
+
+       **RETIRED, 2026-08-23. Not RLVR.** Tg has no ground truth for a
+       generated candidate -- nobody has synthesised it -- so this reward is
+       a learned model's opinion, not a computed fact; see
+       :mod:`polyt5.rewards.tg`'s own warning. This arm is kept, unchanged,
+       ONLY because it already trained to completion (round-1, 2000 steps)
+       BEFORE the Tg cut, and its result stands as the motivating negative
+       finding for making every other arm verifiable: reward-scored error
+       fell while diversity collapsed 0.951 -> 0.535. It remains registered
+       under :func:`build_arm` and its config (``configs/rl/accuracy.yaml``)
+       is untouched so the completed run stays reproducible (e.g.
+       ``train_grpo.py --resume``) and so ``scripts/compare_arms.py`` can
+       still report its row. Do not choose this arm for a new run -- see the
+       module docstring for the current, fully verifiable arm set.
+    """
 
     def __call__(self, candidates, targets, predictions):
         out: list[RewardResult] = []
@@ -205,9 +272,77 @@ class ValidityArm(_BaseArm):
         return out
 
 
+class NoveltyArm(_BaseArm):
+    """R = 1.0 iff the candidate clears the SV+PV gate AND is absent from the
+    training corpus, else 0.0.
+
+    New arm (2026-08-23) -- see this module's docstring. Fully verifiable:
+    novelty is set membership against the injected reference index
+    (:func:`~polyt5.rewards.novelty.novelty_reward`), never a model's opinion.
+
+    Unlike :class:`ValidityArm`'s TSD stage, a missing ``novelty_index`` here
+    degrades to ``novel = 0.0`` (via :func:`~polyt5.rewards.novelty.
+    novelty_reward`'s own None-handling) rather than raising at construction.
+    That mirrors how the OLD ``CompositeArm``/``ConstraintArm`` always treated
+    their novelty term, and keeps this arm safe to build under
+    ``scripts/compare_arms.py --allow-missing-novelty-index`` (which passes
+    ``novelty_index=None`` explicitly, by design) without a second opt-out
+    kwarg to thread through ``scripts/train_grpo.py``'s ``build_reward_arm``.
+    A silently-None index during actual TRAINING is not a realistic risk the
+    way it is for ``ValidityArm``'s TSD stage: ``ARMS_NEEDING_NOVELTY_INDEX``
+    always opens a real path for this arm, and a genuinely missing file
+    raises in ``ScalableNoveltyIndex.open`` before an arm is ever built.
+    """
+
+    def __call__(self, candidates, targets, predictions):
+        out: list[RewardResult] = []
+        # This arm reads neither `targets` nor `predictions` -- novelty is a
+        # fact about the structure alone, checked against an injected index.
+        # Still zipped with strict=True so misaligned inputs raise here, like
+        # every other arm.
+        for pselfies, _target, _prediction in zip(candidates, targets, predictions,
+                                                  strict=True):
+            gate, canon = self._prepare(pselfies)
+            if gate.gated:
+                out.append(gate)
+                continue
+            novel = bool(novelty_reward(canon, self.novelty_index).value)
+            out.append(RewardResult(float(novel), {"novel": float(novel)}))
+        return out
+
+
+class SynthesisabilityArm(_BaseArm):
+    """R = 1.0 iff the candidate clears the SV+PV gate AND its RDKit SA score
+    is <= ``sa_max``, else 0.0.
+
+    New arm (2026-08-23) -- see this module's docstring. Fully verifiable:
+    the SA score is a deterministic RDKit heuristic over the candidate's own
+    structure (:func:`~polyt5.rewards.sa.sa_reward`), never a model's
+    prediction and never conditioned on any target.
+    """
+
+    def __call__(self, candidates, targets, predictions):
+        out: list[RewardResult] = []
+        for pselfies, _target, _prediction in zip(candidates, targets, predictions,
+                                                  strict=True):
+            gate, canon = self._prepare(pselfies)
+            if gate.gated:
+                out.append(gate)
+                continue
+            out.append(sa_reward(canon, sa_max=self.sa_max))
+        return out
+
+
 class CompositeArm(_BaseArm):
-    """C3: weighted sum of the confidence-weighted Tg term and novelty, plus a
-    flat bonus for having cleared the structural gate.
+    """C3, REDEFINED 2026-08-23 (see this module's docstring): weighted sum of
+    four fully verifiable, structural terms -- PV, novelty, SA-pass, and
+    within-batch diversity. No term reads a model prediction.
+
+    Previously a weighted mix that included the Tg closeness term; that term
+    is gone, not merely zero-weighted -- ``predictions`` is no longer read at
+    all (see ``tests/test_rewards.py``'s predictor-invariance tests). **This
+    arm has never been trained under this definition; no data exists for it
+    under any weighting.**
 
     The ``pv`` term is the literal constant ``weights["pv"] * 1.0``: every
     candidate that reaches this line has already passed the SV+PV gate in
@@ -216,9 +351,15 @@ class CompositeArm(_BaseArm):
     candidates and NOTHING else -- within a GRPO group whose members all
     cleared the gate it is a constant that
     :func:`~polyt5.rl.advantages.group_advantages` removes entirely by
-    mean-centring. Calling this "a weighted sum of accuracy, PV pass and
-    novelty" oversold it; only two of the three terms can vary between two
-    gate survivors.
+    mean-centring.
+
+    The ``diversity`` term is first-occurrence-within-this-batch, exactly
+    :class:`ValidityArm`'s own DD stage: ``1.0`` the first time a candidate's
+    canonical form appears in THIS ``__call__``'s batch, ``0.0`` for every
+    later duplicate. This is ``docs/rlvr_plan.md``'s original diversity design
+    ("penalize mode collapse onto a few polymers"), reused rather than
+    reinvented, and -- like DD -- it is computed only over candidates that
+    cleared the gate.
     """
 
     def __init__(self, *, weights: dict[str, float] | None = None, **kw) -> None:
@@ -227,62 +368,69 @@ class CompositeArm(_BaseArm):
 
     def __call__(self, candidates, targets, predictions):
         out: list[RewardResult] = []
-        for pselfies, target, (mean, std, n) in zip(candidates, targets, predictions,
-                                                    strict=True):
+        seen_canonical: set[str] = set()
+        # `predictions` is part of the shared three-argument contract but is
+        # never read -- this arm's whole point is that no term depends on a
+        # model's prediction. See test_composite_arm_ignores_predictions.
+        for pselfies, _target, _prediction in zip(candidates, targets, predictions,
+                                                  strict=True):
             gate, canon = self._prepare(pselfies)
             if gate.gated:
                 out.append(gate)
                 continue
-            tg = tg_reward(mean, std, target, n_contributing=n,
-                           n_total=self.ensemble_size, config=self.tg_config)
-            nov = novelty_reward(canon, self.novelty_index)
-            value = (self.weights.get("tg", 0.0) * tg.value
-                     + self.weights.get("pv", 0.0) * 1.0
-                     + self.weights.get("novelty", 0.0) * nov.value)
-            out.append(RewardResult(value, {**tg.components, **nov.components, "pv": 1.0}))
+            novel = bool(novelty_reward(canon, self.novelty_index).value)
+            sa = sa_reward(canon, sa_max=self.sa_max)
+            first_occurrence = canon not in seen_canonical
+            seen_canonical.add(canon)
+            value = (self.weights.get("pv", 0.0) * 1.0
+                     + self.weights.get("novelty", 0.0) * float(novel)
+                     + self.weights.get("sa", 0.0) * sa.value
+                     + self.weights.get("diversity", 0.0) * float(first_occurrence))
+            out.append(RewardResult(value, {
+                "pv": 1.0, "novelty": float(novel), **sa.components,
+                "diversity": float(first_occurrence),
+            }))
         return out
 
 
 class ConstraintArm(_BaseArm):
-    """C4: Tg window AND synthesisable AND novel, as a conjunction.
+    """C4, REDEFINED 2026-08-23 (see this module's docstring): synthesisable
+    AND novel, as a conjunction. No term reads a model prediction.
 
-    C4 carries no continuous confidence weight -- that is the point of the
-    arm, per spec section 4.3 -- but it must still not read a single member's
-    guess as an ensemble consensus. The coverage of the property ensemble
-    therefore enters as a fourth CONJUNCT (``ensemble_backed``, driven by
-    :attr:`~polyt5.rewards.tg.TgRewardConfig.min_coverage`) rather than as a
-    discount on the value. A single-model predictor reports ``n = 1`` of
-    ``ensemble_size = 1``, i.e. coverage 1.0, and is unaffected.
+    Previously a four-way conjunction (Tg window AND synthesisable AND novel
+    AND ensemble-backed). Both the ``in_window`` clause and the
+    ``ensemble_backed`` clause are gone, not merely dropped from the value:
+    ``predictions`` is no longer read at all (see
+    ``tests/test_rewards.py``'s predictor-invariance tests) --
+    ``ensemble_backed`` existed only to stop a single ensemble member's guess
+    from being read as a Tg consensus, and with no Tg clause there is nothing
+    left for it to guard. **This arm has never been trained under this
+    definition; no data exists for it.**
+
+    This is deliberately NOT the same reward as :class:`SynthesisabilityArm`:
+    that arm is a single verifiable axis (SA alone) plus the gate, mirroring
+    ``NoveltyArm``; this one keeps its original character as the
+    multi-criterion conjunction -- every non-Tg clause the old C4 already had,
+    now the whole story instead of three quarters of it. The name is kept
+    (not renamed to ``synthesisability``) for exactly that reason: it is a
+    different, stricter reward than the SA-only arm, not a duplicate of it.
+    Because the name is unchanged, ``configs/rl/constraint.yaml`` is
+    annotated at the point every dropped key stops mattering, so a reader
+    cannot mistake the old config for still producing the old reward -- see
+    that file and :func:`~polyt5.rewards.constraints.constraint_reward`.
     """
 
     def __call__(self, candidates, targets, predictions):
         out: list[RewardResult] = []
-        for pselfies, target, (mean, _std, n) in zip(candidates, targets, predictions,
-                                                     strict=True):
+        for pselfies, _target, _prediction in zip(candidates, targets, predictions,
+                                                  strict=True):
             gate, canon = self._prepare(pselfies)
             if gate.gated:
                 out.append(gate)
                 continue
-            if not 0 <= n <= self.ensemble_size:
-                raise ValueError(
-                    f"n_contributing ({n}) must be in [0, ensemble_size] "
-                    f"(ensemble_size={self.ensemble_size}): this arm's declared ensemble_size "
-                    "does not match the predictor supplying these predictions."
-                )
-            coverage = n / self.ensemble_size
             sa = synthetic_accessibility(canon) if canon else None
             novel = bool(novelty_reward(canon, self.novelty_index).value)
-            result = constraint_reward(
-                abs(mean - target), sa, novel,
-                tolerance=self.tolerance, sa_max=self.sa_max,
-                ensemble_backed=coverage >= self.tg_config.min_coverage,
-            )
-            out.append(RewardResult(
-                result.value,
-                {**result.components, "coverage": coverage, "n_contributing": float(n)},
-                result.gated,
-                result.reason,
-            ))
+            out.append(constraint_reward(sa, novel, sa_max=self.sa_max))
         return out
 
 
@@ -416,7 +564,13 @@ class ControlArm(_BaseArm):
         return [RewardResult(float(value), {"control": float(value)}) for value in draws]
 
 
+#: ``accuracy`` is RETIRED (see :class:`AccuracyArm`'s docstring) but stays
+#: registered so its completed run remains reproducible and reportable.
+#: ``novelty`` and ``synthesisability`` are new (2026-08-23); ``composite``
+#: and ``constraint`` are registered under their existing names but with
+#: REDEFINED, Tg-free rewards -- see this module's docstring.
 _ARMS = {"accuracy": AccuracyArm, "validity": ValidityArm,
+         "novelty": NoveltyArm, "synthesisability": SynthesisabilityArm,
          "composite": CompositeArm, "constraint": ConstraintArm,
          "control": ControlArm}
 
@@ -425,14 +579,14 @@ def build_arm(name: str, **kwargs: Any) -> ArmReward:
     """Construct an arm by name.
 
     Args:
-        name: One of ``accuracy``, ``validity``, ``composite``, ``constraint``,
-            ``control``.
+        name: One of ``accuracy`` (retired), ``validity``, ``novelty``,
+            ``synthesisability``, ``composite``, ``constraint``, ``control``.
         **kwargs: Passed to the arm - ``novelty_index``, ``tolerance``,
             ``sa_max``, ``tg_config``, ``ensemble_size``, and for composite,
-            ``weights``. Any arm reading the Tg term MUST be given the
-            ``ensemble_size`` of the predictor whose triples it will receive;
-            see :class:`_BaseArm`. ``control`` additionally reads ``seed``
-            (default ``0``) - see :class:`ControlArm`.
+            ``weights``. ``accuracy`` (the only arm still reading the Tg term)
+            MUST be given the ``ensemble_size`` of the predictor whose triples
+            it will receive; see :class:`_BaseArm`. ``control`` additionally
+            reads ``seed`` (default ``0``) - see :class:`ControlArm`.
 
     Raises:
         ValueError: On an unknown arm name.
