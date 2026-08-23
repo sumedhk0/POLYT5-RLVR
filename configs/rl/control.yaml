@@ -1,0 +1,57 @@
+# Negative control arm (Addition 1) - reward is uniform random in [0, 1),
+# independent of the candidate's content entirely. See ControlArm's docstring
+# in src/polyt5/rewards/composite.py for the full rationale: this arm
+# optimizes NOTHING, so scripts/compare_arms.py's ARM_METRIC has no entry for
+# it and its matrix row's `success` column is always None/N-A. Its purpose is
+# purely diagnostic -- if training against pure noise still moves PV rate,
+# diversity, or any other reported metric, that is evidence an apparent
+# improvement in one of the four real arms is not, by itself, attributable to
+# that arm's reward design.
+# Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
+experiment_name: grpo_control
+arm: control
+seed: 0
+
+baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
+
+reward:
+  # None of these are read by ControlArm -- its reward is
+  # np.random.default_rng([seed, step_index]).uniform(0, 1), nothing else --
+  # kept here only so this file stays structurally comparable to the other
+  # four configs.
+  tolerance: 100.0
+  sigma0: 17.0
+  sigma_unknown: 45.2
+  min_coverage: 0.5
+  sa_max: 6.0
+  window_tolerance: 50.0
+
+train:
+  group_size: 16          # candidates per prompt; the GRPO baseline
+  prompts_per_step: 32    # 512 candidates per step
+  max_steps: 2000
+  max_length: 200         # [PAPER] the paper's sequence limit
+  target_min: 250.0       # uniform sampling forces genuine conditioning
+  target_max: 600.0
+  temperature: 0.7        # arm B's tuned operating point
+  top_p: 0.95
+  learning_rate: 1.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.02           # primary knob; KL is logged every step
+  max_grad_norm: 1.0
+  rollout_batch_size: 128 # measured optimum; 512 is 3.5x slower
+  log_every: 10
+  save_every: 100
+  device: auto
+
+# Spec 4.4 drift monitoring. LOGGING ONLY: the auditor loaded here is handed to
+# polyt5.rl.DriftMonitor and is never passed to the reward arm (see
+# scripts/train_grpo.py's module docstring). --no-drift-monitor overrides this.
+drift:
+  enabled: true
+  every: 50                                         # steps between measurements; step 0 always measured
+  reference: data/processed/tg/generation/train.jsonl  # labelled Tg set for max-Tanimoto
+  max_reference: 20000
+
+output:
+  results_root: results

@@ -349,7 +349,19 @@ class GRPOTrainer:
         )
 
         predictions = self.predictor.predict_with_uncertainty(batch.texts)
-        results: list[RewardResult] = self.arm(batch.texts, batch.targets, predictions)
+        # Step-aware arms (currently only ControlArm -- see its docstring)
+        # declare `wants_step_index = True` and read an extra keyword-only
+        # `step_index` beyond the shared three-argument ArmReward contract,
+        # so their own reward can be seeded from (config.seed, step_index)
+        # the same way this step already seeds `targets` above. Every other
+        # arm's __call__ does not accept that keyword at all, so it must
+        # never be passed unconditionally.
+        if getattr(self.arm, "wants_step_index", False):
+            results: list[RewardResult] = self.arm(
+                batch.texts, batch.targets, predictions, step_index=step_index
+            )
+        else:
+            results = self.arm(batch.texts, batch.targets, predictions)
 
         rewards = np.array([r.value for r in results], dtype=np.float64)
         advantages = group_advantages(rewards, cfg.group_size)

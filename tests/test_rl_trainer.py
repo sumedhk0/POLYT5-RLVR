@@ -226,6 +226,73 @@ def test_logs_weighted_and_unweighted_reward():
         assert key in stats, key
 
 
+# --------------------------------------------------- control arm step-index wiring
+#
+# GRPOTrainer.step must pass its own step_index through to a step-aware arm
+# (ControlArm.wants_step_index) so that arm's reward is reproducible from
+# (config.seed, step_index) alone, exactly like the trainer's own target
+# sampling -- and NOT pass it to an arm that never asked for it.
+
+
+def test_control_arm_step_reward_is_reproducible_for_the_same_step_index():
+    policy, tok = _tiny()
+    reference, _ = _tiny()
+    reference.load_state_dict(policy.state_dict())
+
+    def run():
+        trainer = GRPOTrainer(
+            policy=policy, reference=reference, tokenizer=tok,
+            arm=build_arm("control", seed=3), predictor=_FakePredictor(),
+            config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=32,
+                                     device="cpu", seed=11),
+        )
+        return trainer.step(0)
+
+    stats_a, stats_b = run(), run()
+    assert stats_a["reward_mean"] == stats_b["reward_mean"]
+
+
+def test_control_arm_step_reward_changes_across_step_index():
+    policy, tok = _tiny()
+    reference, _ = _tiny()
+    reference.load_state_dict(policy.state_dict())
+    trainer = GRPOTrainer(
+        policy=policy, reference=reference, tokenizer=tok,
+        arm=build_arm("control", seed=3), predictor=_FakePredictor(),
+        config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=32,
+                                 device="cpu", seed=11),
+    )
+    stats0 = trainer.step(0)
+    stats1 = trainer.step(1)
+    assert stats0["reward_mean"] != stats1["reward_mean"]
+
+
+def test_non_step_aware_arm_is_never_called_with_step_index(monkeypatch):
+    """An arm that does not declare wants_step_index must be called with
+    exactly the original three positional arguments -- passing step_index to
+    it unconditionally would raise a TypeError on every real (non-control)
+    arm's __call__.
+    """
+    policy, tok = _tiny()
+    reference, _ = _tiny()
+
+    captured: dict[str, object] = {}
+    real_arm = build_arm("accuracy", ensemble_size=4)
+
+    def spy(candidates, targets, predictions, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_arm(candidates, targets, predictions)
+
+    trainer = GRPOTrainer(
+        policy=policy, reference=reference, tokenizer=tok,
+        arm=spy, predictor=_FakePredictor(),
+        config=GRPOTrainerConfig(group_size=4, prompts_per_step=2, max_length=32,
+                                 device="cpu", seed=0),
+    )
+    trainer.step(0)
+    assert captured["kwargs"] == {}
+
+
 # -- additional coverage: mutant-check requirements from the task-7 brief --
 # rather than in the literal Step 1 test block. See task-7-report.md for the
 # rationale and the explicit red-step-against-each-mutant evidence.

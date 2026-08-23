@@ -157,6 +157,87 @@ def test_build_reward_arm_defaults_match_documented_values():
     assert arm.tolerance == 50.0
 
 
+# ------------------------------------------------------- control arm (Addition 1)
+
+
+def test_arms_includes_control():
+    assert "control" in train_grpo.ARMS
+
+
+def test_control_is_not_an_arm_needing_a_novelty_index():
+    """The control arm's reward never reads the candidate at all -- see
+    ControlArm's docstring -- so it must not be wired to open a novelty
+    index, unlike validity/composite/constraint.
+    """
+    assert "control" not in train_grpo.ARMS_NEEDING_NOVELTY_INDEX
+
+
+def test_build_reward_arm_control_reads_seed_from_the_config():
+    arm = build_reward_arm("control", {"seed": 7})
+    assert arm.seed == 7
+
+
+def test_build_reward_arm_control_seed_defaults_to_zero():
+    arm = build_reward_arm("control", {})
+    assert arm.seed == 0
+
+
+def test_build_reward_arm_control_ignores_a_novelty_index_override():
+    """control is not in ARMS_NEEDING_NOVELTY_INDEX, so build_reward_arm must
+    not even try to resolve a novelty_index kwarg for it -- an override must
+    be silently unused, not raise TypeError('unexpected keyword').
+    """
+    arm = build_reward_arm("control", {"seed": 1}, novelty_index=object())
+    assert not hasattr(arm, "novelty_index") or arm.novelty_index is None
+
+
+# ------------------------------------------------- run_experiment_name (Addition 2)
+
+
+def test_run_experiment_name_seed_zero_is_unsuffixed():
+    """Backward compatibility: the in-flight results/grpo_accuracy/ run is
+    seed 0 and must keep its exact directory name.
+    """
+    assert train_grpo.run_experiment_name("grpo_accuracy", 0) == "grpo_accuracy"
+
+
+def test_run_experiment_name_nonzero_seed_gets_a_suffix():
+    assert train_grpo.run_experiment_name("grpo_accuracy", 1) == "grpo_accuracy_seed1"
+    assert train_grpo.run_experiment_name("grpo_accuracy", 7) == "grpo_accuracy_seed7"
+
+
+def test_main_seed_zero_keeps_the_suffixless_run_dir(monkeypatch, tmp_path):
+    sentinel = RuntimeError("stopped after load_frozen_baseline (by design)")
+
+    def _raise(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(train_grpo, "load_frozen_baseline", _raise)
+
+    with pytest.raises(RuntimeError, match="stopped after load_frozen_baseline"):
+        train_grpo.main([
+            "--arm", "accuracy", "--set", f"output.results_root={tmp_path}",
+        ])
+    assert (tmp_path / "grpo_accuracy").is_dir()
+    assert not (tmp_path / "grpo_accuracy_seed0").exists()
+
+
+def test_main_nonzero_seed_appends_seed_suffix_to_the_run_dir(monkeypatch, tmp_path):
+    sentinel = RuntimeError("stopped after load_frozen_baseline (by design)")
+
+    def _raise(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(train_grpo, "load_frozen_baseline", _raise)
+
+    with pytest.raises(RuntimeError, match="stopped after load_frozen_baseline"):
+        train_grpo.main([
+            "--arm", "accuracy", "--set", "seed=1", f"output.results_root={tmp_path}",
+        ])
+    assert (tmp_path / "grpo_accuracy_seed1").is_dir()
+    assert not (tmp_path / "grpo_accuracy").exists()
+
+
 def test_build_reward_arm_novelty_index_override_is_used_verbatim():
     class FakeIndex:
         def is_novel(self, psmiles):
@@ -491,7 +572,7 @@ def test_trainer_config_reads_drift_every_from_the_config():
 def test_every_shipped_arm_config_declares_a_drift_block():
     from polyt5.utils import load_config
 
-    for arm in ("accuracy", "validity", "composite", "constraint"):
+    for arm in ("accuracy", "validity", "composite", "constraint", "control"):
         cfg = load_config(REPO_ROOT / "configs" / "rl" / f"{arm}.yaml")
         assert "drift" in cfg, arm
         assert cfg["drift"]["enabled"] is True, arm

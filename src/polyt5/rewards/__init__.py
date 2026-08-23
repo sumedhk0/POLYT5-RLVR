@@ -21,6 +21,7 @@ from polyt5.rewards.composite import (
     ArmReward,
     CompositeArm,
     ConstraintArm,
+    ControlArm,
     ValidityArm,
     build_arm,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "ArmReward",
     "CompositeArm",
     "ConstraintArm",
+    "ControlArm",
     "RewardResult",
     "TgRewardConfig",
     "ValidityArm",

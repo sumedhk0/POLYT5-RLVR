@@ -1,18 +1,30 @@
-"""The four arms. Weights live in config, never in code.
+"""The four real arms, plus a negative control. Weights live in config, never
+in code.
 
-Every arm rejects a structure that RDKit cannot parse before scoring anything
-else: a structure that is not a polymer earns nothing on any axis. Three arms
-(accuracy, composite, constraint) apply the combined SV+PV validity gate up
-front and score the rest of their terms only on survivors. ``ValidityArm`` is
-the exception: its whole job is to *measure* the paper's nested SV -> TSD ->
-DD -> PV cascade, so it checks SV first but defers PV until after TSD and DD,
-in the cascade's own order - see its docstring.
+Every real arm rejects a structure that RDKit cannot parse before scoring
+anything else: a structure that is not a polymer earns nothing on any axis.
+Three arms (accuracy, composite, constraint) apply the combined SV+PV
+validity gate up front and score the rest of their terms only on survivors.
+``ValidityArm`` is the exception: its whole job is to *measure* the paper's
+nested SV -> TSD -> DD -> PV cascade, so it checks SV first but defers PV
+until after TSD and DD, in the cascade's own order - see its docstring.
+
+``ControlArm`` is not one of the four: it is the study's negative control,
+scoring every candidate with reward drawn uniformly at random from
+``[0, 1)``, independent of the candidate's content entirely - no gate, no
+chemistry, nothing read from ``pselfies`` at all. It exists to separate "this
+specific reward design changed the metrics" from "training against ANY
+reward signal changes the metrics, through RL mechanics alone" (entropy
+change, KL drift, sampling shift). See its own docstring for the full
+rationale and the three non-negotiable design points.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any, Protocol
+
+import numpy as np
 
 from polyt5.chemistry.canonicalization import canonical_psmiles
 from polyt5.chemistry.conversion import pselfies_to_psmiles
@@ -274,20 +286,109 @@ class ConstraintArm(_BaseArm):
         return out
 
 
+class ControlArm(_BaseArm):
+    """Negative control: reward is uniform random in ``[0, 1)``, independent
+    of the candidate entirely.
+
+    Purpose
+    -------
+    Every one of the four real arms' whole premise is "this specific reward
+    design changed what the policy learns to do". Nothing in a single GRPO
+    run against a single accuracy/validity/composite/constraint arm can
+    distinguish that claim from the alternative explanation that ANY reward
+    signal - however uninformative - moves the metrics
+    ``scripts/compare_arms.py`` reports (PV rate, diversity/duplicate rate,
+    property MAE, ...), purely through the mechanics of RL itself: entropy
+    change under repeated sampling, KL drift away from the frozen reference,
+    or a sampling-distribution shift that has nothing to do with what the
+    reward actually measures. This arm is the control for that confound: it
+    is trained through the exact same :class:`~polyt5.rl.trainer.GRPOTrainer`
+    loop as every other arm, on noise. If ``control``'s trained policy shows
+    apparent improvement on ANY reported metric, that is direct evidence that
+    an improvement in one of the other four arms is not, by itself,
+    attributable to that arm's reward design - it would need to be shown to
+    exceed what optimizing pure noise already produces. This arm has no
+    "metric it optimized": ``scripts/compare_arms.py``'s ``ARM_METRIC`` has
+    no entry for ``"control"``, so its row's ``success`` column is always
+    ``None`` - it did not win or lose, because it was not competing.
+
+    Three design points, none negotiable
+    -------------------------------------
+    * **Independent of the candidate's content.** Every other arm's
+      ``__call__`` starts by running :meth:`_BaseArm._prepare` (the SV+PV
+      gate) or :func:`~polyt5.chemistry.validity.validate_pselfies` directly.
+      This one does neither - it never reads ``pselfies`` at all, valid or
+      not. Gating invalid candidates to ``0.0`` here would make this
+      secretly a second validity arm, correlated with PV by construction,
+      not a control.
+    * **Reproducible, not merely random.** ``np.random.default_rng([seed,
+      step_index])`` - the SAME two-integer seeding
+      :meth:`~polyt5.rl.trainer.GRPOTrainer.step` uses for its own target
+      sampling (see that module's docstring) - so replaying step
+      ``step_index`` of a run with the same ``seed`` reproduces the exact
+      same rewards. The GLOBAL numpy RNG (``np.random.seed``/``np.random.
+      rand``) is never touched, so these draws cannot be perturbed by, or
+      accidentally perturb, anything else in the process that happens to use
+      the global generator.
+    * **Random, never constant.** A constant reward (e.g. always ``0.5``)
+      gives every group zero within-group variance, hence an advantage of
+      exactly ``0.0`` for every member (see
+      :func:`~polyt5.rl.advantages.group_advantages`) and therefore NO
+      policy gradient at all - only KL-anchored drift toward the reference.
+      That would test nothing: an inert arm cannot show whether RL mechanics
+      alone move the metrics, because RL's optimization step never actually
+      ran on anything. Uniform-random reward keeps real within-group
+      variance and therefore a real (if uninformative) gradient - the actual
+      control.
+
+    ``step_index`` is not part of the shared :class:`ArmReward` three-argument
+    contract - it is an extra, keyword-only argument this arm alone accepts.
+    :attr:`wants_step_index` is the duck-typed marker
+    :meth:`~polyt5.rl.trainer.GRPOTrainer.step` reads to know to pass it
+    through; every other arm's reward is a pure function of ``(candidates,
+    targets, predictions)`` and does not declare it. Called without
+    ``step_index`` (e.g. directly from a test, or from
+    ``scripts/compare_arms.py``, which has no training step index at all) it
+    defaults to ``0``.
+    """
+
+    #: Read by GRPOTrainer.step to decide whether to pass this call's
+    #: step_index through. False (the class default, via getattr) for every
+    #: other arm.
+    wants_step_index = True
+
+    def __init__(self, *, seed: int = 0, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.seed = int(seed)
+
+    def __call__(self, candidates, targets, predictions, *, step_index: int = 0):
+        # Zipped purely to validate alignment, matching every other arm's
+        # contract (e.g. ValidityArm.__call__) -- this arm reads none of the
+        # three sequences' actual content, only their common length.
+        for _ in zip(candidates, targets, predictions, strict=True):
+            pass
+        rng = np.random.default_rng([self.seed, int(step_index)])
+        draws = rng.uniform(0.0, 1.0, size=len(candidates))
+        return [RewardResult(float(value), {"control": float(value)}) for value in draws]
+
+
 _ARMS = {"accuracy": AccuracyArm, "validity": ValidityArm,
-         "composite": CompositeArm, "constraint": ConstraintArm}
+         "composite": CompositeArm, "constraint": ConstraintArm,
+         "control": ControlArm}
 
 
 def build_arm(name: str, **kwargs: Any) -> ArmReward:
     """Construct an arm by name.
 
     Args:
-        name: One of ``accuracy``, ``validity``, ``composite``, ``constraint``.
+        name: One of ``accuracy``, ``validity``, ``composite``, ``constraint``,
+            ``control``.
         **kwargs: Passed to the arm - ``novelty_index``, ``tolerance``,
             ``sa_max``, ``tg_config``, ``ensemble_size``, and for composite,
             ``weights``. Any arm reading the Tg term MUST be given the
             ``ensemble_size`` of the predictor whose triples it will receive;
-            see :class:`_BaseArm`.
+            see :class:`_BaseArm`. ``control`` additionally reads ``seed``
+            (default ``0``) - see :class:`ControlArm`.
 
     Raises:
         ValueError: On an unknown arm name.

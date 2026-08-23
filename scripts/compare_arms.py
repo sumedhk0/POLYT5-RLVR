@@ -181,6 +181,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -210,12 +211,17 @@ from train_grpo import (  # noqa: E402
     load_drift_reference,
     load_frozen_baseline,
     load_verified_model,
+    run_experiment_name,
     sha256_of_file,
     verify_artifact,
 )
 
-#: The four Phase-3 arms this script can score, in the paper's C1-C4 order.
-RLVR_ARMS: tuple[str, ...] = ("accuracy", "validity", "composite", "constraint")
+#: The four Phase-3 arms this script can score, in the paper's C1-C4 order,
+#: plus the ``control`` negative control (Addition 1 -- see
+#: ``polyt5.rewards.composite.ControlArm``). ``control`` has no entry in
+#: :data:`ARM_METRIC`: it optimizes nothing, so its matrix row's ``success``
+#: is always ``None``/N-A, exactly like arm_a/arm_b's.
+RLVR_ARMS: tuple[str, ...] = ("accuracy", "validity", "composite", "constraint", "control")
 
 #: Default novelty index (see ``scripts/train_grpo.py``'s copy of this constant
 #: -- deliberately not imported from there, so a change to what an ARM trains
@@ -280,8 +286,16 @@ BOOTSTRAP_SEED = 0
 #: the module docstring) are DIAGNOSTIC / provenance columns computed
 #: identically for every row, arm_a's and arm_b's included -- they are never
 #: read by :data:`ARM_METRIC` or :func:`apply_success_criterion`.
+#:
+#: ``seed`` (Addition 2: multi-seed support) is the training seed that
+#: produced an RLVR row's checkpoint -- ``None`` for arm_a/arm_b, which are
+#: not GRPO-trained runs at all. An arm can now have more than one row (one
+#: per discovered seed under its run directory, see
+#: :func:`discover_seed_runs`); :func:`compute_seed_aggregates` groups them
+#: back together by ``arm`` and reports mean +/- sd across seeds, alongside
+#: (not instead of) these existing per-run columns.
 MATRIX_COLUMNS: tuple[str, ...] = (
-    "arm", "kind", "checkpoint", "checkpoint_sha256", "temperature", "top_p",
+    "arm", "kind", "checkpoint", "checkpoint_sha256", "seed", "temperature", "top_p",
     "sampling_matches_arm_b", "n_requested",
     "n_sv", "sv_rate", "n_tsd", "tsd_rate", "n_dd", "dd_rate", "n_pv", "pv_rate",
     "sr_rate", "duplicate_rate", "max_tanimoto_mean", "near_copy_fraction", "mean_length",
@@ -305,6 +319,51 @@ MATRIX_COLUMNS: tuple[str, ...] = (
 #: 1500-element list per metric per predictor, not a cell) and stripped before
 #: ``summary.json`` is written.
 SAMPLES_KEY = "_metric_samples"
+
+# ---------------------------------------------------------------- multi-seed (Addition 2)
+#
+# Today each arm runs once and apply_success_criterion's bootstrap captures
+# sampling noise WITHIN that one run's candidates -- it says nothing about
+# RUN-TO-RUN variance from training the same arm at a different seed. The
+# functions below add a second, independent axis of aggregation on top of
+# (not instead of) the existing per-row bootstrap columns: group every row an
+# arm has -- one per discovered training seed -- back together, and report
+# each metric's mean +/- sample sd ACROSS those seeds, plus an across-seed
+# success verdict that compares the arm's across-seed MEAN against arm_b by
+# the same pre-registered min_margin. There is deliberately no bootstrap
+# here: 1-3 independent training runs cannot support a second, seed-level
+# bootstrap the way ~1500 candidates can support one over sampling noise.
+
+#: Bookkeeping / identity / verdict columns excluded from cross-seed mean+-sd
+#: aggregation (see :func:`compute_seed_aggregates`) -- everything else in
+#: :data:`MATRIX_COLUMNS` is a per-row MEASURED quantity and gets aggregated.
+#: Derived by exclusion, not a second hand-maintained list, for the same
+#: reason :func:`skipped_arm_row` derives from :data:`MATRIX_COLUMNS`: a
+#: hand-maintained list drifts the moment a column is added.
+_SEED_AGGREGATE_EXCLUDE: frozenset[str] = frozenset({
+    "arm", "kind", "checkpoint", "checkpoint_sha256", "seed", "temperature", "top_p",
+    "sampling_matches_arm_b", "n_requested", "novelty_index_sha256",
+    "accuracy_reward_config_sha256", "composite_reward_config_sha256",
+    "constraint_reward_config_sha256", "optimized_metric", "optimized_min_margin",
+    "optimized_value_auditor", "optimized_value_ensemble",
+    "delta_ensemble", "delta_ensemble_ci_low", "delta_ensemble_ci_high",
+    "delta_auditor", "delta_auditor_ci_low", "delta_auditor_ci_high",
+    "beats_arm_b", "survives_audit", "success",
+})
+
+#: Every MATRIX_COLUMNS cell that is a measured quantity, in order --
+#: :func:`compute_seed_aggregates` computes a cross-seed :func:`_seed_stat`
+#: for each one. Deliberately not limited to an arm's own OPTIMIZED metric:
+#: if the negative control (``control``, which optimizes nothing) shows
+#: apparent improvement in ``pv_rate``, ``duplicate_rate``, or any other
+#: column here, that is the diagnostic ControlArm's docstring describes.
+SEED_AGGREGATE_METRICS: tuple[str, ...] = tuple(
+    column for column in MATRIX_COLUMNS if column not in _SEED_AGGREGATE_EXCLUDE
+)
+
+#: Matches a run directory's ``_seed<N>`` suffix (see
+#: ``train_grpo.run_experiment_name``).
+_SEED_SUFFIX_RE = re.compile(r"_seed(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -570,17 +629,97 @@ def _latest_checkpoint(run_dir: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger):
+def resolve_arm_run_dir(
+    arm_name: str, results_root: Path, *, seed: int = 0,
+    repo_cfg: dict[str, Any] | None = None,
+) -> Path:
+    """The run directory ``train_grpo.py`` created for ``(arm_name, seed)``.
+
+    Mirrors ``train_grpo.run_experiment_name`` exactly (seed 0 keeps the base
+    name unsuffixed, matching every run directory that existed before
+    multi-seed support did): the two must never drift apart, or this script
+    would look in a directory ``train_grpo.py`` never wrote to.
+
+    Args:
+        arm_name: One of :data:`RLVR_ARMS`.
+        results_root: Root results directory (``results/`` by default).
+        seed: The training seed. ``0`` (the default) resolves to the exact
+            same path this function always resolved to before multi-seed
+            support existed.
+        repo_cfg: The arm's own ``configs/rl/<arm>.yaml``, already loaded --
+            passed by callers (:func:`discover_seed_runs`,
+            :func:`load_rlvr_arm_model`) that already have it, so this
+            function does not re-read the file on every seed. Loaded here
+            when omitted.
+
+    Returns:
+        ``<results_root>/<base_name>`` (seed 0) or
+        ``<results_root>/<base_name>_seed<N>`` (seed N), where ``base_name``
+        is ``repo_cfg["experiment_name"]`` or ``f"grpo_{arm_name}"``.
+    """
+    if repo_cfg is None:
+        repo_cfg = load_config(REPO_ROOT / "configs" / "rl" / f"{arm_name}.yaml")
+    base_name = repo_cfg.get("experiment_name") or f"grpo_{arm_name}"
+    return _resolve(results_root) / run_experiment_name(base_name, seed)
+
+
+def discover_seed_runs(
+    arm_name: str, results_root: Path, *, repo_cfg: dict[str, Any] | None = None,
+) -> list[tuple[int, Path]]:
+    """Every ``(seed, run_dir)`` pair this arm has a run directory for, sorted by seed.
+
+    Backward compatible with a pre-multi-seed run: a directory with no
+    ``_seedN`` suffix -- e.g. the in-flight ``results/grpo_accuracy/`` -- is
+    discovered as seed 0, exactly where :func:`resolve_arm_run_dir` (seed 0)
+    would look for it. An arm that was never trained at all returns ``[]``,
+    not an error.
+
+    Args:
+        arm_name: One of :data:`RLVR_ARMS`.
+        results_root: Root results directory (``results/`` by default).
+        repo_cfg: The arm's own ``configs/rl/<arm>.yaml``, already loaded, or
+            ``None`` to load it here.
+
+    Returns:
+        ``[(seed, run_dir), ...]`` sorted by seed ascending. A directory is
+        included whether or not it actually holds a checkpoint yet --
+        :func:`load_rlvr_arm_model` is what decides "not trained yet" and
+        skips it; this function only reports what directories exist.
+    """
+    if repo_cfg is None:
+        repo_cfg = load_config(REPO_ROOT / "configs" / "rl" / f"{arm_name}.yaml")
+    base_name = repo_cfg.get("experiment_name") or f"grpo_{arm_name}"
+    root = _resolve(results_root)
+
+    found: dict[int, Path] = {}
+    seed0_dir = root / base_name
+    if seed0_dir.is_dir():
+        found[0] = seed0_dir
+    if root.is_dir():
+        for candidate in root.glob(f"{base_name}_seed*"):
+            if not candidate.is_dir():
+                continue
+            match = _SEED_SUFFIX_RE.search(candidate.name)
+            if match is None:
+                continue
+            found[int(match.group(1))] = candidate
+    return sorted(found.items())
+
+
+def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger, *, seed: int = 0):
     """Load an RLVR arm's trained policy, plus the temperature/top_p it actually trained with.
 
     Args:
         arm_name: One of :data:`RLVR_ARMS`.
         results_root: Root results directory (``results/`` by default); the
-            arm's run directory is looked up as ``<results_root>/grpo_<arm>``.
+            arm's run directory is looked up via :func:`resolve_arm_run_dir`.
         tokenizer: The tokenizer this comparison is scoring with -- the
             checkpoint's own recorded ``tokenizer_sha256`` is checked against
             it.
         logger: Where to report what was found or why an arm was skipped.
+        seed: Which training seed's run directory to load (Addition 2).
+            ``0`` (the default) resolves to exactly the same directory this
+            function always loaded before multi-seed support existed.
 
     Returns:
         ``(model, checkpoint_path, checkpoint_sha256, SweepPoint)``, or
@@ -595,13 +734,12 @@ def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger):
 
     repo_config_path = REPO_ROOT / "configs" / "rl" / f"{arm_name}.yaml"
     repo_cfg = load_config(repo_config_path)
-    experiment_name = repo_cfg.get("experiment_name") or f"grpo_{arm_name}"
-    run_dir = _resolve(results_root) / experiment_name
+    run_dir = resolve_arm_run_dir(arm_name, results_root, seed=seed, repo_cfg=repo_cfg)
 
     checkpoint_path = _latest_checkpoint(run_dir)
     if checkpoint_path is None:
-        logger.warning("arm %s: no checkpoint under %s -- skipping (not trained yet)",
-                       arm_name, run_dir / "checkpoints")
+        logger.warning("arm %s seed %d: no checkpoint under %s -- skipping (not trained yet)",
+                       arm_name, seed, run_dir / "checkpoints")
         return None
 
     # The RUN's own resolved config -- not the repo default -- is what
@@ -651,6 +789,7 @@ def evaluate_arm(
     device, batch_size: int, max_length: int, seed: int,
     tolerance: float, checkpoint_label: str | None, checkpoint_sha256: str | None,
     novelty_index_sha256: str | None, reward_config_sha256: dict[str, str],
+    run_seed: int | None = None,
 ) -> dict[str, Any]:
     """Sample, screen and score one arm under the fixed protocol.
 
@@ -700,6 +839,11 @@ def evaluate_arm(
             ``configs/rl/*.yaml`` files ``auditor_scorers`` /
             ``ensemble_scorers`` were built from (:func:`hash_reward_configs`),
             recorded verbatim on every row for pre-registration provenance.
+        run_seed: The training seed whose checkpoint ``model`` is (Addition
+            2) -- recorded verbatim as the row's ``seed`` column, so
+            :func:`compute_seed_aggregates` can group an arm's rows back
+            together by seed. ``None`` (the default) for arm_a/arm_b, which
+            are not GRPO-trained runs and therefore have no training seed.
 
     Returns:
         One flat row dict, matching :data:`MATRIX_COLUMNS` minus the verdict
@@ -789,6 +933,7 @@ def evaluate_arm(
         "kind": kind,
         "checkpoint": checkpoint_label,
         "checkpoint_sha256": checkpoint_sha256,
+        "seed": run_seed,
         "temperature": point.temperature,
         "top_p": point.top_p,
         "n_requested": n_samples,
@@ -1004,6 +1149,231 @@ def skipped_arm_row(arm_name: str) -> dict[str, Any]:
         "optimized_min_margin": ARM_MIN_MARGIN.get(arm_name),
     })
     return row
+
+
+def _seed_stat(values: Sequence[Any]) -> dict[str, Any]:
+    """Mean +/- sample sd of one metric's per-seed values (Addition 2).
+
+    ``sd`` is ``None`` -- never a fabricated ``0.0`` -- whenever fewer than
+    two finite values are available: a single training run has no
+    run-to-run variance to report, and printing a spread of zero would claim
+    a repeat-run agreement that was never measured. ``note`` states the seed
+    count in words for exactly that case (``"1 seed"``/``"0 seeds"``), so a
+    reader of the matrix cannot mistake "not measured" for "measured and
+    found to be zero".
+
+    Args:
+        values: One value per seed, in whatever order the caller collected
+            them (``None`` entries -- an arm's row missing this column --
+            are dropped, not treated as ``0.0``).
+
+    Returns:
+        ``{"n_seeds", "mean", "sd", "note", "values"}``.
+    """
+    finite = [float(v) for v in values if v is not None]
+    n = len(finite)
+    if n == 0:
+        return {"n_seeds": 0, "mean": None, "sd": None, "note": "0 seeds", "values": []}
+    mean = _mean(finite)
+    if n == 1:
+        return {"n_seeds": 1, "mean": mean, "sd": None, "note": "1 seed", "values": finite}
+    sd = float(np.std(np.asarray(finite, dtype=float), ddof=1))
+    return {"n_seeds": n, "mean": mean, "sd": sd, "note": f"{n} seeds", "values": finite}
+
+
+def _across_seed_clause(
+    own_mean: float | None, base_value: Any, *, direction: str, min_margin: float,
+) -> tuple[bool | None, float | None]:
+    """One clause of the across-seed success criterion (Addition 2).
+
+    Mirrors :func:`_clause`'s sign convention (positive delta always means
+    "better than arm_b") without the bootstrap: an arm trained at 1-3 seeds
+    has too few independent runs to support a second, seed-level bootstrap
+    the way ~1500 candidates support one over sampling noise within a run
+    (see ``frozen_baseline.json``'s ``success_criterion_across_seeds``).
+
+    Args:
+        own_mean: The arm's across-seed mean of one metric column (a
+            :func:`_seed_stat` result's ``"mean"``), or ``None`` if unmeasured.
+        base_value: arm_b's own (single-run) value of the SAME metric column.
+        direction: ``"higher"`` or ``"lower"``.
+        min_margin: The pre-registered minimum effect size.
+
+    Returns:
+        ``(verdict, delta)`` -- ``verdict`` is ``None``, not ``False``, when
+        either side is unmeasured.
+    """
+    if own_mean is None or base_value is None:
+        return None, None
+    sign = 1.0 if direction == "higher" else -1.0
+    delta = sign * (float(own_mean) - float(base_value))
+    return bool(delta >= min_margin), delta
+
+
+def compute_seed_aggregates(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Group RLVR rows by arm and report mean +/- sd across seeds, per metric.
+
+    Complements, and does NOT replace, :func:`apply_success_criterion`'s
+    per-row bootstrap-over-candidates clauses (still computed on every row,
+    seed included -- see :data:`MATRIX_COLUMNS`' ``delta_*``/``beats_arm_b``/
+    ``survives_audit``/``success`` columns): that bootstrap answers "is this
+    ONE seed's candidate sample distinguishable from arm_b's", a question
+    about SAMPLING noise within a single run. This function answers a
+    different one -- "does the arm's own run-to-run variance across
+    INDEPENDENT TRAINING SEEDS still show the improvement" -- which no
+    amount of bootstrapping a single run's candidates can answer, since
+    every candidate in that run shares the same trained checkpoint.
+
+    Args:
+        rows: Every row :func:`evaluate_arm`/:func:`skipped_arm_row`
+            produced, arm_a's and arm_b's included. Only rows with
+            ``kind == "rlvr"`` and an actual checkpoint (i.e. NOT a
+            :func:`skipped_arm_row` placeholder, whose ``checkpoint`` is
+            always ``None``) are grouped; an arm with zero trained seeds is
+            simply absent from the result.
+
+    Returns:
+        ``{arm_name: {"n_seeds", "seeds", "optimized_metric", "min_margin",
+        "metrics": {column: _seed_stat(...) for column in
+        SEED_AGGREGATE_METRICS}, "across_seed_beats_arm_b",
+        "across_seed_delta_ensemble", "across_seed_survives_audit",
+        "across_seed_delta_auditor", "across_seed_success"}}``. The verdict
+        keys are ``None`` for an arm with no entry in :data:`ARM_METRIC`
+        (``control`` -- see its docstring: optimizing nothing means nothing
+        can beat or lose to arm_b) and ``across_seed_success`` is ``None``
+        whenever any one of the arm's seeds was not sampled at arm_b's
+        operating point (mirrors :func:`apply_success_criterion`'s own
+        ``sampling_matches_arm_b`` refusal, extended across every seed).
+    """
+    trained = [
+        row for row in rows
+        if row.get("kind") == "rlvr" and row.get("checkpoint") is not None
+    ]
+    by_arm: dict[str, list[dict[str, Any]]] = {}
+    for row in trained:
+        by_arm.setdefault(row["arm"], []).append(row)
+
+    arm_b = next((row for row in rows if row.get("arm") == "arm_b"), None)
+
+    aggregates: dict[str, dict[str, Any]] = {}
+    for arm_name, arm_rows in by_arm.items():
+        seeds = sorted(row["seed"] for row in arm_rows if row.get("seed") is not None)
+        metrics = {
+            column: _seed_stat([row.get(column) for row in arm_rows])
+            for column in SEED_AGGREGATE_METRICS
+        }
+        metric_name, direction = ARM_METRIC.get(arm_name, (None, None))
+        entry: dict[str, Any] = {
+            "n_seeds": len(arm_rows), "seeds": seeds, "metrics": metrics,
+            "optimized_metric": metric_name, "min_margin": ARM_MIN_MARGIN.get(arm_name),
+        }
+
+        if metric_name is None or arm_b is None:
+            entry["across_seed_beats_arm_b"] = None
+            entry["across_seed_delta_ensemble"] = None
+            entry["across_seed_survives_audit"] = None
+            entry["across_seed_delta_auditor"] = None
+            entry["across_seed_success"] = None
+            aggregates[arm_name] = entry
+            continue
+
+        min_margin = float(ARM_MIN_MARGIN.get(arm_name, 0.0))
+        all_match = all(row.get("sampling_matches_arm_b") for row in arm_rows)
+
+        ensemble_column = _metric_column(metric_name, "ensemble")
+        beats, delta_ensemble = _across_seed_clause(
+            metrics[ensemble_column]["mean"], arm_b.get(ensemble_column),
+            direction=direction, min_margin=min_margin,
+        )
+        entry["across_seed_beats_arm_b"] = beats
+        entry["across_seed_delta_ensemble"] = delta_ensemble
+
+        if metric_name in STRUCTURAL_METRICS:
+            audit_clause: Any = True
+            entry["across_seed_survives_audit"] = STRUCTURAL_AUDIT_NOTE
+            entry["across_seed_delta_auditor"] = None
+        else:
+            auditor_column = _metric_column(metric_name, "auditor")
+            audit_clause, delta_auditor = _across_seed_clause(
+                metrics[auditor_column]["mean"], arm_b.get(auditor_column),
+                direction=direction, min_margin=min_margin,
+            )
+            entry["across_seed_survives_audit"] = audit_clause
+            entry["across_seed_delta_auditor"] = delta_auditor
+
+        if beats is None or audit_clause is None:
+            entry["across_seed_success"] = None
+        elif not all_match:
+            # Refused, not failed -- mirrors apply_success_criterion's own
+            # sampling_matches_arm_b handling: an incomparable operating
+            # point says nothing about whether the arm worked.
+            entry["across_seed_success"] = None
+        else:
+            entry["across_seed_success"] = bool(beats and audit_clause)
+
+        aggregates[arm_name] = entry
+
+    return aggregates
+
+
+def format_seed_summary_markdown(aggregates: dict[str, dict[str, Any]]) -> str:
+    """Render :func:`compute_seed_aggregates`' output as a markdown table.
+
+    One row per RLVR arm with at least one trained seed, reporting its
+    OPTIMIZED metric's across-seed mean and spread (ensemble and auditor),
+    the seed count, and the across-seed verdict. An arm with exactly one
+    seed reports its spread as the literal ``"1 seed"``, never a fabricated
+    ``0.0`` -- a single run has no run-to-run variance to report. ``control``
+    (and any arm with no entry in :data:`ARM_METRIC`) reports ``"n/a"`` for
+    the metric/verdict columns -- see :func:`compute_seed_aggregates`.
+
+    Args:
+        aggregates: :func:`compute_seed_aggregates`'s return value.
+
+    Returns:
+        Markdown text (a heading plus a table), or just the heading if
+        ``aggregates`` is empty -- never raises on an empty input.
+    """
+    header = ("| arm | optimized_metric | n_seeds | seeds | mean_ensemble | "
+              "spread_ensemble | mean_auditor | spread_auditor | "
+              "across_seed_beats_arm_b | across_seed_survives_audit | "
+              "across_seed_success |")
+    sep = "|" + "|".join("---:" for _ in range(11)) + "|"
+    lines = ["", "### Cross-seed summary", "", header, sep]
+    for arm_name, entry in aggregates.items():
+        metric_name = entry.get("optimized_metric")
+        ensemble_stat = (
+            entry["metrics"].get(_metric_column(metric_name, "ensemble")) if metric_name else None
+        )
+        auditor_stat = (
+            entry["metrics"].get(_metric_column(metric_name, "auditor")) if metric_name else None
+        )
+        seeds_cell = ",".join(str(s) for s in entry["seeds"]) if entry["seeds"] else "n/a"
+        lines.append("| " + " | ".join([
+            str(arm_name),
+            metric_name or "n/a",
+            str(entry["n_seeds"]),
+            seeds_cell,
+            _format_cell(ensemble_stat["mean"] if ensemble_stat else None),
+            _format_seed_spread(ensemble_stat),
+            _format_cell(auditor_stat["mean"] if auditor_stat else None),
+            _format_seed_spread(auditor_stat),
+            _format_cell(entry.get("across_seed_beats_arm_b")),
+            _format_cell(entry.get("across_seed_survives_audit")),
+            _format_cell(entry.get("across_seed_success")),
+        ]) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _format_seed_spread(stat: dict[str, Any] | None) -> str:
+    """Render a :func:`_seed_stat`'s ``sd`` -- ``"1 seed"``, never a
+    fabricated ``"0.0000"``, when fewer than two seeds were measured.
+    """
+    if stat is None:
+        return "n/a"
+    if stat["n_seeds"] <= 1:
+        return stat["note"]
+    return _format_cell(stat["sd"])
 
 
 def write_matrix_csv(rows: list[dict[str, Any]], path: Path) -> Path:
@@ -1259,25 +1629,53 @@ def main(argv: list[str] | None = None) -> int:
         rows.append(row)
 
     for arm_name in args.arms:
-        loaded = load_rlvr_arm_model(arm_name, args.results_root, tokenizer, logger)
-        if loaded is None:
+        # Addition 2: an arm can now have more than one trained seed under
+        # its base run directory -- discover every one of them (seed 0
+        # included, suffix-less, for backward compatibility with runs
+        # started before multi-seed support existed) and evaluate each as
+        # its own row, rather than only ever looking at a single directory.
+        arm_repo_cfg = load_config(REPO_ROOT / "configs" / "rl" / f"{arm_name}.yaml")
+        seed_runs = discover_seed_runs(arm_name, args.results_root, repo_cfg=arm_repo_cfg)
+        if not seed_runs:
+            logger.warning("arm %s: no run directory found under %s (any seed) -- skipping",
+                           arm_name, args.results_root)
             rows.append(skipped_arm_row(arm_name))
             continue
-        model, checkpoint_path, checkpoint_sha256, point = loaded
-        row = evaluate_arm(
-            model, tokenizer, arm_key=arm_name, label=f"Arm {arm_name}", kind="rlvr",
-            point=point, targets=targets, n_samples=n_samples, training_index=training_index,
-            auditor=auditor, ensemble=ensemble, auditor_scorers=auditor_scorers,
-            ensemble_scorers=ensemble_scorers, similarity_monitor=similarity_monitor,
-            device=device, batch_size=args.batch_size,
-            max_length=args.max_length, seed=args.seed, tolerance=tolerance,
-            checkpoint_label=str(checkpoint_path), checkpoint_sha256=checkpoint_sha256,
-            novelty_index_sha256=novelty_index_sha256,
-            reward_config_sha256=reward_config_sha256,
-        )
-        rows.append(row)
+
+        arm_rows: list[dict[str, Any]] = []
+        for run_seed, _run_dir in seed_runs:
+            loaded = load_rlvr_arm_model(
+                arm_name, args.results_root, tokenizer, logger, seed=run_seed)
+            if loaded is None:
+                continue
+            model, checkpoint_path, checkpoint_sha256, point = loaded
+            label = f"Arm {arm_name}" if run_seed == 0 else f"Arm {arm_name} (seed {run_seed})"
+            row = evaluate_arm(
+                model, tokenizer, arm_key=arm_name, label=label, kind="rlvr",
+                point=point, targets=targets, n_samples=n_samples,
+                training_index=training_index,
+                auditor=auditor, ensemble=ensemble, auditor_scorers=auditor_scorers,
+                ensemble_scorers=ensemble_scorers, similarity_monitor=similarity_monitor,
+                device=device, batch_size=args.batch_size,
+                max_length=args.max_length, seed=args.seed, tolerance=tolerance,
+                checkpoint_label=str(checkpoint_path), checkpoint_sha256=checkpoint_sha256,
+                novelty_index_sha256=novelty_index_sha256,
+                reward_config_sha256=reward_config_sha256,
+                run_seed=run_seed,
+            )
+            arm_rows.append(row)
+
+        if not arm_rows:
+            rows.append(skipped_arm_row(arm_name))
+            continue
+        rows.extend(arm_rows)
 
     apply_success_criterion(rows)
+    # Addition 2: a SECOND, independent axis of aggregation on top of (not
+    # instead of) the per-row bootstrap apply_success_criterion just filled
+    # in -- see compute_seed_aggregates' own docstring for why the two ask
+    # different questions.
+    seed_aggregates = compute_seed_aggregates(rows)
 
     for row in rows:
         if row.get("kind") == "rlvr" and row.get("sampling_matches_arm_b") is False:
@@ -1292,6 +1690,9 @@ def main(argv: list[str] | None = None) -> int:
 
     csv_path = write_matrix_csv(rows, run_dir.root / "matrix.csv")
     md_path = write_matrix_markdown(rows, run_dir.root / "matrix.md")
+    if seed_aggregates:
+        with md_path.open("a", encoding="utf-8") as handle:
+            handle.write(format_seed_summary_markdown(seed_aggregates))
     # The per-candidate sample vectors are ~1500 floats per metric per
     # predictor per row; they exist for the bootstrap, not for the record.
     summary_rows = [{k: v for k, v in row.items() if k != SAMPLES_KEY} for row in rows]
@@ -1310,6 +1711,14 @@ def main(argv: list[str] | None = None) -> int:
             "rule": "clause holds iff delta >= min_margin AND ci_low > 0; success also "
                     "requires sampling_matches_arm_b",
         },
+        # Addition 2: a second, independent axis of aggregation across
+        # INDEPENDENT TRAINING SEEDS, alongside (not instead of) the
+        # per-candidate bootstrap above -- see compute_seed_aggregates' own
+        # docstring, and frozen_baseline.json's success_criterion_across_seeds
+        # for the pre-registered rule. Each arm entry's "n_seeds" is the seed
+        # count this run was requested to record.
+        "success_criterion_across_seeds": frozen.get("success_criterion_across_seeds"),
+        "seed_aggregates": seed_aggregates,
         "evaluation_protocol": {"targets_k": targets, "n_per_target": n_per_target,
                                 "n_samples": n_samples, "tolerance": tolerance},
         "novelty_index": {"path": str(novelty_path), "sha256": novelty_index_sha256,
@@ -1354,6 +1763,14 @@ def main(argv: list[str] | None = None) -> int:
                   f"ci=[{row.get('delta_ensemble_ci_low')}, "
                   f"{row.get('delta_ensemble_ci_high')}] "
                   f"sampling_matches_arm_b={row.get('sampling_matches_arm_b')}")
+    for arm_name, entry in seed_aggregates.items():
+        metric_name = entry.get("optimized_metric")
+        ensemble_col = _metric_column(metric_name, "ensemble") if metric_name else None
+        stat = entry["metrics"].get(ensemble_col) if ensemble_col else None
+        spread_note = stat["note"] if stat else "n/a"
+        print(f"  {arm_name:<12} across_seed_success={entry.get('across_seed_success')} "
+              f"n_seeds={entry['n_seeds']} seeds={entry['seeds']} "
+              f"spread=[{spread_note}]")
     return 0
 
 

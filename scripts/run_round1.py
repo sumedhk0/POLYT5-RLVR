@@ -13,9 +13,25 @@ a stalled GPU job that silently hands off to the next arm would burn the rest of
 the budget producing nothing, which is exactly the failure this study cannot
 afford to discover late.
 
+Multi-seed chaining (Addition 2)
+---------------------------------
+``--seeds`` chains every arm in ``--then`` across more than one training seed,
+seed-OUTER / arm-INNER: every arm in ``--then`` finishes seed 0 before ANY arm
+starts seed 1, so an early ``scripts/compare_arms.py`` run after just the first
+pass already has a comparable row for every requested arm, rather than a full
+multi-seed picture for only the first arm. Defaults to ``[0]`` -- today's
+single-seed behaviour, unchanged (same command line, same log file name)
+unless ``--seeds`` is actually passed. Seed 0 is never given ``--set seed=0``
+on the ``train_grpo.py`` command line (matching ``configs/rl/*.yaml``'s own
+``seed: 0``); every other seed gets ``--set seed=<N>``, which
+``train_grpo.run_experiment_name`` (mirrored here by :func:`run_dir_for`)
+turns into a ``results/grpo_<arm>_seed<N>/`` run directory distinct from every
+other seed's.
+
 Usage::
 
     python scripts/run_round1.py --wait-for accuracy --then validity composite constraint
+    python scripts/run_round1.py --then accuracy validity composite constraint --seeds 0 1 2
 """
 
 from __future__ import annotations
@@ -31,13 +47,26 @@ REPO = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 
 
-def run_dir_for(arm: str) -> Path:
-    return REPO / "results" / f"grpo_{arm}"
+def _run_experiment_name(arm: str, seed: int) -> str:
+    """Mirrors ``train_grpo.run_experiment_name`` without importing it.
+
+    ``train_grpo.py`` imports ``torch``/``rdkit`` at module level; this
+    driver's whole job is polling small files and spawning subprocesses, so
+    it deliberately never imports that module -- see
+    ``test_run_dir_for_matches_train_grpo_run_experiment_name`` for the test
+    that pins the two functions together so they cannot silently drift.
+    """
+    base = f"grpo_{arm}"
+    return base if seed == 0 else f"{base}_seed{seed}"
 
 
-def last_step(arm: str) -> int | None:
+def run_dir_for(arm: str, seed: int = 0) -> Path:
+    return REPO / "results" / _run_experiment_name(arm, seed)
+
+
+def last_step(arm: str, seed: int = 0) -> int | None:
     """Highest step recorded in an arm's metrics.csv, or None if unreadable."""
-    path = run_dir_for(arm) / "metrics.csv"
+    path = run_dir_for(arm, seed) / "metrics.csv"
     if not path.exists():
         return None
     try:
@@ -118,20 +147,33 @@ def wait_for(arm: str, *, target_steps: int, stall_seconds: float, poll: float) 
         return False
 
 
-def train(arm: str) -> bool:
-    """Run one arm to completion. False on a non-zero exit."""
-    log_path = REPO / "results" / f"rl_{arm}_round1.log"
-    print(f"[driver] starting arm={arm} -> {log_path}", flush=True)
+def train(arm: str, seed: int = 0) -> bool:
+    """Run one arm, at one seed, to completion. False on a non-zero exit.
+
+    ``seed == 0`` (the default) issues EXACTLY the command line and log file
+    name this function always used before multi-seed support existed --
+    ``train_grpo.py`` is never given ``--set seed=0`` explicitly, matching
+    every ``configs/rl/*.yaml``'s own ``seed: 0``. Every other seed appends
+    ``--set seed=<N>``, which lands in ``results/grpo_<arm>_seed<N>/`` (see
+    ``run_dir_for`` / ``train_grpo.run_experiment_name``).
+    """
+    label = arm if seed == 0 else f"{arm} (seed {seed})"
+    log_name = f"rl_{arm}_round1.log" if seed == 0 else f"rl_{arm}_seed{seed}_round1.log"
+    log_path = REPO / "results" / log_name
+    cmd = [PYTHON, "-u", str(REPO / "scripts" / "train_grpo.py"), "--arm", arm]
+    if seed != 0:
+        cmd += ["--set", f"seed={seed}"]
+    print(f"[driver] starting arm={label} -> {log_path}", flush=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
         completed = subprocess.run(
-            [PYTHON, "-u", str(REPO / "scripts" / "train_grpo.py"), "--arm", arm],
-            stdout=log, stderr=subprocess.STDOUT, cwd=REPO, check=False,
+            cmd, stdout=log, stderr=subprocess.STDOUT, cwd=REPO, check=False,
         )
     if completed.returncode != 0:
-        print(f"[driver] ABORT: arm={arm} exited {completed.returncode}; "
+        print(f"[driver] ABORT: arm={label} exited {completed.returncode}; "
               f"see {log_path}. Remaining arms not started.", flush=True)
         return False
-    print(f"[driver] arm={arm} finished", flush=True)
+    print(f"[driver] arm={label} finished", flush=True)
     return True
 
 
@@ -145,6 +187,12 @@ def main() -> int:
     parser.add_argument("--stall-minutes", type=float, default=45.0,
                         help="Treat the waited-for arm as dead after this long with no new step.")
     parser.add_argument("--poll-seconds", type=float, default=120.0)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0],
+                        help="Seeds to chain every arm in --then across, seed-outer / "
+                             "arm-inner (every arm finishes seed 0 before any arm starts "
+                             "seed 1). Defaults to [0] -- today's single-seed behaviour, "
+                             "with an identical train_grpo.py command line and log file "
+                             "name to before this flag existed.")
     args = parser.parse_args()
 
     if args.wait_for and not wait_for(
@@ -155,11 +203,13 @@ def main() -> int:
     ):
         return 1
 
-    for arm in args.then:
-        if not train(arm):
-            return 1
+    for seed in args.seeds:
+        for arm in args.then:
+            if not train(arm, seed):
+                return 1
 
-    print(f"[driver] round 1 complete: {', '.join(args.then)}", flush=True)
+    print(f"[driver] round 1 complete: {', '.join(args.then)} across seeds {args.seeds}",
+          flush=True)
     return 0
 
 

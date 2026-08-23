@@ -425,3 +425,160 @@ def test_sa_reward_is_no_longer_a_public_symbol():
 
     assert not hasattr(rewards, "sa_reward")
     assert "sa_reward" not in rewards.__all__
+
+
+# ------------------------------------------------------------------- ControlArm
+#
+# The negative control: reward is uniform random in [0, 1), independent of
+# the candidate entirely. See ControlArm's own docstring in
+# src/polyt5/rewards/composite.py for the full rationale.
+
+
+def test_control_arm_is_registered_under_build_arm():
+    from polyt5.rewards.composite import ControlArm
+
+    arm = build_arm("control", seed=0)
+    assert isinstance(arm, ControlArm)
+
+
+def test_control_arm_reward_is_identical_for_the_same_seed_and_step_index():
+    """Reproducibility: (seed, step_index) alone determines the draw, so a
+    step replays identically -- exactly like GRPOTrainer.step's own targets.
+    """
+    arm = build_arm("control", seed=7)
+    first = arm([VALID, VALID, VALID], [500.0] * 3, [(500.0, 1.0, 4)] * 3, step_index=3)
+    second = arm([VALID, VALID, VALID], [500.0] * 3, [(500.0, 1.0, 4)] * 3, step_index=3)
+    assert [r.value for r in first] == [r.value for r in second]
+
+
+def test_control_arm_reward_changes_across_step_index():
+    arm = build_arm("control", seed=7)
+    step0 = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=0)
+    step1 = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=1)
+    assert [r.value for r in step0] != [r.value for r in step1]
+
+
+def test_control_arm_reward_changes_across_seed_for_the_same_step_index():
+    arm_a = build_arm("control", seed=1)
+    arm_b = build_arm("control", seed=2)
+    out_a = arm_a([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=0)
+    out_b = arm_b([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=0)
+    assert [r.value for r in out_a] != [r.value for r in out_b]
+
+
+def test_control_arm_does_not_use_the_global_numpy_rng():
+    """Perturbing numpy's GLOBAL random state between two identically-seeded
+    calls must not change the result -- a real bug would look like: swap
+    ``np.random.default_rng`` for ``np.random`` module-level calls, and this
+    test starts failing.
+    """
+    import numpy as np
+
+    arm = build_arm("control", seed=5)
+    before = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=2)
+    np.random.seed(12345)
+    for _ in range(50):
+        np.random.rand()
+    after = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=2)
+    assert [r.value for r in before] == [r.value for r in after]
+
+
+def test_control_arm_draws_are_in_the_unit_interval():
+    arm = build_arm("control", seed=0)
+    out = arm([VALID] * 20, [500.0] * 20, [(500.0, 1.0, 4)] * 20, step_index=0)
+    for result in out:
+        assert 0.0 <= result.value < 1.0
+
+
+def test_control_arm_step_index_defaults_to_zero_when_omitted():
+    arm = build_arm("control", seed=3)
+    with_default = arm([VALID], [500.0], [(500.0, 1.0, 4)])
+    explicit_zero = arm([VALID], [500.0], [(500.0, 1.0, 4)], step_index=0)
+    assert with_default[0].value == explicit_zero[0].value
+
+
+def test_control_arm_gives_an_invalid_candidate_a_real_nonzero_draw():
+    """The arm must NOT apply the validity gate: a structurally invalid
+    candidate gets the same kind of random draw as a valid one, not a
+    zeroed/gated result -- otherwise this would secretly be a validity arm.
+    """
+    arm = build_arm("control", seed=42)
+    out = arm([INVALID], [500.0], [(500.0, 1.0, 4)], step_index=9)[0]
+    assert out.gated is False
+    assert out.value > 0.0
+
+
+def test_control_arm_invalid_and_valid_candidates_draw_from_the_same_distribution():
+    """Not merely nonzero -- the SAME reproducible draw a valid candidate at
+    the same batch position would have gotten, proving the reward reads only
+    position/seed/step, never the candidate string.
+    """
+    arm = build_arm("control", seed=42)
+    invalid_first = arm([INVALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=1)
+    valid_first = arm([VALID, INVALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=1)
+    assert invalid_first[0].value == valid_first[0].value
+    assert invalid_first[1].value == valid_first[1].value
+
+
+def test_control_arm_never_gates_any_candidate():
+    arm = build_arm("control", seed=0)
+    out = arm([VALID, INVALID, "", "garbage"], [500.0] * 4, [(500.0, 1.0, 4)] * 4, step_index=0)
+    assert all(result.gated is False for result in out)
+    assert all(result.reason is None for result in out)
+
+
+def test_control_arm_rejects_misaligned_inputs_like_every_other_arm():
+    arm = build_arm("control", seed=0)
+    with pytest.raises(ValueError):
+        arm([VALID, VALID], [500.0], [(500.0, 1.0, 4), (500.0, 1.0, 4)])
+
+
+def test_control_arm_empty_batch_returns_empty():
+    arm = build_arm("control", seed=0)
+    assert arm([], [], [], step_index=0) == []
+
+
+def test_control_arm_wants_step_index_flag_is_set():
+    """Duck-typed marker GRPOTrainer.step reads to decide whether to pass
+    step_index through -- every other arm's reward is a pure function of
+    (candidates, targets, predictions) and must NOT declare this.
+    """
+    from polyt5.rewards.composite import (
+        AccuracyArm,
+        CompositeArm,
+        ConstraintArm,
+        ControlArm,
+        ValidityArm,
+    )
+
+    assert ControlArm.wants_step_index is True
+    for cls in (AccuracyArm, ValidityArm, CompositeArm, ConstraintArm):
+        assert getattr(cls, "wants_step_index", False) is False
+
+
+def test_control_arm_ignores_unused_base_arm_kwargs():
+    """ControlArm subclasses _BaseArm and is built through the same
+    build_reward_arm kwargs path as every other arm (tolerance/sa_max/
+    tg_config/ensemble_size always get passed); it must accept and ignore
+    them rather than raising.
+    """
+    arm = build_arm("control", seed=0, tolerance=50.0, sa_max=6.0, ensemble_size=4)
+    out = arm([VALID], [500.0], [(500.0, 1.0, 4)], step_index=0)
+    assert 0.0 <= out[0].value < 1.0
+
+
+def test_control_arm_has_no_optimized_metric_in_arm_metric():
+    """ARM_METRIC lives in scripts/compare_arms.py, not here, but the
+    contract this arm promises (see its docstring) is that it never appears
+    there -- pin the intent at the source so a future edit to ARM_METRIC that
+    accidentally adds "control" is caught right next to the reward it would
+    misrepresent as optimizing something."""
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root / "scripts") not in sys.path:
+        sys.path.insert(0, str(repo_root / "scripts"))
+    import compare_arms
+
+    assert "control" not in compare_arms.ARM_METRIC

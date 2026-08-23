@@ -66,6 +66,24 @@ def test_arm_metric_validity_unchanged():
     assert ARM_METRIC["validity"] == ("pv_rate", "higher")
 
 
+def test_control_has_no_entry_in_arm_metric():
+    """It optimizes nothing (see ControlArm's docstring); its matrix row's
+    success column must stay None/N-A, never a computed verdict.
+    """
+    assert "control" not in ARM_METRIC
+
+
+def test_rlvr_arms_includes_control():
+    assert "control" in compare_arms.RLVR_ARMS
+
+
+def test_matrix_columns_includes_seed():
+    """Addition 2: multi-seed rows need a column recording which seed
+    produced them, alongside the existing per-run columns.
+    """
+    assert "seed" in MATRIX_COLUMNS
+
+
 def test_property_mae_is_still_reported_for_every_row():
     """It is not C1's success metric, but it IS the paper's headline
     conditioning metric and arm_b's frozen number is one, so it stays in the
@@ -488,6 +506,321 @@ def test_score_with_arm_empty_batch_is_zero():
 
 
 # --------------------------------------------------------------- _auditor_predictions
+
+
+def _minimal_evaluate_arm_fixture(monkeypatch):
+    """Shared minimal stubbing for evaluate_arm tests that only care about
+    the row's bookkeeping fields (e.g. ``seed``), not the auditor/ensemble
+    wiring itself -- see
+    ``test_evaluate_arm_auditor_predictions_are_wired_through_the_helper``
+    for that.
+    """
+    from polyt5.evaluation.filters import CandidateRecord, FilterCounts
+    from polyt5.evaluation.sweep import ScreenedBatch, SweepPoint
+
+    def _record(canonical_psmiles):
+        return CandidateRecord(
+            raw_pselfies="raw", psmiles=canonical_psmiles, canonical_psmiles=canonical_psmiles,
+            passed_sv=True, passed_tsd=True, passed_dd=True, passed_pv=True,
+            reproducible=True, failure_stage=None, sa_score=None,
+        )
+
+    fixed_batch = ScreenedBatch(
+        point=SweepPoint(temperature=0.7, top_p=0.95),
+        candidates=["cand0"], sample_targets=[300.0], records=[_record("A")],
+        counts=FilterCounts(n_input=1, n_sv=1, n_tsd=1, n_dd=1, n_pv=1),
+        sr_rate=1.0, duplicate_rate=0.0, mean_length=5.0,
+    )
+    monkeypatch.setattr(
+        compare_arms, "screen_candidates", lambda model, tokenizer, **kw: fixed_batch)
+
+    class _FakeEnsemble:
+        def predict_with_uncertainty(self, candidates):
+            return [(111.0, 9.0, 4) for _ in candidates]
+
+    class _RecordingArm:
+        def __call__(self, candidates, targets, predictions):
+            return [_FakeResult(1.0) for _ in candidates]
+
+    scorers = ArmScorers(
+        accuracy=_RecordingArm(), composite=_RecordingArm(), constraint=_RecordingArm())
+
+    class _NullSimilarityMonitor:
+        def observe(self, candidates, ensemble_predictions):
+            return {"max_tanimoto_mean": None, "near_copy_fraction": None,
+                    "max_tanimoto_p90": None, "max_tanimoto_n": None,
+                    "auditor_gap_mean": None, "auditor_gap_signed_mean": None,
+                    "auditor_gap_n": None}
+
+    return {
+        "model": None, "tokenizer": None, "point": SweepPoint(temperature=0.7, top_p=0.95),
+        "targets": [300.0], "n_samples": 1, "training_index": None,
+        "auditor": lambda candidates: [111.0], "ensemble": _FakeEnsemble(),
+        "auditor_scorers": scorers, "ensemble_scorers": scorers,
+        "similarity_monitor": _NullSimilarityMonitor(), "device": "cpu",
+        "batch_size": 1, "max_length": 200, "seed": 0, "tolerance": 50.0,
+        "checkpoint_label": None, "checkpoint_sha256": None, "novelty_index_sha256": None,
+        "reward_config_sha256": {"accuracy": "a" * 64, "composite": "b" * 64,
+                                 "constraint": "c" * 64},
+    }
+
+
+def test_evaluate_arm_records_the_provided_run_seed(monkeypatch):
+    kwargs = _minimal_evaluate_arm_fixture(monkeypatch)
+    row = compare_arms.evaluate_arm(
+        arm_key="composite", label="t", kind="rlvr", run_seed=3, **kwargs)
+    assert row["seed"] == 3
+
+
+def test_evaluate_arm_seed_defaults_to_none_when_not_a_seeded_run(monkeypatch):
+    """arm_a/arm_b rows (kind="baseline") never pass run_seed at all -- "no
+    training seed produced this row" must read None, never a fabricated 0.
+    """
+    kwargs = _minimal_evaluate_arm_fixture(monkeypatch)
+    row = compare_arms.evaluate_arm(arm_key="arm_a", label="t", kind="baseline", **kwargs)
+    assert row["seed"] is None
+
+
+# --------------------------------------------------- multi-seed run discovery
+
+
+def test_resolve_arm_run_dir_seed_zero_matches_the_pre_multiseed_layout(tmp_path):
+    run_dir = compare_arms.resolve_arm_run_dir(
+        "accuracy", tmp_path, seed=0, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert run_dir == tmp_path / "grpo_accuracy"
+
+
+def test_resolve_arm_run_dir_nonzero_seed_gets_a_suffix(tmp_path):
+    run_dir = compare_arms.resolve_arm_run_dir(
+        "accuracy", tmp_path, seed=2, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert run_dir == tmp_path / "grpo_accuracy_seed2"
+
+
+def test_discover_seed_runs_finds_the_suffixless_seed_zero_directory(tmp_path):
+    """Backward compatibility: the in-flight results/grpo_accuracy/ run must
+    still be discoverable as seed 0.
+    """
+    (tmp_path / "grpo_accuracy").mkdir()
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == [(0, tmp_path / "grpo_accuracy")]
+
+
+def test_discover_seed_runs_finds_every_seeded_directory_too(tmp_path):
+    (tmp_path / "grpo_accuracy").mkdir()
+    (tmp_path / "grpo_accuracy_seed2").mkdir()
+    (tmp_path / "grpo_accuracy_seed1").mkdir()
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == [
+        (0, tmp_path / "grpo_accuracy"),
+        (1, tmp_path / "grpo_accuracy_seed1"),
+        (2, tmp_path / "grpo_accuracy_seed2"),
+    ]
+
+
+def test_discover_seed_runs_empty_when_nothing_exists(tmp_path):
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == []
+
+
+def test_discover_seed_runs_ignores_unrelated_directories(tmp_path):
+    (tmp_path / "grpo_accuracy_seed1").mkdir()
+    (tmp_path / "grpo_composite_seed1").mkdir()  # a different arm
+    (tmp_path / "grpo_accuracy_seedX").mkdir()   # not a valid integer seed
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == [(1, tmp_path / "grpo_accuracy_seed1")]
+
+
+# -------------------------------------------------------------- _seed_stat
+
+
+def test_seed_stat_single_value_reports_undefined_spread_not_zero():
+    """The exact requirement: '1 seed', never a fabricated spread of 0."""
+    stat = compare_arms._seed_stat([0.5])
+    assert stat["n_seeds"] == 1
+    assert stat["mean"] == pytest.approx(0.5)
+    assert stat["sd"] is None
+    assert stat["note"] == "1 seed"
+
+
+def test_seed_stat_multiple_values_computes_a_real_sample_sd():
+    stat = compare_arms._seed_stat([0.4, 0.6])
+    assert stat["n_seeds"] == 2
+    assert stat["mean"] == pytest.approx(0.5)
+    assert stat["sd"] == pytest.approx(0.14142135, rel=1e-4)
+    assert stat["note"] == "2 seeds"
+
+
+def test_seed_stat_empty_reports_zero_seeds_not_a_crash():
+    stat = compare_arms._seed_stat([])
+    assert stat["n_seeds"] == 0
+    assert stat["mean"] is None
+    assert stat["sd"] is None
+
+
+def test_seed_stat_ignores_none_values():
+    stat = compare_arms._seed_stat([0.5, None, 0.7])
+    assert stat["n_seeds"] == 2
+
+
+# -------------------------------------------------------- compute_seed_aggregates
+
+
+def test_compute_seed_aggregates_groups_rows_by_arm_and_reports_mean_and_sd():
+    rows = [
+        _row("arm_b", accuracy_score_ensemble=0.5, accuracy_score_auditor=0.5),
+        _row("accuracy", kind="rlvr", checkpoint="s0.pt", seed=0,
+             accuracy_score_ensemble=0.60, accuracy_score_auditor=0.60,
+             sampling_matches_arm_b=True),
+        _row("accuracy", kind="rlvr", checkpoint="s1.pt", seed=1,
+             accuracy_score_ensemble=0.62, accuracy_score_auditor=0.62,
+             sampling_matches_arm_b=True),
+    ]
+    aggregates = compare_arms.compute_seed_aggregates(rows)
+    entry = aggregates["accuracy"]
+    assert entry["n_seeds"] == 2
+    assert entry["seeds"] == [0, 1]
+    stat = entry["metrics"]["accuracy_score_ensemble"]
+    assert stat["n_seeds"] == 2
+    assert stat["mean"] == pytest.approx(0.61)
+    assert stat["sd"] is not None
+
+
+def test_compute_seed_aggregates_records_the_seed_count(tmp_path):
+    """'Record the seed count in summary.json' -- n_seeds is the field."""
+    rows = [
+        _row("arm_b", pv_rate=0.5),
+        _row("validity", kind="rlvr", checkpoint="s0.pt", seed=0, pv_rate=0.5,
+             sampling_matches_arm_b=True),
+    ]
+    aggregates = compare_arms.compute_seed_aggregates(rows)
+    assert aggregates["validity"]["n_seeds"] == 1
+
+
+def test_compute_seed_aggregates_excludes_untrained_placeholder_rows():
+    rows = [_row("arm_b"), skipped_arm_row("accuracy")]
+    aggregates = compare_arms.compute_seed_aggregates(rows)
+    assert "accuracy" not in aggregates
+
+
+def test_compute_seed_aggregates_across_seed_success_true_when_mean_beats_margin():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.62, composite_score_auditor=0.62,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_beats_arm_b"] is True
+    assert entry["across_seed_survives_audit"] is True
+    assert entry["across_seed_success"] is True
+
+
+def test_compute_seed_aggregates_across_seed_success_false_below_the_margin():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.500, composite_score_auditor=0.500),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.505, composite_score_auditor=0.505,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_beats_arm_b"] is False
+    assert entry["across_seed_success"] is False
+
+
+def test_compute_seed_aggregates_none_when_sampling_does_not_match_for_every_seed():
+    """Mirrors apply_success_criterion's own refusal (finding 11), extended
+    across seeds: ANY seed sampled off arm_b's operating point makes the
+    across-seed verdict incomparable, not merely that one seed's row.
+    """
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=False),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_beats_arm_b"] is True, "the comparison is still recorded"
+    assert entry["across_seed_success"] is None, "but no verdict is issued"
+
+
+def test_compute_seed_aggregates_structural_metric_is_na_not_a_computed_bool():
+    rows = [
+        _row("arm_b", pv_rate=0.5),
+        _row("validity", kind="rlvr", checkpoint="s0.pt", seed=0, pv_rate=0.9,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["validity"]
+    assert entry["across_seed_beats_arm_b"] is True
+    assert entry["across_seed_survives_audit"] == compare_arms.STRUCTURAL_AUDIT_NOTE
+    assert entry["across_seed_success"] is True
+
+
+def test_compute_seed_aggregates_control_arm_has_no_verdict_but_reports_metrics():
+    """The control arm has no entry in ARM_METRIC, so its across-seed verdict
+    is always None/N-A -- but its diagnostic metrics (pv_rate here, standing
+    in for "diversity, or any other metric") must still be aggregated, so a
+    reader can see whether pure noise alone moved them.
+    """
+    rows = [
+        _row("arm_b", pv_rate=0.5),
+        _row("control", kind="rlvr", checkpoint="s0.pt", seed=0, pv_rate=0.6,
+             sampling_matches_arm_b=True),
+        _row("control", kind="rlvr", checkpoint="s1.pt", seed=1, pv_rate=0.65,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["control"]
+    assert entry["optimized_metric"] is None
+    assert entry["across_seed_beats_arm_b"] is None
+    assert entry["across_seed_survives_audit"] is None
+    assert entry["across_seed_success"] is None
+    stat = entry["metrics"]["pv_rate"]
+    assert stat["n_seeds"] == 2
+    assert stat["mean"] == pytest.approx(0.625)
+
+
+# ------------------------------------------------------ format_seed_summary_markdown
+
+
+def test_format_seed_summary_markdown_reports_one_seed_explicitly_not_a_zero_spread():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.5, composite_score_auditor=0.5),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.6, composite_score_auditor=0.6,
+             sampling_matches_arm_b=True),
+    ]
+    aggregates = compare_arms.compute_seed_aggregates(rows)
+    text = compare_arms.format_seed_summary_markdown(aggregates)
+    assert "composite" in text
+    assert "1 seed" in text
+
+
+def test_format_seed_summary_markdown_two_seeds_does_not_claim_one_seed():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.5, composite_score_auditor=0.5),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.6, composite_score_auditor=0.6,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.7, composite_score_auditor=0.7,
+             sampling_matches_arm_b=True),
+    ]
+    aggregates = compare_arms.compute_seed_aggregates(rows)
+    text = compare_arms.format_seed_summary_markdown(aggregates)
+    assert "1 seed" not in text
+
+
+def test_format_seed_summary_markdown_empty_aggregates_is_still_valid_text():
+    assert compare_arms.format_seed_summary_markdown({}) is not None
 
 
 def test_auditor_predictions_always_carries_zero_std():

@@ -98,12 +98,19 @@ from polyt5.utils import (  # noqa: E402
     select_device,
 )
 
-#: The four arms Task 6 implements. Order matches the paper's C1-C4 numbering.
-ARMS: tuple[str, ...] = ("accuracy", "validity", "composite", "constraint")
+#: The four arms Task 6 implements, plus the ``control`` negative control
+#: (Addition 1: see ``polyt5.rewards.composite.ControlArm``). Order matches
+#: the paper's C1-C4 numbering, with ``control`` last since it is not a
+#: paper arm at all -- it optimizes nothing and has no entry in
+#: ``scripts/compare_arms.py``'s ``ARM_METRIC``.
+ARMS: tuple[str, ...] = ("accuracy", "validity", "composite", "constraint", "control")
 
 #: Arms whose reward needs a TSD / novelty reference set (see
 #: ``polyt5.rewards.composite`` -- ``ValidityArm`` requires one by default,
 #: ``CompositeArm`` and ``ConstraintArm`` score a ``novelty`` term with one).
+#: ``control`` is deliberately absent: its reward never reads the candidate
+#: at all (see ``ControlArm``'s docstring), so it must not open, or accept an
+#: override for, a novelty index either.
 ARMS_NEEDING_NOVELTY_INDEX: frozenset[str] = frozenset({"validity", "composite", "constraint"})
 
 #: Checkpoint used to initialise BOTH the policy and the reference: the
@@ -126,6 +133,37 @@ def _resolve(path: str | Path) -> Path:
     """Resolve ``path`` relative to the repo root unless it is already absolute."""
     path = Path(path)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def run_experiment_name(base_name: str, seed: int) -> str:
+    """The run-directory name a given ``(base_name, seed)`` gets (Addition 2).
+
+    Multi-seed support means the same arm can now be trained more than once,
+    at different seeds, without one run overwriting another's directory.
+    ``seed == 0`` keeps ``base_name`` completely unsuffixed -- e.g.
+    ``"grpo_accuracy"`` -- for backward compatibility with every run
+    directory created before multi-seed support existed, including the
+    in-flight ``results/grpo_accuracy/`` run this change must not disturb:
+    it is a seed-0 run (``configs/rl/accuracy.yaml`` pins ``seed: 0``) and
+    must remain discoverable at exactly that path. Every other seed gets an
+    explicit ``"_seed<N>"`` suffix, so ``results/grpo_<arm>_seed<N>/`` and the
+    original suffix-less directory can coexist side by side under the same
+    ``results_root``.
+
+    ``scripts/compare_arms.py``'s ``resolve_arm_run_dir`` / ``discover_seed_
+    runs`` mirror this exact rule when looking a run directory back up; the
+    two must never drift apart.
+
+    Args:
+        base_name: ``cfg["experiment_name"]`` if the config set one, else
+            ``f"grpo_{arm}"`` -- whatever :func:`main` would have used as the
+            run directory name before multi-seed support existed.
+        seed: The run's ``config.seed``.
+
+    Returns:
+        ``base_name`` unchanged for ``seed == 0``, else ``f"{base_name}_seed{seed}"``.
+    """
+    return base_name if seed == 0 else f"{base_name}_seed{seed}"
 
 
 def sha256_of_file(path: Path, *, chunk_size: int = 1 << 20) -> str:
@@ -474,6 +512,14 @@ def build_reward_arm(
         weights = reward_cfg.get("weights")
         if weights is not None:
             kwargs["weights"] = dict(weights)
+    if arm_name == "control":
+        # ControlArm's reproducibility contract -- "replaying step
+        # step_index of a run with the same seed reproduces the exact same
+        # rewards" -- requires this to be the SAME seed GRPOTrainerConfig.seed
+        # is built from (see build_trainer_config / main()), read from the
+        # top-level `seed` key, never from `reward.*` (there is no
+        # legitimate ablation of "which random numbers this control drew").
+        kwargs["seed"] = int(cfg.get("seed", 0))
     return build_arm(arm_name, **kwargs)
 
 
@@ -695,8 +741,11 @@ def main(argv: list[str] | None = None) -> int:
     seed = int(cfg.get("seed", 0))
     seed_everything(seed)
 
-    run_dir = RunDirectory.create(_resolve(cfg.get("output", {}).get("results_root", "results")),
-                                  cfg.get("experiment_name") or f"grpo_{args.arm}")
+    base_experiment_name = cfg.get("experiment_name") or f"grpo_{args.arm}"
+    run_dir = RunDirectory.create(
+        _resolve(cfg.get("output", {}).get("results_root", "results")),
+        run_experiment_name(base_experiment_name, seed),
+    )
     logger = get_logger("polyt5.train_grpo", log_file=run_dir.logs / "train_grpo.log")
     logger.info("arm=%s config=%s run_dir=%s", args.arm, config_path, run_dir.root)
     if reward_override_record:
