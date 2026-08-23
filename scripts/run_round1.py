@@ -43,8 +43,44 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
+
+
+def _experiment_name_for(arm: str) -> str:
+    """The base run-directory name ``train_grpo.py`` uses for ``arm`` at seed 0.
+
+    Review finding 3: an earlier version of this function hardcoded
+    ``f"grpo_{arm}"`` instead of reading ``configs/rl/<arm>.yaml``'s own
+    ``experiment_name`` key, so a YAML that overrode it would silently
+    desynchronise this driver from the directory ``train_grpo.py`` actually
+    writes to -- ``last_step`` would poll a directory that never gets a
+    ``metrics.csv``, and ``wait_for`` would either hang forever (while
+    ``trainer_is_alive()`` stays ``True``, which it will) or abort the whole
+    chain after the stall budget with a misleading "stuck at step None".
+
+    Reads the plain YAML key directly (``yaml.safe_load``, already a
+    dependency) rather than importing ``train_grpo.py`` or
+    ``polyt5.utils.load_config`` -- this driver's whole job is polling small
+    files and spawning subprocesses, and stays free of ``torch``/``rdkit``
+    at import time on purpose (``train_grpo.py`` pulls both in at module
+    level).
+
+    Mirrors ``train_grpo.main()``'s own fallback exactly:
+    ``cfg.get("experiment_name") or f"grpo_{arm}"``. A missing or unreadable
+    config file falls back to the same ``f"grpo_{arm}"`` default rather than
+    raising -- this function is called before every poll, and a driver that
+    cannot start because a YAML briefly failed to read is worse than one
+    that falls back to the common-case name.
+    """
+    config_path = REPO / "configs" / "rl" / f"{arm}.yaml"
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except OSError:
+        raw = {}
+    return raw.get("experiment_name") or f"grpo_{arm}"
 
 
 def _run_experiment_name(arm: str, seed: int) -> str:
@@ -53,10 +89,11 @@ def _run_experiment_name(arm: str, seed: int) -> str:
     ``train_grpo.py`` imports ``torch``/``rdkit`` at module level; this
     driver's whole job is polling small files and spawning subprocesses, so
     it deliberately never imports that module -- see
-    ``test_run_dir_for_matches_train_grpo_run_experiment_name`` for the test
-    that pins the two functions together so they cannot silently drift.
+    ``test_run_dir_for_follows_a_configs_own_experiment_name_override`` for
+    the test that pins base-name derivation (not just the seed-suffix rule)
+    against the real YAML files.
     """
-    base = f"grpo_{arm}"
+    base = _experiment_name_for(arm)
     return base if seed == 0 else f"{base}_seed{seed}"
 
 

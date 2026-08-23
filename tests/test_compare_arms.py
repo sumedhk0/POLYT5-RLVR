@@ -147,6 +147,67 @@ def test_frozen_record_pins_a_margin_for_every_arm():
         assert float(registered[arm]["min_margin"]) > 0.0, arm
 
 
+# ------------------------------------ review finding 2: across-seed rule binding
+
+
+def test_check_pre_registration_requires_success_criterion_across_seeds():
+    """Review finding 2: the across-seed criterion used to be pre-registered
+    PROSE with nothing in check_pre_registration reading it at all -- the
+    identical unbound-drift failure mode ARM_METRIC's own binding exists to
+    prevent, just for a newer criterion.
+    """
+    frozen = _frozen()
+    del frozen["success_criterion_across_seeds"]
+    problems = check_pre_registration(frozen)
+    assert any("success_criterion_across_seeds" in p for p in problems), problems
+
+
+def test_check_pre_registration_requires_across_seed_rule():
+    frozen = _frozen()
+    del frozen["success_criterion_statistics"]["across_seed_rule"]
+    problems = check_pre_registration(frozen)
+    assert any("across_seed_rule" in p for p in problems), problems
+
+
+def test_check_pre_registration_catches_the_across_seed_rule_changing_underneath_the_code(
+    monkeypatch,
+):
+    """Mutant evidence (b): the frozen record's across-seed rule changes
+    (e.g. someone decides it should use a bootstrap after all) without the
+    code being told -- must be caught, not silently accepted.
+    """
+    frozen = _frozen()
+    frozen["success_criterion_statistics"]["across_seed_bootstrap"] = True
+    problems = check_pre_registration(frozen)
+    assert any("across_seed_bootstrap" in p for p in problems), problems
+
+
+def test_check_pre_registration_catches_a_second_across_seed_margin_appearing():
+    frozen = _frozen()
+    frozen["success_criterion_statistics"]["across_seed_min_margin_source"] = (
+        "a_new_separate_margin")
+    problems = check_pre_registration(frozen)
+    assert any("across_seed_min_margin_source" in p for p in problems), problems
+
+
+def test_check_pre_registration_catches_unanimity_being_silently_dropped(monkeypatch):
+    """Mutant evidence (c), pre-registration half: the record says unanimity
+    is required, but if the code's own ACROSS_SEED_REQUIRES_UNANIMITY
+    constant were ever flipped to False, this must be caught rather than
+    letting the mean-only criterion quietly become the whole story again.
+    """
+    monkeypatch.setattr(compare_arms, "ACROSS_SEED_REQUIRES_UNANIMITY", False)
+    problems = check_pre_registration(_frozen())
+    assert any("across_seed_requires_unanimity" in p for p in problems), problems
+
+
+def test_check_pre_registration_passes_against_the_real_frozen_record_with_across_seed_fields():
+    """The real file, unmutated, must still pass -- this is the binding
+    actually landing cleanly, not just the mutants being catchable.
+    """
+    assert check_pre_registration(_frozen()) == []
+
+
 # -------------------------------------------------- reward config provenance (item 1)
 
 
@@ -634,6 +695,54 @@ def test_discover_seed_runs_ignores_unrelated_directories(tmp_path):
     assert found == [(1, tmp_path / "grpo_accuracy_seed1")]
 
 
+# ------------------------------------------------------ review finding 6: seed regex
+
+
+def test_discover_seed_runs_rejects_a_leading_zero_suffix(tmp_path):
+    """"_seed01" must not collide with "_seed1" on the integer key 1 --
+    train_grpo.run_experiment_name never produces a leading-zero suffix, so
+    a directory shaped like one is simply not recognised as a seed
+    directory (rather than silently discarding whichever glob returns
+    last).
+    """
+    (tmp_path / "grpo_accuracy_seed1").mkdir()
+    (tmp_path / "grpo_accuracy_seed01").mkdir()
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == [(1, tmp_path / "grpo_accuracy_seed1")]
+
+
+def test_discover_seed_runs_finds_a_negative_seed_directory(tmp_path):
+    (tmp_path / "grpo_accuracy_seed-1").mkdir()
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == [(-1, tmp_path / "grpo_accuracy_seed-1")]
+
+
+def test_discover_seed_runs_rejects_a_negative_leading_zero_suffix(tmp_path):
+    (tmp_path / "grpo_accuracy_seed-01").mkdir()
+    found = compare_arms.discover_seed_runs(
+        "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == []
+
+
+def test_discover_seed_runs_warns_when_a_seed0_suffixed_dir_collides_with_the_canonical_one(
+    tmp_path, caplog
+):
+    """train_grpo.py never suffixes seed 0, so a hand-made
+    grpo_accuracy_seed0 alongside the canonical grpo_accuracy is a genuine
+    collision -- the canonical one is kept and the collision is logged,
+    rather than a stray directory silently deciding the outcome.
+    """
+    (tmp_path / "grpo_accuracy").mkdir()
+    (tmp_path / "grpo_accuracy_seed0").mkdir()
+    with caplog.at_level("WARNING"):
+        found = compare_arms.discover_seed_runs(
+            "accuracy", tmp_path, repo_cfg={"experiment_name": "grpo_accuracy"})
+    assert found == [(0, tmp_path / "grpo_accuracy")]
+    assert any("seed 0" in record.message for record in caplog.records)
+
+
 # -------------------------------------------------------------- _seed_stat
 
 
@@ -783,9 +892,191 @@ def test_compute_seed_aggregates_control_arm_has_no_verdict_but_reports_metrics(
     assert entry["across_seed_beats_arm_b"] is None
     assert entry["across_seed_survives_audit"] is None
     assert entry["across_seed_success"] is None
+    assert entry["across_seed_unanimous"] is None
+    assert entry["combined_success"] is None
     stat = entry["metrics"]["pv_rate"]
     assert stat["n_seeds"] == 2
     assert stat["mean"] == pytest.approx(0.625)
+
+
+# ------------------------------------------------- review finding 4: mismatch exclusion
+
+
+def test_compute_seed_aggregates_excludes_a_sampling_mismatched_seed_from_the_mean_too():
+    """Not just the verdict: a seed sampled off arm_b's operating point must
+    not be averaged into the published mean/sd either.
+    """
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.99, composite_score_auditor=0.99,
+             temperature=1.0, sampling_matches_arm_b=False),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    stat = entry["metrics"]["composite_score_ensemble"]
+    assert stat["n_seeds"] == 1, "the mismatched seed must not be counted"
+    assert stat["mean"] == pytest.approx(0.60), "and must not move the published mean"
+    assert entry["n_seeds"] == 2, "but it still counts as a seed that was actually trained"
+    assert entry["n_seeds_matching_sampling"] == 1
+
+
+# --------------------------------------------------- review finding 5: None vs False
+
+
+def test_compute_seed_aggregates_distinguishes_mismatch_from_unknown_sampling():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             temperature=1.0, sampling_matches_arm_b=False),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=None),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["sampling_mismatch_seeds"] == [0]
+    assert entry["sampling_unknown_sampling_seeds"] == [1]
+    assert entry["across_seed_success"] is None
+
+
+# --------------------------------------------------------- review finding 7: n_seeds
+
+
+def test_compute_seed_aggregates_n_seeds_and_seeds_are_derived_from_the_same_source():
+    """A row with no recorded seed must not inflate n_seeds beyond len(seeds)."""
+    rows = [
+        _row("arm_b", pv_rate=0.5),
+        _row("validity", kind="rlvr", checkpoint="s0.pt", seed=0, pv_rate=0.6,
+             sampling_matches_arm_b=True),
+        _row("validity", kind="rlvr", checkpoint="s1.pt", seed=None, pv_rate=0.6,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["validity"]
+    assert entry["n_seeds"] == len(entry["seeds"]) == 1
+
+
+# ------------------------------------------- review's statistical recommendation: unanimity
+
+
+def test_compute_seed_aggregates_unanimous_true_when_every_seed_clears_the_margin():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.62, composite_score_auditor=0.62,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_unanimous"] is True
+    assert entry["across_seed_unanimous_ensemble"] is True
+    assert entry["combined_success"] is None, "no per-row 'success' set on these fabricated rows"
+
+
+def test_compute_seed_aggregates_unanimous_false_when_seeds_disagree_on_sign():
+    """Mutant evidence (kills 'unanimity dropped while the mean still
+    passes'): per-seed deltas {+0.09, +0.01, -0.04} against arm_b=0.50 give
+    an across-seed MEAN delta of +0.02 -- a pass under margin-only -- even
+    though one seed actually lost to arm_b. across_seed_success (mean-based,
+    unchanged) still passes; across_seed_unanimous must not.
+    """
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.59, composite_score_auditor=0.59,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.51, composite_score_auditor=0.51,
+             sampling_matches_arm_b=True),
+        _row("composite", kind="rlvr", checkpoint="s2.pt", seed=2,
+             composite_score_ensemble=0.46, composite_score_auditor=0.46,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_delta_ensemble"] == pytest.approx(0.02, abs=1e-9)
+    assert entry["across_seed_success"] is True, "the confound: mean-only still passes"
+    assert entry["across_seed_unanimous"] is False, "but one seed actually lost to arm_b"
+    assert entry["across_seed_unanimous_ensemble"] is False
+    assert entry["combined_success"] in (False, None)
+
+    # Kill the mutant directly: if unanimity were dropped from combined_success
+    # (mean-only restored as the whole story), a maximally lenient reader
+    # relying on combined_success alone would wrongly see this arm pass.
+    if entry["combined_success"] is not None:
+        assert entry["combined_success"] is False
+
+
+def test_compute_seed_aggregates_unanimous_none_when_no_matching_seeds():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             temperature=1.0, sampling_matches_arm_b=False),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_unanimous"] is None
+
+
+def test_compute_seed_aggregates_unanimous_structural_metric_is_na_not_true():
+    rows = [
+        _row("arm_b", pv_rate=0.5),
+        _row("validity", kind="rlvr", checkpoint="s0.pt", seed=0, pv_rate=0.9,
+             sampling_matches_arm_b=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["validity"]
+    assert entry["across_seed_unanimous_auditor"] == compare_arms.STRUCTURAL_AUDIT_NOTE
+    assert entry["across_seed_unanimous"] is True
+
+
+# ------------------------------------------------- review finding 8: combined_success
+
+
+def test_compute_seed_aggregates_combined_success_requires_every_row_success_too():
+    """A seed whose across-seed numbers pass but whose OWN per-candidate
+    bootstrap did not confirm success must still zero out combined_success.
+    """
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True, success=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.62, composite_score_auditor=0.62,
+             sampling_matches_arm_b=True, success=False),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["across_seed_success"] is True
+    assert entry["across_seed_unanimous"] is True
+    assert entry["combined_success"] is False, "one seed's own row-level success was False"
+
+
+def test_compute_seed_aggregates_combined_success_true_when_everything_agrees():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True, success=True),
+        _row("composite", kind="rlvr", checkpoint="s1.pt", seed=1,
+             composite_score_ensemble=0.62, composite_score_auditor=0.62,
+             sampling_matches_arm_b=True, success=True),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["combined_success"] is True
+
+
+def test_compute_seed_aggregates_combined_success_none_when_a_row_success_is_unmeasured():
+    rows = [
+        _row("arm_b", composite_score_ensemble=0.50, composite_score_auditor=0.50),
+        _row("composite", kind="rlvr", checkpoint="s0.pt", seed=0,
+             composite_score_ensemble=0.60, composite_score_auditor=0.60,
+             sampling_matches_arm_b=True, success=None),
+    ]
+    entry = compare_arms.compute_seed_aggregates(rows)["composite"]
+    assert entry["combined_success"] is None
 
 
 # ------------------------------------------------------ format_seed_summary_markdown

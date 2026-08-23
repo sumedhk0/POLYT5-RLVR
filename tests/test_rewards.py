@@ -1,6 +1,7 @@
 # tests/test_rewards.py
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from polyt5.chemistry.canonicalization import canonical_psmiles
@@ -472,8 +473,6 @@ def test_control_arm_does_not_use_the_global_numpy_rng():
     ``np.random.default_rng`` for ``np.random`` module-level calls, and this
     test starts failing.
     """
-    import numpy as np
-
     arm = build_arm("control", seed=5)
     before = arm([VALID, VALID], [500.0, 500.0], [(500.0, 1.0, 4)] * 2, step_index=2)
     np.random.seed(12345)
@@ -495,6 +494,79 @@ def test_control_arm_step_index_defaults_to_zero_when_omitted():
     with_default = arm([VALID], [500.0], [(500.0, 1.0, 4)])
     explicit_zero = arm([VALID], [500.0], [(500.0, 1.0, 4)], step_index=0)
     assert with_default[0].value == explicit_zero[0].value
+
+
+# --------------------------------------------------- review finding 1: stream tag
+#
+# ControlArm must NOT reuse GRPOTrainer.step's own [seed, step_index] RNG
+# stream: that stream's very next draw after construction is the step's
+# target Tg vector (rng.uniform(target_min, target_max, size=prompts_per_step)
+# in src/polyt5/rl/trainer.py), so an untagged ControlArm's rewards would be a
+# deterministic affine image of that vector -- correlated 1.000000, not
+# independent noise at all.
+
+
+def test_control_arm_draws_differ_from_the_untagged_trainer_stream():
+    """Kills the "drop the stream tag" mutant directly: reproduces exactly
+    what ControlArm would have produced before _CONTROL_STREAM_TAG existed
+    (np.random.default_rng([seed, step_index]), no third element) and
+    asserts the real arm's draws are NOT that.
+    """
+    seed, step_index, n = 0, 11, 5
+    arm = build_arm("control", seed=seed)
+    actual = [
+        result.value for result in
+        arm([VALID] * n, [500.0] * n, [(500.0, 1.0, 4)] * n, step_index=step_index)
+    ]
+
+    untagged_rng = np.random.default_rng([seed, step_index])
+    untagged = list(untagged_rng.uniform(0.0, 1.0, size=n))
+
+    assert actual != untagged
+
+
+def test_control_arm_draws_are_uncorrelated_with_the_steps_conditioning_targets():
+    """The exact confound the review measured directly: reproduces
+    GRPOTrainer.step's own target-sampling draw (src/polyt5/rl/trainer.py's
+    ``rng = np.random.default_rng([cfg.seed, step_index]); targets =
+    rng.uniform(target_min, target_max, size=prompts_per_step)``) for the
+    SAME (seed, step_index) ControlArm is asked for, and confirms the
+    control's rewards are neither equal to, nor correlated with, the
+    normalized target vector. Before the stream tag existed this was
+    measured at correlation 1.000000, max abs diff 0.0 (exact equality).
+    """
+    seed, step_index = 0, 11
+    prompts_per_step = 32
+    target_min, target_max = 250.0, 600.0
+
+    trainer_rng = np.random.default_rng([seed, step_index])
+    targets = trainer_rng.uniform(target_min, target_max, size=prompts_per_step)
+    normalized_targets = (targets - target_min) / (target_max - target_min)
+
+    arm = build_arm("control", seed=seed)
+    candidates = [VALID] * prompts_per_step
+    control_values = np.array([
+        result.value for result in
+        arm(candidates, [500.0] * prompts_per_step, [(500.0, 1.0, 4)] * prompts_per_step,
+            step_index=step_index)
+    ])
+
+    assert not np.allclose(control_values, normalized_targets)
+    correlation = float(np.corrcoef(control_values, normalized_targets)[0, 1])
+    assert abs(correlation) < 0.3, (
+        f"control draws correlated with the step's own conditioning targets at r={correlation} "
+        "-- the control is not independent of the run it is meant to be a control FOR"
+    )
+
+
+def test_control_arm_reproducibility_survives_the_stream_tag():
+    """The tag must not break the documented (seed, step_index)
+    reproducibility contract -- only make the stream itself distinct.
+    """
+    arm = build_arm("control", seed=9)
+    first = arm([VALID] * 4, [500.0] * 4, [(500.0, 1.0, 4)] * 4, step_index=6)
+    second = arm([VALID] * 4, [500.0] * 4, [(500.0, 1.0, 4)] * 4, step_index=6)
+    assert [r.value for r in first] == [r.value for r in second]
 
 
 def test_control_arm_gives_an_invalid_candidate_a_real_nonzero_draw():

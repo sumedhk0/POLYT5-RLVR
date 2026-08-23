@@ -181,6 +181,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import re
 import sys
 from collections.abc import Sequence
@@ -189,6 +190,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+#: A plain ``logging.getLogger`` (propagate=True, no handlers of its own),
+#: deliberately NOT ``polyt5.utils.get_logger`` -- that function is
+#: idempotent per name and ``main()`` calls
+#: ``get_logger("polyt5.compare_arms", log_file=...)`` to attach the run's
+#: own file handler; a module-level call here under that SAME name would
+#: run first (at import time), permanently pre-empt ``main()``'s handler
+#: attachment (``get_logger`` returns the existing logger unchanged once it
+#: already has handlers), and silently break ``compare_arms.log``. This
+#: logger exists only for the rare, defensive warning inside
+#: :func:`discover_seed_runs` (review finding 6).
+_LOGGER = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
@@ -281,6 +294,19 @@ N_BOOTSTRAP = 2000
 BOOTSTRAP_CONFIDENCE = 0.95
 BOOTSTRAP_SEED = 0
 
+#: Statistical properties of the ACROSS-SEED criterion (Addition 2),
+#: pre-registered in ``frozen_baseline.json``'s ``success_criterion_
+#: statistics`` alongside :data:`N_BOOTSTRAP` / :data:`BOOTSTRAP_CONFIDENCE`
+#: / :data:`BOOTSTRAP_SEED` and checked the identical way by
+#: :func:`check_pre_registration` -- see that function's docstring (review
+#: finding 2: the across-seed rule used to be pre-registered PROSE with no
+#: executable binding at all) and ``frozen_baseline.json``'s
+#: ``success_criterion_across_seeds`` / ``success_criterion_statistics.
+#: across_seed_rule`` for what these bind.
+ACROSS_SEED_BOOTSTRAP = False
+ACROSS_SEED_MIN_MARGIN_SOURCE = "same_as_arm_min_margin"
+ACROSS_SEED_REQUIRES_UNANIMITY = True
+
 #: ``max_tanimoto_mean`` / ``near_copy_fraction`` (adjudication (d)) and the
 #: three ``*_reward_config_sha256`` columns (pre-registration integrity, see
 #: the module docstring) are DIAGNOSTIC / provenance columns computed
@@ -363,7 +389,20 @@ SEED_AGGREGATE_METRICS: tuple[str, ...] = tuple(
 
 #: Matches a run directory's ``_seed<N>`` suffix (see
 #: ``train_grpo.run_experiment_name``).
-_SEED_SUFFIX_RE = re.compile(r"_seed(\d+)$")
+#:
+#: Review finding 6: deliberately rejects a leading zero (``0|[1-9]\d*``, not
+#: bare ``\d+``) so ``_seed1`` and ``_seed01`` cannot both parse to the
+#: integer key ``1`` and silently collide in :func:`discover_seed_runs`'s
+#: ``found`` dict -- one of the two directories would disappear from the
+#: aggregate with no trace. ``train_grpo.run_experiment_name`` builds this
+#: suffix with an f-string int format (``f"_seed{seed}"``), which never
+#: produces a leading zero, so a directory shaped like one can only be
+#: hand-made; rejecting it here means it is simply not recognised as a seed
+#: directory rather than risking that collision. The optional ``-`` keeps a
+#: negative ``--set seed=-1`` run (reachable, though not via
+#: ``run_round1.py``, which only ever passes the ints handed to ``--seeds``)
+#: discoverable.
+_SEED_SUFFIX_RE = re.compile(r"_seed(0|-?[1-9]\d*)$")
 
 
 @dataclass(frozen=True)
@@ -578,6 +617,18 @@ def check_pre_registration(frozen: dict[str, Any]) -> list[str]:
     the record of what was promised, and this refuses to let the code drift
     from it.
 
+    Review finding 2 (Addition 2): the across-seed criterion
+    (:data:`ACROSS_SEED_BOOTSTRAP` / :data:`ACROSS_SEED_MIN_MARGIN_SOURCE` /
+    :data:`ACROSS_SEED_REQUIRES_UNANIMITY`, applied by
+    :func:`compute_seed_aggregates`) used to be pre-registered in
+    ``frozen_baseline.json`` as PROSE -- ``success_criterion_across_seeds``
+    and ``success_criterion_statistics.across_seed_rule`` -- with nothing in
+    this function reading either key, which is the identical unbound-drift
+    failure mode the rest of this docstring describes, just for a newer
+    criterion. Both keys are now required to be present, and three
+    structured statistics keys are checked against code the same way
+    ``n_bootstrap``/``confidence``/``bootstrap_seed`` already are.
+
     Args:
         frozen: The parsed ``frozen_baseline.json``.
 
@@ -613,10 +664,29 @@ def check_pre_registration(frozen: dict[str, Any]) -> list[str]:
                         f"{sorted(frozen_structural)}")
 
     statistics = frozen.get("success_criterion_statistics", {})
-    for key, coded_value in (("n_bootstrap", N_BOOTSTRAP), ("confidence", BOOTSTRAP_CONFIDENCE),
-                             ("bootstrap_seed", BOOTSTRAP_SEED)):
+    for key, coded_value in (
+        ("n_bootstrap", N_BOOTSTRAP), ("confidence", BOOTSTRAP_CONFIDENCE),
+        ("bootstrap_seed", BOOTSTRAP_SEED),
+        ("across_seed_bootstrap", ACROSS_SEED_BOOTSTRAP),
+        ("across_seed_min_margin_source", ACROSS_SEED_MIN_MARGIN_SOURCE),
+        ("across_seed_requires_unanimity", ACROSS_SEED_REQUIRES_UNANIMITY),
+    ):
         if key in statistics and statistics[key] != coded_value:
             problems.append(f"{key}: code {coded_value!r} != frozen {statistics[key]!r}")
+
+    # Review finding 2: presence, not just value-on-match -- a DELETED key
+    # must fail too, not silently skip the comparison the way the six
+    # optional value checks above do for a genuinely older record.
+    if not frozen.get("success_criterion_across_seeds"):
+        problems.append(
+            "frozen_baseline.json has no success_criterion_across_seeds -- the across-seed "
+            "criterion compute_seed_aggregates() applies is unregistered"
+        )
+    if not statistics.get("across_seed_rule"):
+        problems.append(
+            "frozen_baseline.json's success_criterion_statistics has no across_seed_rule -- "
+            "the across-seed criterion compute_seed_aggregates() applies is unregistered"
+        )
     return problems
 
 
@@ -702,7 +772,20 @@ def discover_seed_runs(
             match = _SEED_SUFFIX_RE.search(candidate.name)
             if match is None:
                 continue
-            found[int(match.group(1))] = candidate
+            seed_value = int(match.group(1))
+            if seed_value in found:
+                # Should be unreachable for anything train_grpo.py itself
+                # created (the regex above already forbids the one
+                # collision -- a leading zero -- it could produce by
+                # accident); still logged rather than silently dropped, so
+                # a hand-made collision never loses a run with no trace.
+                _LOGGER.warning(
+                    "discover_seed_runs(%s): both %r and %r resolve to seed %d -- keeping %r, "
+                    "dropping the other.", arm_name, found[seed_value].name, candidate.name,
+                    seed_value, found[seed_value].name,
+                )
+                continue
+            found[seed_value] = candidate
     return sorted(found.items())
 
 
@@ -1210,6 +1293,45 @@ def _across_seed_clause(
     return bool(delta >= min_margin), delta
 
 
+def _unanimous_clause(
+    values: Sequence[float | None], base_value: Any, *, direction: str, min_margin: float,
+) -> bool | None:
+    """Whether EVERY individual seed value clears ``min_margin`` on its own.
+
+    Review judgement on margin-only-on-the-mean: it can pass on seeds that
+    disagree about the sign entirely -- e.g. per-seed deltas
+    ``{+0.09, +0.01, -0.04}`` against ``min_margin=0.02`` give a mean of
+    ``+0.02``, a pass, while one seed actually LOST to arm_b. Unanimity is
+    distribution-free (no assumed sampling distribution, unlike a
+    ``mean_delta - min_margin >= sd/sqrt(n)`` guard, which is not defensible
+    at n=1-3), needs no minimum sample size, and is exactly what "not seed
+    luck" means operationally. See ``frozen_baseline.json``'s
+    ``success_criterion_across_seeds`` for the full reasoning and the two
+    alternatives (a seed-level bootstrap, a sign test) considered and
+    rejected.
+
+    Args:
+        values: One value per seed -- typically a :func:`_seed_stat`
+            result's ``"values"`` (already ``None``-filtered).
+        base_value: arm_b's own (single-run) value of the SAME metric column.
+        direction: ``"higher"`` or ``"lower"``.
+        min_margin: The pre-registered minimum effect size (same one
+            :func:`_across_seed_clause` uses -- there is no separate
+            unanimity margin).
+
+    Returns:
+        ``None`` -- not ``True`` -- when there are no values or arm_b's
+        value is unmeasured: "not measured" and "measured and vacuously
+        true over zero seeds" are different facts, and the latter would
+        read as an unearned pass.
+    """
+    finite = [float(v) for v in values if v is not None]
+    if not finite or base_value is None:
+        return None
+    sign = 1.0 if direction == "higher" else -1.0
+    return all(sign * (value - float(base_value)) >= min_margin for value in finite)
+
+
 def compute_seed_aggregates(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Group RLVR rows by arm and report mean +/- sd across seeds, per metric.
 
@@ -1233,17 +1355,39 @@ def compute_seed_aggregates(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
             simply absent from the result.
 
     Returns:
-        ``{arm_name: {"n_seeds", "seeds", "optimized_metric", "min_margin",
-        "metrics": {column: _seed_stat(...) for column in
-        SEED_AGGREGATE_METRICS}, "across_seed_beats_arm_b",
-        "across_seed_delta_ensemble", "across_seed_survives_audit",
-        "across_seed_delta_auditor", "across_seed_success"}}``. The verdict
-        keys are ``None`` for an arm with no entry in :data:`ARM_METRIC`
-        (``control`` -- see its docstring: optimizing nothing means nothing
-        can beat or lose to arm_b) and ``across_seed_success`` is ``None``
-        whenever any one of the arm's seeds was not sampled at arm_b's
-        operating point (mirrors :func:`apply_success_criterion`'s own
-        ``sampling_matches_arm_b`` refusal, extended across every seed).
+        Per arm: ``n_seeds``/``seeds`` (both derived from the SAME
+        ``seed``-not-``None`` row list, so they cannot disagree -- review
+        finding 7), ``n_seeds_matching_sampling``, ``sampling_mismatch_
+        seeds`` / ``sampling_unknown_sampling_seeds`` (seeds excluded from
+        the metrics below because ``sampling_matches_arm_b`` was ``False``
+        or ``None`` respectively -- review finding 5 keeps those two facts
+        distinct rather than collapsing both into one boolean),
+        ``optimized_metric``, ``min_margin``, ``metrics`` (``{column:
+        _seed_stat(...) for column in SEED_AGGREGATE_METRICS}``, computed
+        ONLY over sampling-matching rows -- review finding 4: a seed
+        excluded from the verdict must also be excluded from the published
+        mean/sd, not silently averaged in), ``across_seed_beats_arm_b`` /
+        ``across_seed_delta_ensemble`` / ``across_seed_survives_audit`` /
+        ``across_seed_delta_auditor`` / ``across_seed_success`` (the
+        mean-based verdict, unchanged in meaning), ``across_seed_unanimous_
+        ensemble`` / ``across_seed_unanimous_auditor`` / ``across_seed_
+        unanimous`` (whether EVERY individual matching seed clears
+        ``min_margin`` on its own -- the review's statistical
+        recommendation: mean-only can pass on seeds that disagree about the
+        sign, see :func:`_unanimous_clause`), and ``combined_success`` (the
+        actual conjunction of ``across_seed_success``, ``across_seed_
+        unanimous`` and every contributing seed's own per-row bootstrap
+        ``success`` -- review finding 8: ``success`` and ``across_seed_
+        success`` used to be reported side by side with nothing joining
+        them).
+
+        Every verdict/unanimity/``combined_success`` key is ``None`` for an
+        arm with no entry in :data:`ARM_METRIC` (``control`` -- see its
+        docstring: optimizing nothing means nothing can beat or lose to
+        arm_b) and ``None`` whenever any one of the arm's seeds was not
+        confirmed sampled at arm_b's operating point (mirrors
+        :func:`apply_success_criterion`'s own ``sampling_matches_arm_b``
+        refusal, extended across every seed).
     """
     trained = [
         row for row in rows
@@ -1257,14 +1401,41 @@ def compute_seed_aggregates(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
 
     aggregates: dict[str, dict[str, Any]] = {}
     for arm_name, arm_rows in by_arm.items():
+        # Finding 7: both derived from the SAME filtered list, so they
+        # cannot disagree the way a bare len(arm_rows) vs a None-dropping
+        # "seeds" list could.
         seeds = sorted(row["seed"] for row in arm_rows if row.get("seed") is not None)
+
+        # Finding 5: apply_success_criterion already keeps "confirmed
+        # mismatch" (False) and "unknown" (None) apart per row; this
+        # preserves that distinction across the whole arm instead of
+        # folding both into one collapsed boolean.
+        mismatched_seeds = sorted(
+            row["seed"] for row in arm_rows
+            if row.get("sampling_matches_arm_b") is False and row.get("seed") is not None
+        )
+        unknown_sampling_seeds = sorted(
+            row["seed"] for row in arm_rows
+            if row.get("sampling_matches_arm_b") is None and row.get("seed") is not None
+        )
+        all_match = not mismatched_seeds and not unknown_sampling_seeds
+
+        # Finding 4: a seed excluded from the verdict is excluded from the
+        # published mean/sd too -- not averaged in and then separately
+        # refused.
+        matching_rows = [row for row in arm_rows if row.get("sampling_matches_arm_b") is True]
         metrics = {
-            column: _seed_stat([row.get(column) for row in arm_rows])
+            column: _seed_stat([row.get(column) for row in matching_rows])
             for column in SEED_AGGREGATE_METRICS
         }
+
         metric_name, direction = ARM_METRIC.get(arm_name, (None, None))
         entry: dict[str, Any] = {
-            "n_seeds": len(arm_rows), "seeds": seeds, "metrics": metrics,
+            "n_seeds": len(seeds), "seeds": seeds,
+            "n_seeds_matching_sampling": len(matching_rows),
+            "sampling_mismatch_seeds": mismatched_seeds,
+            "sampling_unknown_sampling_seeds": unknown_sampling_seeds,
+            "metrics": metrics,
             "optimized_metric": metric_name, "min_margin": ARM_MIN_MARGIN.get(arm_name),
         }
 
@@ -1274,32 +1445,49 @@ def compute_seed_aggregates(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
             entry["across_seed_survives_audit"] = None
             entry["across_seed_delta_auditor"] = None
             entry["across_seed_success"] = None
+            entry["across_seed_unanimous_ensemble"] = None
+            entry["across_seed_unanimous_auditor"] = None
+            entry["across_seed_unanimous"] = None
+            entry["combined_success"] = None
             aggregates[arm_name] = entry
             continue
 
         min_margin = float(ARM_MIN_MARGIN.get(arm_name, 0.0))
-        all_match = all(row.get("sampling_matches_arm_b") for row in arm_rows)
 
         ensemble_column = _metric_column(metric_name, "ensemble")
+        ensemble_base = arm_b.get(ensemble_column)
         beats, delta_ensemble = _across_seed_clause(
-            metrics[ensemble_column]["mean"], arm_b.get(ensemble_column),
+            metrics[ensemble_column]["mean"], ensemble_base,
+            direction=direction, min_margin=min_margin,
+        )
+        unanimous_ensemble = _unanimous_clause(
+            metrics[ensemble_column]["values"], ensemble_base,
             direction=direction, min_margin=min_margin,
         )
         entry["across_seed_beats_arm_b"] = beats
         entry["across_seed_delta_ensemble"] = delta_ensemble
+        entry["across_seed_unanimous_ensemble"] = unanimous_ensemble
 
         if metric_name in STRUCTURAL_METRICS:
             audit_clause: Any = True
+            unanimous_auditor: Any = True
             entry["across_seed_survives_audit"] = STRUCTURAL_AUDIT_NOTE
             entry["across_seed_delta_auditor"] = None
+            entry["across_seed_unanimous_auditor"] = STRUCTURAL_AUDIT_NOTE
         else:
             auditor_column = _metric_column(metric_name, "auditor")
+            auditor_base = arm_b.get(auditor_column)
             audit_clause, delta_auditor = _across_seed_clause(
-                metrics[auditor_column]["mean"], arm_b.get(auditor_column),
+                metrics[auditor_column]["mean"], auditor_base,
+                direction=direction, min_margin=min_margin,
+            )
+            unanimous_auditor = _unanimous_clause(
+                metrics[auditor_column]["values"], auditor_base,
                 direction=direction, min_margin=min_margin,
             )
             entry["across_seed_survives_audit"] = audit_clause
             entry["across_seed_delta_auditor"] = delta_auditor
+            entry["across_seed_unanimous_auditor"] = unanimous_auditor
 
         if beats is None or audit_clause is None:
             entry["across_seed_success"] = None
@@ -1311,6 +1499,28 @@ def compute_seed_aggregates(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
         else:
             entry["across_seed_success"] = bool(beats and audit_clause)
 
+        if unanimous_ensemble is None or unanimous_auditor is None:
+            entry["across_seed_unanimous"] = None
+        elif not all_match:
+            entry["across_seed_unanimous"] = None
+        else:
+            entry["across_seed_unanimous"] = bool(unanimous_ensemble and unanimous_auditor)
+
+        # Finding 8: the actual conjunction -- every contributing seed's own
+        # per-candidate bootstrap success, AND the across-seed mean, AND
+        # across-seed unanimity. success and across_seed_success/across_
+        # seed_unanimous remain separately reported (they answer different
+        # questions), but a reader no longer has to perform this AND by hand.
+        per_row_success = [row.get("success") for row in matching_rows]
+        if (entry["across_seed_success"] is None or entry["across_seed_unanimous"] is None
+                or not matching_rows or any(value is None for value in per_row_success)):
+            entry["combined_success"] = None
+        else:
+            entry["combined_success"] = bool(
+                entry["across_seed_success"] and entry["across_seed_unanimous"]
+                and all(bool(value) for value in per_row_success)
+            )
+
         aggregates[arm_name] = entry
 
     return aggregates
@@ -1320,8 +1530,12 @@ def format_seed_summary_markdown(aggregates: dict[str, dict[str, Any]]) -> str:
     """Render :func:`compute_seed_aggregates`' output as a markdown table.
 
     One row per RLVR arm with at least one trained seed, reporting its
-    OPTIMIZED metric's across-seed mean and spread (ensemble and auditor),
-    the seed count, and the across-seed verdict. An arm with exactly one
+    OPTIMIZED metric's across-seed mean and spread (ensemble and auditor,
+    computed only over seeds sampled at arm_b's operating point -- review
+    finding 4), the seed count, the mean-based verdict, whether EVERY
+    individual seed unanimously clears the margin on its own (review's
+    statistical recommendation -- see :func:`_unanimous_clause`), and the
+    combined verdict (review finding 8). An arm with exactly one matching
     seed reports its spread as the literal ``"1 seed"``, never a fabricated
     ``0.0`` -- a single run has no run-to-run variance to report. ``control``
     (and any arm with no entry in :data:`ARM_METRIC`) reports ``"n/a"`` for
@@ -1334,11 +1548,13 @@ def format_seed_summary_markdown(aggregates: dict[str, dict[str, Any]]) -> str:
         Markdown text (a heading plus a table), or just the heading if
         ``aggregates`` is empty -- never raises on an empty input.
     """
-    header = ("| arm | optimized_metric | n_seeds | seeds | mean_ensemble | "
-              "spread_ensemble | mean_auditor | spread_auditor | "
-              "across_seed_beats_arm_b | across_seed_survives_audit | "
-              "across_seed_success |")
-    sep = "|" + "|".join("---:" for _ in range(11)) + "|"
+    columns = (
+        "arm", "optimized_metric", "n_seeds", "seeds", "mean_ensemble", "spread_ensemble",
+        "mean_auditor", "spread_auditor", "across_seed_beats_arm_b", "across_seed_survives_audit",
+        "across_seed_unanimous", "across_seed_success", "combined_success",
+    )
+    header = "| " + " | ".join(columns) + " |"
+    sep = "|" + "|".join("---:" for _ in columns) + "|"
     lines = ["", "### Cross-seed summary", "", header, sep]
     for arm_name, entry in aggregates.items():
         metric_name = entry.get("optimized_metric")
@@ -1360,7 +1576,9 @@ def format_seed_summary_markdown(aggregates: dict[str, dict[str, Any]]) -> str:
             _format_seed_spread(auditor_stat),
             _format_cell(entry.get("across_seed_beats_arm_b")),
             _format_cell(entry.get("across_seed_survives_audit")),
+            _format_cell(entry.get("across_seed_unanimous")),
             _format_cell(entry.get("across_seed_success")),
+            _format_cell(entry.get("combined_success")),
         ]) + " |")
     return "\n".join(lines) + "\n"
 

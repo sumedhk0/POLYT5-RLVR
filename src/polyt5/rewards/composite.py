@@ -286,6 +286,33 @@ class ConstraintArm(_BaseArm):
         return out
 
 
+#: Third element of :class:`ControlArm`'s RNG seed tuple.
+#:
+#: :meth:`~polyt5.rl.trainer.GRPOTrainer.step` seeds
+#: ``np.random.default_rng([cfg.seed, step_index])`` for its OWN target-Tg
+#: sampling (see that module's docstring), then immediately draws
+#: ``rng.uniform(target_min, target_max, size=prompts_per_step)`` from it.
+#: Seeding :class:`ControlArm` with that IDENTICAL two-integer pair -- as an
+#: earlier version of this class did -- means the control's first
+#: ``prompts_per_step`` rewards ARE that step's normalized target values:
+#: measured correlation ``1.000000``, max absolute difference ``0.0``,
+#: against ``target_min + (target_max - target_min) * control_draws``. That
+#: is a deterministic affine image of the run's conditioning variable, not
+#: independent noise -- precisely the property this arm exists to rule out
+#: (see ``ControlArm``'s own docstring).
+#:
+#: A THIRD seed element already guarantees a different entropy pool than the
+#: trainer's two-element one, for any value -- ``numpy``'s ``SeedSequence``
+#: does not collide sequences of different length. The specific value below
+#: is therefore not load-bearing on its own; a named module-level constant is
+#: used anyway, rather than a bare literal inlined at the call site, so the
+#: intent ("this integer exists ONLY to keep this stream distinct from
+#: anything else in the process, on purpose") is legible at the point of use
+#: instead of resting on an implementation detail of ``SeedSequence`` hashing
+#: that nothing here documents.
+_CONTROL_STREAM_TAG: int = 0xC0117201
+
+
 class ControlArm(_BaseArm):
     """Negative control: reward is uniform random in ``[0, 1)``, independent
     of the candidate entirely.
@@ -321,15 +348,28 @@ class ControlArm(_BaseArm):
       not. Gating invalid candidates to ``0.0`` here would make this
       secretly a second validity arm, correlated with PV by construction,
       not a control.
-    * **Reproducible, not merely random.** ``np.random.default_rng([seed,
-      step_index])`` - the SAME two-integer seeding
-      :meth:`~polyt5.rl.trainer.GRPOTrainer.step` uses for its own target
-      sampling (see that module's docstring) - so replaying step
-      ``step_index`` of a run with the same ``seed`` reproduces the exact
-      same rewards. The GLOBAL numpy RNG (``np.random.seed``/``np.random.
-      rand``) is never touched, so these draws cannot be perturbed by, or
-      accidentally perturb, anything else in the process that happens to use
-      the global generator.
+    * **Reproducible, not merely random - and on its OWN stream.**
+      ``np.random.default_rng([seed, step_index, _CONTROL_STREAM_TAG])`` -
+      deliberately built from the same two leading integers
+      :meth:`~polyt5.rl.trainer.GRPOTrainer.step` uses for its own target-Tg
+      sampling (see that module's docstring), but tagged with a third,
+      distinct constant so it is never the SAME stream. Without the tag this
+      arm and the trainer's own ``rng = np.random.default_rng([cfg.seed,
+      step_index])`` would draw from the identical bit stream - and since
+      the trainer's very next call is ``rng.uniform(target_min, target_max,
+      size=prompts_per_step)``, the control's "independent noise" would be a
+      deterministic affine image of that step's target Tg vector (measured,
+      before :data:`_CONTROL_STREAM_TAG` existed: correlation ``1.000000``
+      between the first ``prompts_per_step`` control rewards and that step's
+      targets). That is not independent of the run's conditioning variable,
+      which is exactly the property this arm exists to guarantee - see
+      :data:`_CONTROL_STREAM_TAG`. Replaying step ``step_index`` of a run
+      with the same ``seed`` still reproduces the exact same rewards; only
+      the stream itself is guaranteed distinct from anything else in the
+      process. The GLOBAL numpy RNG (``np.random.seed``/``np.random.rand``)
+      is never touched either, so these draws cannot be perturbed by, or
+      accidentally perturb, anything else that happens to use the global
+      generator.
     * **Random, never constant.** A constant reward (e.g. always ``0.5``)
       gives every group zero within-group variance, hence an advantage of
       exactly ``0.0`` for every member (see
@@ -367,7 +407,11 @@ class ControlArm(_BaseArm):
         # three sequences' actual content, only their common length.
         for _ in zip(candidates, targets, predictions, strict=True):
             pass
-        rng = np.random.default_rng([self.seed, int(step_index)])
+        # The third element is load-bearing, not decoration -- see
+        # _CONTROL_STREAM_TAG's own docstring. [self.seed, step_index] ALONE
+        # is the identical pair GRPOTrainer.step seeds its own target-Tg
+        # sampling from.
+        rng = np.random.default_rng([self.seed, int(step_index), _CONTROL_STREAM_TAG])
         draws = rng.uniform(0.0, 1.0, size=len(candidates))
         return [RewardResult(float(value), {"control": float(value)}) for value in draws]
 
