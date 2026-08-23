@@ -1,5 +1,29 @@
 """Confidence-weighted Tg reward.
 
+.. warning::
+
+   **This term is NOT verifiable, and arms built on it are not RLVR.** A
+   generated polymer has no experimental Tg and never will -- nobody has
+   synthesised it -- so this reward is a learned model's opinion, not a
+   computed fact. ``accuracy``, ``composite`` and ``constraint`` are therefore
+   reinforcement learning against a LEARNED reward; only ``validity`` (the
+   RDKit cascade) and ``control`` (candidate-independent noise) have rewards
+   that can actually be checked. That is a legitimate method -- the paper
+   screens its own 6.17M candidates with polyT5-based predictors the same way
+   -- but it must be labelled as what it is.
+
+   **The confidence weight below is weaker than its rationale claims.**
+   ``docs/instrument_audit.md`` measured corr(sigma, |error|) = 0.15 on
+   predictions from members that never trained on the polymer, i.e. sigma
+   explains roughly 2% of error variance. The 16.7 K figure quoted below is a
+   CONTAMINATED number: it is inflated by members that memorised the answer
+   disagreeing with members that did not, which is split membership rather
+   than uncertainty about the molecule. The weight is retained because
+   changing a reward mid-round would invalidate the round in flight, not
+   because the audit vindicated it. Phase 4
+   (``docs/superpowers/specs/2026-08-23-phase4-group-a-design.md``) rebuilds
+   the instrument this term depends on.
+
 The Tg reward is the only term backed by a model rather than a computed fact,
 so it is the only term a policy can farm. Our five predictors disagree by
 16.7 K on average and up to 45.2 K, so exploitable regions demonstrably exist.

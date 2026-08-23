@@ -1,7 +1,33 @@
 # Phase 3 plan: GRPO + RLVR extension
 
-> **⚠️ APPARATUS IMPLEMENTED (Tasks 1–9). NO ARM HAS BEEN TRAINED YET. NOT PART OF THE PUBLISHED polyT5
-> METHOD.**
+> **⚠️ PARTLY SUPERSEDED — 2026-08-23.** Two premises in this document did not survive measurement, and
+> the sections resting on them should be read as the original design record, not as current practice.
+>
+> **1. "Verifiable" does not cover the Tg arms.** A generated polymer has no experimental Tg and never
+> will, so a Tg reward is a learned model's opinion about a molecule nobody has synthesised. Only
+> `validity` (RDKit cascade) and `control` (candidate-independent noise) have rewards that can actually
+> be checked. `accuracy`, `composite` and `constraint` are **reinforcement learning against a learned
+> reward** — a legitimate method, and what the paper's own screening does, but it is not RLVR and is no
+> longer labelled as such. See the README's verifiability table.
+>
+> **2. The reward ensemble and its σ are weaker than assumed.**
+> [`instrument_audit.md`](instrument_audit.md) measured: the 4-model ensemble adds nothing over a single
+> model (28.82 K honest vs 28.67 K), it appears 41% better than it is when scored on data three of four
+> members trained on, and σ explains ~2% of error variance — so §4.2's confidence weight is weakly
+> justified rather than load-bearing. It was left in place because changing a reward mid-round would
+> invalidate the round in flight, not because the audit vindicated it.
+>
+> **What replaced them.** A fifth arm, `control`, was added — a uniform random reward independent of the
+> candidate, without which no other arm's movement is attributable to its own reward design. Success
+> moved to an across-seed criterion requiring unanimity. And Phase 4
+> (`superpowers/specs/2026-08-23-phase4-group-a-design.md`) exists to rebuild the Tg instrument these
+> arms depend on.
+>
+> **⚠️ ROUND 1 PARTIALLY TRAINED. NOT PART OF THE PUBLISHED polyT5 METHOD.** `accuracy` is complete
+> (and collapsed diversity 0.951 → 0.535 while its reward-scored error fell — a verified cost for an
+> unverified gain, reported as a motivating negative result). `validity` is training. `composite`,
+> `constraint` and `control` have not started. No arm has been through `compare_arms.py`, so **no final
+> RLVR result exists.**
 >
 > polyT5 (Sahu et al., npj Artificial Intelligence 2026) is **supervised throughout**: span-corruption
 > pretraining, supervised fine-tuning, then sampling and screening. It contains no reinforcement learning
@@ -10,8 +36,9 @@
 > category, distinct from both *"the paper reports"* and *"our reproduction obtains"*.
 >
 > This document predates the implementation and is kept as the original design record. The as-built spec
-> and task-by-task plan are `docs/superpowers/specs/2026-08-20-grpo-rlvr-design.md` and
-> `docs/superpowers/plans/2026-08-20-grpo-rlvr.md`; §8 below records entry-gate status.
+> and task-by-task plan are `superpowers/specs/2026-08-20-grpo-rlvr-design.md` and
+> `superpowers/plans/2026-08-20-grpo-rlvr.md`; §8 below records entry-gate status. Where this file and
+> the superseding note above disagree, the note is current.
 
 The reward primitives (`src/polyt5/rewards/`) and RL core (`src/polyt5/rl/`) described below now exist,
 built exactly per the constraint stated when this file was written: nothing in
