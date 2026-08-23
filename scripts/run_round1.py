@@ -49,8 +49,42 @@ def last_step(arm: str) -> int | None:
     return max(steps) if steps else None
 
 
+def trainer_is_alive() -> bool | None:
+    """Whether a train_grpo.py process exists. None if that cannot be determined.
+
+    Liveness, not progress, is what distinguishes a dead run from a slow one --
+    and it is the only signal that survives the machine suspending. Wall clock
+    does not: ``time.monotonic()`` on Windows counts suspended time, so a laptop
+    that slept overnight looks identical to a hung trainer.
+    """
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" |"
+             " Where-Object { $_.CommandLine -like '*train_grpo.py*' } |"
+             " Measure-Object).Count"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        return int(completed.stdout.strip()) > 0
+    except ValueError:
+        return None
+
+
 def wait_for(arm: str, *, target_steps: int, stall_seconds: float, poll: float) -> bool:
-    """Block until `arm` reaches target_steps. False if it stalls or dies."""
+    """Block until `arm` reaches target_steps. False only if it is truly dead.
+
+    Aborts when the step count has not advanced for `stall_seconds` AND no
+    trainer process exists. Both conditions are required: a machine that
+    suspends, or a GPU throttled to a third of its clock on battery power,
+    stops advancing steps while remaining perfectly healthy -- an earlier
+    version of this function aborted exactly that case after charging ~17 h
+    of laptop sleep against its stall budget.
+    """
     last_seen, last_change = last_step(arm), time.monotonic()
     print(f"[driver] waiting for arm={arm} to reach step {target_steps} "
           f"(currently {last_seen})", flush=True)
@@ -64,10 +98,24 @@ def wait_for(arm: str, *, target_steps: int, stall_seconds: float, poll: float) 
             last_seen, last_change = current, time.monotonic()
             continue
         stalled = time.monotonic() - last_change
-        if stalled > stall_seconds:
-            print(f"[driver] ABORT: arm={arm} stuck at step {last_seen} for "
-                  f"{stalled / 60:.0f} min. Not starting the remaining arms.", flush=True)
-            return False
+        if stalled <= stall_seconds:
+            continue
+        alive = trainer_is_alive()
+        if alive is None:
+            print(f"[driver] arm={arm} at step {last_seen}, no progress for "
+                  f"{stalled / 60:.0f} min; liveness undetermined, still waiting.", flush=True)
+            last_change = time.monotonic()
+            continue
+        if alive:
+            print(f"[driver] arm={arm} at step {last_seen}, no progress for "
+                  f"{stalled / 60:.0f} min, but the trainer is alive (suspended or "
+                  f"throttled?). Still waiting.", flush=True)
+            last_change = time.monotonic()
+            continue
+        print(f"[driver] ABORT: arm={arm} stuck at step {last_seen} for "
+              f"{stalled / 60:.0f} min and no trainer process is running. "
+              f"Not starting the remaining arms.", flush=True)
+        return False
 
 
 def train(arm: str) -> bool:
