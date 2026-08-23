@@ -133,4 +133,7 @@ novelty index is missing (`--allow-missing-novelty-index` to override, which dis
 duplicate detection for every row) and refuses to score an arm whose sampling settings
 do not match Arm B's protocol, since that row would not be comparable.
 
-**No arm has been trained to completion yet. This repository reports no RLVR result.**
+**`accuracy` has been trained to completion; it is retired and reported as a motivating
+negative result (reward-scored error 52.5 -> 31.4 K while `unique_fraction` fell 0.951 ->
+0.535). No arm has been through `compare_arms.py`, so this repository reports no final RLVR
+result.**
