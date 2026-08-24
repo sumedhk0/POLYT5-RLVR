@@ -56,6 +56,10 @@ from polyt5.data.splits import (
     random_split,
     save_splits,
 )
+from polyt5.data.standardize import (
+    Standardizer,
+    fit_target_standardizer,
+)
 from polyt5.data.tg_metadata import (
     DESCRIPTOR_PREFIXES,
     TgExample,
@@ -80,6 +84,7 @@ __all__ = [
     "SpanCorruptionCollator",
     "SpanCorruptionConfig",
     "SpanCorruptionResult",
+    "Standardizer",
     "TgExample",
     "TgRow",
     "batch_span_corrupt",
@@ -90,6 +95,7 @@ __all__ = [
     "descriptor_group",
     "descriptor_matrix",
     "download",
+    "fit_target_standardizer",
     "format_property_value",
     "load_splits",
     "make_kfold_random_splits",
