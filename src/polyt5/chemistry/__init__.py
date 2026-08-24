@@ -50,6 +50,7 @@ from .conversion import (
     smiles_to_selfies,
     star_to_at,
 )
+from .enumeration import enumerate_pselfies_writings
 from .metrics import (
     SA_AVAILABLE,
     GenerationChemMetrics,
@@ -88,6 +89,7 @@ __all__ = [
     "cleave_and_cap",
     "count_termini",
     "cyclize_psmiles",
+    "enumerate_pselfies_writings",
     "evaluate_generations",
     "hash64",
     "hash64_many",

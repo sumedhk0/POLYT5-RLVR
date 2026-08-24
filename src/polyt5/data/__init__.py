@@ -17,6 +17,7 @@ deliberately **not** re-exported here — import it explicitly::
 
 from __future__ import annotations
 
+from polyt5.data.augment import AugmentedExample, augment_indices
 from polyt5.data.collate import (
     LABEL_IGNORE_ID,
     Seq2SeqCollator,
@@ -83,6 +84,7 @@ __all__ = [
     "LABEL_IGNORE_ID",
     "RED_RELIABILITY",
     "SOURCES",
+    "AugmentedExample",
     "ConfirmationRequiredError",
     "DataSource",
     "DownloadRecord",
@@ -95,6 +97,7 @@ __all__ = [
     "Standardizer",
     "TgExample",
     "TgRow",
+    "augment_indices",
     "batch_span_corrupt",
     "build_generation_examples",
     "build_prediction_examples",
