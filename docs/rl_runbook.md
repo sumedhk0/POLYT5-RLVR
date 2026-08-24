@@ -137,3 +137,21 @@ do not match Arm B's protocol, since that row would not be comparable.
 negative result (reward-scored error 52.5 -> 31.4 K while `unique_fraction` fell 0.951 ->
 0.535). No arm has been through `compare_arms.py`, so this repository reports no final RLVR
 result.**
+
+## Commit provenance note
+
+`51cd00f` carries a destroyed commit message — the literal text `$(cat <<'EOF'` —
+because an amend's heredoc failed. Its content is intact and reviewed: it is
+**Phase 4 Group A, Task 12**, adding `src/polyt5/evaluation/ablation.py`, its package
+export, and `tests/test_group_a_ablation.py` (475 insertions). That commit implements
+the **pre-registered verdict**: `helps` below 27.9142 K, `no effect` inside the
+baseline's own spread, `hurts` above it, with the threshold derived from
+caller-supplied baseline statistics and provably not recomputable from the arms' own
+results.
+
+Its tree hash is identical to the pre-amend commit `50d9484`, so the review packaged
+against that SHA remains valid.
+
+The message was not repaired by rewriting history: doing so would have meant
+rebasing twelve reviewed commits immediately before a long GPU run, risking real work
+to fix a cosmetic defect in a commit whose content is sound.
