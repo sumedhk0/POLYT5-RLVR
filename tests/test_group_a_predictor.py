@@ -190,3 +190,37 @@ def test_unstandardisation_matches_a_hand_computed_kelvin_value(
     predictor = RegressionPropertyPredictor(model, tokenizer, device="cpu")
     result = predictor.predict(["[At][C][C][O][At]"])[0]
     assert result.value == pytest.approx(expected_kelvin, abs=1e-4)
+
+
+def test_call_auto_converts_psmiles_to_agree_with_the_pselfies_prediction():
+    """evaluate_generation hands __call__ canonical PSMILES, not PSELFIES --
+    the same contract PolyT5PropertyPredictor.__call__ honours by converting
+    notation before scoring. "[At]CCO[At]" is the PSMILES form of the exact
+    same polymer as "[At][C][C][O][At]" (verified via psmiles_to_pselfies);
+    without conversion the PSMILES string is mis-tokenized character-by-
+    character and scores as a DIFFERENT, wrong-but-finite Kelvin value."""
+    model, tokenizer, _ = build()
+    predictor = RegressionPropertyPredictor(model, tokenizer, device="cpu")
+    pselfies_value = predictor(["[At][C][C][O][At]"])[0]
+    psmiles_value = predictor(["[At]CCO[At]"])[0]
+    assert psmiles_value == pytest.approx(pselfies_value, abs=1e-4)
+
+
+def test_call_survives_an_inference_exception_like_the_baseline_does():
+    """PolyT5PropertyPredictor.__call__ wraps scoring in try/except so one bad
+    batch degrades to NaNs, never an exception escaping into evaluate_generation.
+    RegressionPropertyPredictor.__call__ must do the same to be interchangeable
+    at the injection point."""
+    model, tokenizer, _ = build()
+    predictor = RegressionPropertyPredictor(model, tokenizer, device="cpu")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("simulated inference failure")
+
+    # Patch the actual torch call inside predict(), not predict()/predict_values()
+    # themselves -- so this test exercises __call__'s exception handling no
+    # matter which of its own methods __call__ happens to delegate through.
+    predictor.model.predict_tg = boom
+    values = predictor(["[At][C][C][At]"])
+    assert len(values) == 1
+    assert math.isnan(values[0])

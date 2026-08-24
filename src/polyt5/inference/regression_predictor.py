@@ -22,11 +22,13 @@ from typing import Any
 
 import torch
 
+from polyt5.chemistry import psmiles_to_pselfies
 from polyt5.data.prepare import format_property_value
 from polyt5.inference.predictor import (
     DEFAULT_MAX_SOURCE_LENGTH,
     NON_NUMERIC_VALUE,
     PredictionResult,
+    looks_like_pselfies,
 )
 from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration
 from polyt5.model.multitask import MultiTaskConfig, PolyT5MultiTask
@@ -207,18 +209,49 @@ class RegressionPropertyPredictor:
     def __call__(self, candidates: Sequence[str]) -> list[float]:
         """Injection point for :func:`polyt5.evaluation.evaluate_generation`.
 
+        Mirrors :meth:`polyt5.inference.PolyT5PropertyPredictor.__call__`
+        exactly, because that function hands its predictor the *canonical
+        PSMILES* of the screened candidates while the model is trained on
+        PSELFIES: notation is auto-detected per entry (an all-bracket-token
+        string is used as PSELFIES, anything else is converted from PSMILES),
+        and the whole scoring call is wrapped so an inference failure degrades
+        to NaNs for this batch rather than raising into the evaluation run.
+        Skipping either step would silently score PSMILES input as a
+        mis-tokenized, wrong-but-finite Kelvin value instead of converting or
+        flagging it -- exactly the failure mode this predictor exists to avoid.
+
         Args:
-            candidates: Candidate polymers as PSELFIES.
+            candidates: Polymers as PSELFIES or PSMILES, in any mixture.
 
         Returns:
             One float per candidate; a failure is
             :data:`~polyt5.inference.NON_NUMERIC_VALUE` (NaN), which the TP
             metric drops from both numerator and denominator.
         """
-        return [
-            NON_NUMERIC_VALUE if result.value is None else result.value
-            for result in self.predict(candidates)
-        ]
+        as_pselfies: list[str | None] = []
+        for entry in candidates:
+            if not isinstance(entry, str) or not entry.strip():
+                as_pselfies.append(None)
+            elif looks_like_pselfies(entry):
+                as_pselfies.append(entry)
+            else:
+                as_pselfies.append(psmiles_to_pselfies(entry))
+
+        encodable = [(i, value) for i, value in enumerate(as_pselfies) if value]
+        values: list[float] = [NON_NUMERIC_VALUE] * len(as_pselfies)
+        if not encodable:
+            return values
+
+        try:
+            scored = self.predict_values([value for _, value in encodable])
+        except Exception:
+            # The injection point must be total: an inference failure is "no
+            # numbers", never an exception escaping into an evaluation run.
+            return values
+
+        for (position, _), value in zip(encodable, scored, strict=True):
+            values[position] = float(value) if value is not None else NON_NUMERIC_VALUE
+        return values
 
     def __repr__(self) -> str:
         return (
