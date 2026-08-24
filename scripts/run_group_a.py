@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -87,6 +88,27 @@ class FrozenSplit:
 def _resolve(path_str: str | Path) -> Path:
     path = Path(path_str)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _config_fingerprint(group_a: GroupAConfig) -> str:
+    """Short, deterministic fingerprint of an arm's full configuration.
+
+    Folded into the run-directory name so a hyperparameter override (e.g. the
+    brief's own ``--arm A3 --set group_a.n_writings=8`` example) cannot
+    collide with -- and silently reuse or overwrite -- a cached
+    ``results.json`` written under a different configuration of the SAME arm.
+    Two :class:`GroupAConfig` values that compare equal field-for-field
+    always produce the same fingerprint (so a resumed run still finds its own
+    cache); any field that differs changes it.
+
+    Args:
+        group_a: The arm's fully-resolved switches and hyperparameters.
+
+    Returns:
+        A 12-hex-character digest of ``group_a.to_dict()``.
+    """
+    payload = json.dumps(group_a.to_dict(), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def load_frozen_splits(path: str | Path, *, n_examples: int) -> list[FrozenSplit]:
@@ -324,11 +346,16 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config, overrides=parse_dotted_overrides(args.set))
     seed = int(cfg.get("seed", 0))
     seed_everything(seed)
+    # "train" is read second so a CLI/--set override under train.* still wins,
+    # but every documented knob (including "training.device") lives under
+    # "training" -- computed once, up front, so device selection and the
+    # per-split trainer config below read the exact same merged mapping.
+    train_cfg = {**cfg.get("training", {}), **cfg.get("train", {})}
 
     out_root = _resolve(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     logger = get_logger("polyt5.run_group_a", log_file=out_root / "run_group_a.log")
-    device = select_device(cfg.get("train", {}).get("device", "auto"))
+    device = select_device(train_cfg.get("device", "auto"))
     logger.info("device=%s", describe_device(device).to_dict())
 
     tokenizer_path = _resolve(
@@ -362,7 +389,6 @@ def main(argv: list[str] | None = None) -> int:
         std_floor=float(group_cfg.get("std_floor", 5.6)),
         huber_delta=float(group_cfg.get("huber_delta", 1.0)),
     )
-    train_cfg = {**cfg.get("training", {}), **cfg.get("train", {})}
     max_source = int(train_cfg.get("max_source_length", 200))
     max_target = int(train_cfg.get("max_target_length", 200))
     collator = TaskCollator(pad_id=tokenizer.pad_id, max_source_length=max_source,
@@ -374,7 +400,10 @@ def main(argv: list[str] | None = None) -> int:
         for split in splits:
             if args.only_split is not None and split.index != args.only_split:
                 continue
-            run_dir = RunDirectory.create(out_root, f"{group_a.arm}/split_{split.index}")
+            fingerprint = _config_fingerprint(group_a)
+            run_dir = RunDirectory.create(
+                out_root, f"{group_a.arm}/split_{split.index}_{fingerprint}"
+            )
             results_path = run_dir.root / RESULTS_FILENAME
             if results_path.is_file() and not args.force:
                 payload = json.loads(results_path.read_text(encoding="utf-8"))
@@ -426,6 +455,10 @@ def main(argv: list[str] | None = None) -> int:
                 scheduler=str(train_cfg.get("scheduler", "constant")),
                 amp=bool(train_cfg.get("amp", True)),
                 amp_dtype=str(train_cfg.get("amp_dtype", "bf16")),
+                # Matches the frozen baseline's retention (scripts/run_splits.py):
+                # the TrainerConfig default of 3 would keep ~12.6 GB of
+                # checkpoints across the 35 arm/split runs instead of ~6.3 GB.
+                keep_last_checkpoints=int(train_cfg.get("keep_last_checkpoints", 1)),
                 max_steps=args.max_steps,
                 seed=seed + split.index,
                 device=device,
@@ -504,11 +537,21 @@ def main(argv: list[str] | None = None) -> int:
             run_dir.write_json(RESULTS_FILENAME, {
                 "arm": group_a.arm,
                 "split_index": split.index,
+                "config_fingerprint": fingerprint,
                 "pretrained": pretrained,
                 "train_seconds": train_seconds,
                 "training": train_metrics,
                 "evaluation": report.to_dict(),
                 "checkpoint": str(checkpoint_path),
+                # "evaluation" is scored from the model's FINAL-EPOCH in-memory
+                # weights (Trainer.train() never reloads a checkpoint before
+                # returning), not necessarily from the state saved at
+                # "checkpoint" -- which may hold an earlier, better-val-loss
+                # epoch if GroupATrainer already wrote it mid-training. This
+                # mirrors scripts/run_splits.py's baseline protocol exactly, so
+                # comparability with the frozen 28.6733 K holds; only the label
+                # was ambiguous.
+                "scored_weights": "final_epoch_in_memory",
                 "attrition": tensors.to_manifest(),
             })
             logger.info("%s split %d: MAE=%s RMSE=%s R2=%s (non-numeric %.4f)",
