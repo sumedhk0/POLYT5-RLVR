@@ -14,6 +14,7 @@ from polyt5.model.heads import (
     weighted_lm_loss,
 )
 from polyt5.model.layers import DecoderLayer, EncoderLayer, FeedForward, T5LayerNorm
+from polyt5.model.multitask import HeadOutput, MultiTaskConfig, PolyT5MultiTask
 from polyt5.model.relative_position import RelativePositionBias, relative_position_bucket
 from polyt5.model.transformer import (
     PolyT5ForConditionalGeneration,
@@ -32,6 +33,9 @@ __all__ = [
     "EncoderLayer",
     "FeedForward",
     "T5LayerNorm",
+    "HeadOutput",
+    "MultiTaskConfig",
+    "PolyT5MultiTask",
     "RelativePositionBias",
     "relative_position_bucket",
     "PolyT5ForConditionalGeneration",
