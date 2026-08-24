@@ -42,6 +42,19 @@ Example:
 
 from __future__ import annotations
 
+from .ablation import (
+    BASELINE_ARM,
+    CLAIM_CATEGORY,
+    CLAIM_NOTE,
+    EFFECT_HELPS,
+    EFFECT_HURTS,
+    EFFECT_NO_EFFECT,
+    EFFECT_NOT_RUN,
+    ArmResult,
+    build_ablation_matrix,
+    classify_effect,
+    success_threshold,
+)
 from .filters import (
     STAGE_DD,
     STAGE_PV,
@@ -98,6 +111,13 @@ from .sweep import (
 )
 
 __all__ = [
+    "BASELINE_ARM",
+    "CLAIM_CATEGORY",
+    "CLAIM_NOTE",
+    "EFFECT_HELPS",
+    "EFFECT_HURTS",
+    "EFFECT_NOT_RUN",
+    "EFFECT_NO_EFFECT",
     "FINGERPRINTS_AVAILABLE",
     "METRIC_NAMES",
     "STAGES",
@@ -105,13 +125,16 @@ __all__ = [
     "STAGE_PV",
     "STAGE_SV",
     "STAGE_TSD",
+    "ArmResult",
     "CandidateRecord",
     "FilterCounts",
     "GenerationReport",
     "RegressionReport",
     "aggregate_over_splits",
     "apply_filter_cascade",
+    "build_ablation_matrix",
     "build_reference_fingerprints",
+    "classify_effect",
     "diversity_metrics",
     "ecfp6",
     "evaluate_generation",
@@ -140,6 +163,7 @@ __all__ = [
     "run_sweep_point",
     "screen_candidates",
     "select_best",
+    "success_threshold",
     "sweep_grid",
     "sweep_to_dataframe",
     "sweep_to_markdown",
