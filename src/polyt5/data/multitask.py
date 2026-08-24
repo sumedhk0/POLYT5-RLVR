@@ -69,8 +69,12 @@ class TaskItem:
             conditioning number for generation.
         label_ids: Decoder target ids, or ``()`` when the regression head owns
             the Tg objective and no text is decoded.
-        tg_standardised: The Tg target in standardised units; ``0.0`` and
-            unused on the text path.
+        tg_standardised: The Tg target in standardised units, always populated
+            on both paths (the same standardizer runs regardless of the
+            regression/text switch). The switch decides which field a head
+            CONSUMES -- this one vs ``label_ids`` -- not which one exists;
+            the text-head trainer simply does not read this field, the same
+            way the regression head does not read ``label_ids``.
         descriptors: Standardised descriptor targets, or ``()`` when the
             descriptor switch is off.
         weight: Per-example loss weight; ``1.0`` when weighting is off.

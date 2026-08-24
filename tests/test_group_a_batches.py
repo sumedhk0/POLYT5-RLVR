@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import pytest
 import torch
 
@@ -128,6 +130,10 @@ def test_weights_are_all_one_when_weighting_is_off():
 
 
 def test_weights_are_inherited_by_every_writing_of_a_polymer():
+    """Pins the group SIZE, not just within-group weight uniformity -- a
+    group degenerated to size 1 (augmentation silently disabled) makes
+    uniformity trivially true and would hide exactly the bug the next test
+    pins against: 4 train polymers x 3 writings each = 12, not 4."""
     examples = [make(i, std=float(i) * 20.0) for i in range(6)]
     out = assemble_split(
         examples, NAMES, train_indices=[0, 1, 2, 3], val_indices=[4], test_indices=[5],
@@ -135,25 +141,49 @@ def test_weights_are_inherited_by_every_writing_of_a_polymer():
         n_writings=3, use_reliability_weighting=True, std_floor=5.6,
         build_generation=False, seed=0,
     )
-    by_target = {}
+    assert len(out.train) == 12, "4 train polymers x 3 writings each"
+    by_target: dict[float, list[float]] = {}
     for item in out.train:
-        by_target.setdefault(item.tg_standardised, set()).add(item.weight)
-    assert all(len(weights) == 1 for weights in by_target.values())
+        by_target.setdefault(item.tg_standardised, []).append(item.weight)
+    assert len(by_target) == 4, "one weight-group per train polymer"
+    for weights in by_target.values():
+        assert len(weights) == 3, "each polymer must contribute all 3 writings, not just 1"
+        assert len(set(weights)) == 1, "every writing of one polymer must inherit the same weight"
 
 
 def test_augmentation_grows_train_but_not_val():
+    """Pins the EXACT item count under a known n_writings, not just that it
+    grew -- '>=' is satisfied by 'augmentation silently did nothing' too,
+    which would let arm A3 report a false null result on a green suite."""
     plain = build(n_writings=1)
     grown = build(n_writings=4)
-    assert grown.n_train_writings >= plain.n_train_writings
+    assert plain.n_train_writings == 6, "n_writings=1 must reproduce one writing per polymer"
+    assert grown.n_train_writings == 24, "n_writings=4 over 6 train polymers must yield 24"
+    writings_per_polymer = Counter(item.tg_standardised for item in grown.train)
+    assert set(writings_per_polymer.values()) == {4}, "every train polymer must get all 4 writings"
     assert grown.n_train_polymers == plain.n_train_polymers == 6
     assert len(grown.val) == len(plain.val) == 2
 
 
-def test_regression_arms_carry_no_text_labels_and_text_arms_carry_no_scalar_target():
+def test_regression_arms_carry_no_text_labels_and_text_arms_carry_text_labels():
     regression = build(use_regression_head=True)
     assert all(item.label_ids == () for item in regression.train)
     text = build(use_regression_head=False)
     assert all(item.label_ids for item in text.train)
+
+
+def test_tg_standardised_is_populated_on_both_the_regression_and_text_paths():
+    """TaskItem.tg_standardised docstring: it is populated the same way on
+    both paths -- the regression/text switch decides which field the head
+    CONSUMES (this one vs label_ids), not whether this one gets populated.
+    Pins the real behavior the docstring describes, rather than the earlier
+    ('0.0 and unused on the text path') claim the code never actually did."""
+    regression = build(use_regression_head=True)
+    text = build(use_regression_head=False)
+    regression_targets = sorted(item.tg_standardised for item in regression.train)
+    text_targets = sorted(item.tg_standardised for item in text.train)
+    assert regression_targets == pytest.approx(text_targets)
+    assert all(value != pytest.approx(0.0) for value in regression_targets)
 
 
 def test_generation_items_are_built_only_when_asked_and_only_from_train():
@@ -195,9 +225,21 @@ def test_collator_pads_labels_with_the_ignore_id():
 
 
 def test_collator_handles_items_with_no_text_labels():
-    items = [TaskItem((5, 6, 1), (), 0.5, (), 1.0, PREDICTION_TASK)]
+    """Batch size 2, not 1: a lone empty-label item pads to width 0, so there
+    is no padded cell left to check the pad id against. A sibling item with
+    real labels forces the padded width above zero so the empty item's row
+    actually gets padded, and this test can catch a wrong-pad-id-for-labels
+    bug the batch-size-1 version could not (same blind spot Task 5 hit)."""
+    from polyt5.data.collate import LABEL_IGNORE_ID
+
+    items = [
+        TaskItem((5, 6, 1), (), 0.5, (), 1.0, PREDICTION_TASK),
+        TaskItem((5, 1), (7, 8, 1), 0.5, (), 1.0, PREDICTION_TASK),
+    ]
     batch = TaskCollator(pad_id=0)(items)
-    assert batch["labels"].shape == (1, 0)
+    assert batch["labels"].shape == (2, 3)
+    assert batch["labels"][0].tolist() == [LABEL_IGNORE_ID, LABEL_IGNORE_ID, LABEL_IGNORE_ID]
+    assert batch["labels"][1].tolist() == [7, 8, 1]
 
 
 def test_dataset_is_picklable_for_dataloader_workers():
