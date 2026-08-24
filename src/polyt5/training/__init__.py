@@ -11,6 +11,7 @@ from polyt5.training.checkpoint import (
     save_checkpoint,
 )
 from polyt5.training.group_a import ARM_IDS, SWITCH_NAMES, GroupAConfig, arm_config
+from polyt5.training.multitask_trainer import GroupATrainer, InterleavedLoader
 from polyt5.training.optim import build_optimizer, build_scheduler
 from polyt5.training.trainer import Trainer, TrainerConfig
 
@@ -18,6 +19,8 @@ __all__ = [
     "ARM_IDS",
     "Checkpoint",
     "GroupAConfig",
+    "GroupATrainer",
+    "InterleavedLoader",
     "SWITCH_NAMES",
     "Trainer",
     "TrainerConfig",

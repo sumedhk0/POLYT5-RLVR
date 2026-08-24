@@ -186,6 +186,17 @@ class Trainer:
             )
         return out.loss
 
+    def _batch_weight(self, batch: Batch) -> int:
+        """Weight of this batch in the epoch's mean loss.
+
+        The base trainer reports a TOKEN-level mean, so the weight is the
+        number of label positions that are not ``-100``. Subclasses whose
+        batches are not token-scored (e.g. a regression head) override this;
+        the epoch mean is then over whatever unit they return, and their
+        docstring says which.
+        """
+        return int((batch["labels"] != -100).sum().item())
+
     def _optimizer_step(self) -> None:
         """Unscale -> clip -> step -> scaler update -> zero -> scheduler."""
         if self.config.max_grad_norm is not None:
@@ -230,7 +241,7 @@ class Trainer:
             scaled = loss / cfg.gradient_accumulation_steps
             self.scaler.scale(scaled).backward()
 
-            num_tokens = int((batch["labels"] != -100).sum().item())
+            num_tokens = self._batch_weight(batch)
             token_sum += num_tokens
             loss_sum += loss.item() * num_tokens
             self._last_seq_len = int(batch["input_ids"].shape[1])
@@ -273,7 +284,7 @@ class Trainer:
         for batch in self.val_loader:
             batch = self._to_device(batch)
             loss = self._forward_loss(batch)
-            num_tokens = int((batch["labels"] != -100).sum().item())
+            num_tokens = self._batch_weight(batch)
             loss_sum += loss.item() * num_tokens
             token_sum += num_tokens
         return {"val_loss": loss_sum / max(token_sum, 1)}
