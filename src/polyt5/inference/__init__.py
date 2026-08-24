@@ -59,10 +59,12 @@ from polyt5.inference.predictor import (
     conditioning_report,
     looks_like_pselfies,
 )
+from polyt5.inference.regression_predictor import GROUP_A_CONFIG_KEY, RegressionPropertyPredictor
 
 __all__ = [
     "DEFAULT_MAX_SOURCE_LENGTH",
     "DEFAULT_TOLERANCES",
+    "GROUP_A_CONFIG_KEY",
     "NON_NUMERIC_VALUE",
     "CacheInfo",
     "CachedPredictor",
@@ -70,6 +72,7 @@ __all__ = [
     "EnsemblePropertyPredictor",
     "PolyT5PropertyPredictor",
     "PredictionResult",
+    "RegressionPropertyPredictor",
     "conditioning_report",
     "looks_like_pselfies",
 ]
