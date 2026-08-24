@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+from polyt5.evaluation import sweep as sweep_module  # noqa: E402
 from polyt5.evaluation.sweep import (  # noqa: E402
     DEFAULT_GRID,
     PAPER_GRID,
@@ -42,6 +43,7 @@ from polyt5.evaluation.sweep import (  # noqa: E402
     generate_candidates,
     read_results_jsonl,
     run_sweep_point,
+    screen_candidates,
     select_best,
     sweep_grid,
     sweep_to_dataframe,
@@ -361,6 +363,111 @@ class TestRunSweepPoint:
         assert payload["epoch"] == 3
         assert payload["checkpoint"] == "best.pt"
         assert payload["n_pv"] == result.counts["n_pv"]
+
+
+class TestScreenCandidatesDeviceContract:
+    """Regression coverage for a real crash on Arm A of ``compare_arms.py``.
+
+    ``screen_candidates`` takes ``device`` as an explicit parameter and
+    builds ``generate_candidates``'s ``input_ids``/``attention_mask`` on it,
+    but a model loaded with ``map_location="cpu"`` (the normal way to load a
+    checkpoint -- see ``scripts/compare_arms.py``) was never moved onto that
+    same device before being handed to ``generate``, so the model's own
+    weights and its inputs ended up on different devices:
+
+        RuntimeError: Expected all tensors to be on the same device, but got
+        index is on cuda:0, different from other tensors on cpu ...
+
+    Every OTHER test in this file calls ``screen_candidates``/
+    ``run_sweep_point``/``generate_candidates`` with ``device="cpu"`` --
+    including the ones added when this function was split out of
+    ``run_sweep_point``. A CPU-resident model handed a CPU device can never
+    expose "model on one device, inputs on another", which is exactly why
+    this bug shipped unnoticed. This test is the first in the suite to pass
+    a device that differs from the model's actual (CPU) residency.
+
+    It does this without any GPU: ``torch.device("meta")`` is used purely as
+    a distinguishable marker device that ``nn.Module.to()`` genuinely
+    relocates parameters/buffers to (confirmed directly against
+    ``PolyT5ForConditionalGeneration`` -- every parameter reports
+    ``device="meta"`` afterwards). ``generate_candidates`` itself is stubbed
+    out, because meta tensors carry no real data and cannot survive actual
+    sampling (``torch.multinomial``, ``.item()``, ...) -- that is an
+    unrelated limitation of the meta backend, not the device-placement bug
+    this test targets. What this test asks is exactly the question the bug
+    turns on: did ``screen_candidates`` move the model onto ``device``
+    before generation ran, and does it stay there.
+
+    What this does NOT cover: it never runs real generation on two
+    genuinely different compute backends (e.g. an actual CPU-weights /
+    CUDA-inputs mismatch), so it cannot catch a device bug that only
+    manifests inside real tensor arithmetic (as opposed to a plain
+    residency/placement check). The GPU run this fix unblocks is the real
+    end-to-end confirmation of that.
+    """
+
+    def test_moves_a_cpu_resident_model_onto_the_requested_device(
+        self, tiny_model, tokenizer, monkeypatch
+    ) -> None:
+        assert next(tiny_model.parameters()).device == torch.device("cpu")
+
+        seen_model_devices: list[torch.device] = []
+
+        def fake_generate_candidates(model, tokenizer, **kwargs):
+            # Records what device the model was on at the moment generation
+            # actually ran -- the real bug moved the model too late (never,
+            # in fact), so checking only the post-call state would miss a
+            # fix that moved it AFTER generation instead of before.
+            seen_model_devices.append(next(model.parameters()).device)
+            return ["[C]"] * kwargs["n_samples"]
+
+        monkeypatch.setattr(sweep_module, "generate_candidates", fake_generate_candidates)
+
+        target_device = torch.device("meta")
+        screen_candidates(
+            tiny_model,
+            tokenizer,
+            point=SweepPoint(temperature=1.0, top_p=0.95),
+            targets=[300.0],
+            n_samples=3,
+            training_index=None,
+            device=target_device,
+            batch_size=4,
+            seed=0,
+        )
+
+        assert seen_model_devices == [target_device], (
+            "the model must already be on the requested device by the time "
+            "generation runs, not left on whatever device it was loaded on"
+        )
+        assert all(p.device == target_device for p in tiny_model.parameters()), (
+            "the model must still be on the requested device after "
+            "screen_candidates returns"
+        )
+
+    def test_device_string_is_accepted_like_a_torch_device(
+        self, tiny_model, tokenizer, monkeypatch
+    ) -> None:
+        """``device`` may be a plain string (every real caller passes one)."""
+        monkeypatch.setattr(
+            sweep_module,
+            "generate_candidates",
+            lambda model, tokenizer, **kwargs: ["[C]"] * kwargs["n_samples"],
+        )
+
+        screen_candidates(
+            tiny_model,
+            tokenizer,
+            point=SweepPoint(temperature=1.0, top_p=0.95),
+            targets=[300.0],
+            n_samples=2,
+            training_index=None,
+            device="meta",
+            batch_size=4,
+            seed=0,
+        )
+
+        assert all(p.device == torch.device("meta") for p in tiny_model.parameters())
 
 
 class TestDeterminism:

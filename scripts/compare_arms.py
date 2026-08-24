@@ -869,7 +869,9 @@ def discover_seed_runs(
     return sorted(found.items())
 
 
-def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger, *, seed: int = 0):
+def load_rlvr_arm_model(
+    arm_name: str, results_root: Path, tokenizer, logger, *, seed: int = 0, device: Any = "cpu"
+):
     """Load an RLVR arm's trained policy, plus the temperature/top_p it actually trained with.
 
     Args:
@@ -883,6 +885,13 @@ def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger, *,
         seed: Which training seed's run directory to load (Addition 2).
             ``0`` (the default) resolves to exactly the same directory this
             function always loaded before multi-seed support existed.
+        device: Torch device (or device string) the returned model is moved
+            to before this function returns it -- the checkpoint itself is
+            always read with ``map_location="cpu"``, so without this the
+            model would silently stay on CPU regardless of what the rest of
+            the run uses. Defaults to ``"cpu"`` (a no-op move) so existing
+            callers that only care about the checkpoint contents, not device
+            placement, are unaffected.
 
     Returns:
         ``(model, checkpoint_path, checkpoint_sha256, SweepPoint)``, or
@@ -932,6 +941,7 @@ def load_rlvr_arm_model(arm_name: str, results_root: Path, tokenizer, logger, *,
     model_config = PolyT5Config.from_dict(payload["model_config"])
     model = PolyT5ForConditionalGeneration(model_config)
     model.load_state_dict(payload["model_state"])
+    model = model.to(device)
 
     train_cfg = run_cfg.get("train", {})
     point = SweepPoint(
@@ -1848,6 +1858,14 @@ def main(argv: list[str] | None = None) -> int:
             num_beams=args.predictor_num_beams,
         )
         generation_model, _ = load_verified_model(frozen, "generation")
+        # load_verified_model always loads to CPU (map_location="cpu") and
+        # deliberately leaves the device decision to its caller -- train_grpo.py's
+        # two callers rely on that and move policy/reference via GRPOTrainer /
+        # ReferencePolicy. screen_candidates now also moves whatever model it is
+        # handed onto its own device parameter (belt and suspenders), but this
+        # loader is the one place in this script that owns "generation_model", so
+        # it satisfies the contract itself rather than depending on that.
+        generation_model = generation_model.to(device)
     except (FileNotFoundError, ValueError, KeyError) as error:
         logger.error("could not build the comparison: %s", error)
         print(f"ERROR: {error}", file=sys.stderr)
@@ -1955,7 +1973,7 @@ def main(argv: list[str] | None = None) -> int:
         arm_rows: list[dict[str, Any]] = []
         for run_seed, _run_dir in seed_runs:
             loaded = load_rlvr_arm_model(
-                arm_name, args.results_root, tokenizer, logger, seed=run_seed)
+                arm_name, args.results_root, tokenizer, logger, seed=run_seed, device=device)
             if loaded is None:
                 continue
             model, checkpoint_path, checkpoint_sha256, point = loaded

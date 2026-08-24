@@ -646,14 +646,20 @@ def screen_candidates(
 
     Args:
         model: The generation model, in or out of eval mode (put in eval mode
-            for the duration by :func:`generate_candidates`).
+            for the duration by :func:`generate_candidates`) and on any
+            device -- moved onto ``device`` in place before generation
+            starts if it exposes ``.to`` (every real ``nn.Module`` does).
         tokenizer: The polyT5 tokenizer.
         point: The temperature / ``top_p`` configuration to sample at.
         targets: Property values to condition on, cycled round-robin.
         n_samples: Candidates to generate.
         training_index: Known training polymers for the TSD stage; ``None``
             makes TSD a no-op.
-        device: Torch device (or device string) to decode on.
+        device: Torch device (or device string) to decode on. ``model`` is
+            moved here first, so a checkpoint loaded with
+            ``map_location="cpu"`` -- the normal way to load one -- still
+            ends up matched with the inputs this function builds on
+            ``device``.
         batch_size: Prompts per decoding batch.
         seed: Base RNG seed; the result is fully determined by it.
         max_length: Maximum tokens to generate.
@@ -665,6 +671,21 @@ def screen_candidates(
     Returns:
         A :class:`ScreenedBatch`. This function never raises on model output.
     """
+    import torch
+
+    # This function OWNS the device contract: it is what takes ``device`` as
+    # an explicit parameter and builds ``generate_candidates``'s inputs on
+    # it, so a caller that hands in a model still sitting on whatever device
+    # it was loaded/constructed on (checkpoints load to CPU by convention;
+    # see ``scripts/compare_arms.py``'s loaders) must not have to remember to
+    # move it itself. ``model.to`` is in place for an ``nn.Module``, so this
+    # mutates the caller's model rather than returning a new one -- standard
+    # torch practice, and the only way a plain fake-model test double (never
+    # constructed via a loader) still ends up on the right device too.
+    torch_device = torch.device(device) if not isinstance(device, torch.device) else device
+    if hasattr(model, "to"):
+        model.to(torch_device)
+
     sample_targets = assign_targets(targets, n_samples)
     candidates = generate_candidates(
         model,
