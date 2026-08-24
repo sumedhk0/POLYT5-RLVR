@@ -53,6 +53,7 @@ from .ablation import (
     ArmResult,
     build_ablation_matrix,
     classify_effect,
+    format_ablation_matrix,
     success_threshold,
 )
 from .filters import (
@@ -138,6 +139,7 @@ __all__ = [
     "diversity_metrics",
     "ecfp6",
     "evaluate_generation",
+    "format_ablation_matrix",
     "format_console_summary",
     "has_valid_termini",
     "loop_closed_mol",

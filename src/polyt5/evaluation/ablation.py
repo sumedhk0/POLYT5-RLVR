@@ -40,6 +40,7 @@ __all__ = [
     "ArmResult",
     "build_ablation_matrix",
     "classify_effect",
+    "format_ablation_matrix",
     "success_threshold",
 ]
 

@@ -1,0 +1,60 @@
+# configs/finetune/group_a.yaml
+# Phase 4 Group A ablation (docs/superpowers/specs/2026-08-23-phase4-group-a-design.md).
+#
+# NOT part of the published polyT5 method. The five switches per arm come from
+# polyt5.training.group_a.arm_config, NOT from this file: "A6 is all five
+# combined" must be a property a test asserts, not a convention maintained here.
+# This file carries only what is shared across arms.
+#
+# PAPER values (inherited from tg_prediction.yaml): 30 epochs, batch 16, AdamW,
+#   lr 3e-4, weight decay 0.01, max length 200, beam width 4, five splits.
+# OURS: the head hyperparameters, and reusing the frozen splits verbatim.
+
+task: tg_group_a
+seed: 0
+data_mode: proxy
+
+data:
+  source: lamalab_tg
+  csv_path: data/external/LAMALAB_CURATED_Tg.csv
+  property_name: Tg
+  decimals: 1               # PAPER: targets like "236.0"
+  max_length: 200           # PAPER
+  deduplicate: true
+
+splits:
+  # OURS: reuse the frozen splits verbatim. Rebuilding them would produce
+  # numbers that LOOK comparable to 28.6733 K and are not.
+  frozen_file: results/tg_prediction_5splits_medium92m/splits.json
+
+baseline:
+  frozen_file: artifacts/baseline/frozen_baseline.json
+
+model:
+  config: configs/model/polyt5_medium.yaml
+
+group_a:
+  descriptor_lambda: 0.1    # OURS  [AMBIGUITY] sensitivity is reported, not assumed
+  n_writings: 4             # OURS  [AMBIGUITY] N is measured by A3, not assumed
+  std_floor: 5.6            # OURS: median spread over the 279 repeated measurements
+  huber_delta: 1.0          # OURS: in standardised units
+  head_dropout: 0.1         # OURS: matches the backbone's dropout_rate
+
+training:
+  epochs: 30                # PAPER
+  batch_size: 16            # PAPER
+  optimizer: adamw          # PAPER
+  learning_rate: 3.0e-4     # PAPER
+  weight_decay: 0.01        # PAPER
+  max_source_length: 200    # PAPER
+  max_target_length: 200    # PAPER
+  scheduler: constant
+  amp: true
+  amp_dtype: bf16
+  num_workers: 0
+
+evaluation:
+  batch_size: 32
+  beam_width: 4             # PAPER, for the text-head arms only
+  max_target_length: 32
+  length_penalty: 1.0
