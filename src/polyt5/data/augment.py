@@ -78,14 +78,21 @@ def augment_indices(
 
     Raises:
         ValueError: If ``n_writings`` is below 1.
-        IndexError: If an index is out of range for ``examples``. Silently
-            skipping it would quietly shrink a split.
+        IndexError: If an index is negative or out of range for ``examples``.
+            Silently skipping it would quietly shrink a split, and silently
+            wrapping a negative index would attach a writing to the wrong
+            polymer's label.
     """
     if n_writings < 1:
         raise ValueError(f"n_writings must be >= 1, got {n_writings}")
 
     out: list[AugmentedExample] = []
     for position in indices:
+        if position < 0:
+            # A bare `examples[position]` would silently wrap a negative index
+            # to the far end of the list instead of refusing it, quietly
+            # attaching the wrong polymer's writings to `position`'s label.
+            raise IndexError(f"augment_indices does not accept negative positions, got {position}")
         example = examples[position]  # IndexError on a bad index, deliberately
         out.append(
             AugmentedExample(pselfies=example.pselfies, source_index=position, is_original=True)

@@ -111,17 +111,41 @@ def test_no_augmented_train_writing_lands_in_the_test_split():
 
 
 def test_the_leakage_check_catches_augment_before_split():
-    """Negative control: a guard that never fires proves nothing.
+    """Negative control ON THE GUARD, not on ``augment_indices`` itself.
 
-    Here augmentation is (wrongly) run over the WHOLE corpus -- train and test
-    indices together -- instead of over just the train split, the exact
-    ordering mistake spec 4.3 warns about. The result still carries every test
-    polymer's own writing (each source's original is included verbatim), so
-    the same disjointness assertion as the test above must now fail.
+    ``test_no_augmented_train_writing_lands_in_the_test_split`` above is the
+    real safety net: it always calls ``augment_indices`` with ONLY the train
+    indices, so it can only ever fail if ``augment_indices`` itself leaks
+    across the boundary it was given. This test exists to prove that same
+    disjointness assertion is capable of firing at all -- that it is not
+    vacuous -- by reproducing spec 4.3's ordering mistake explicitly:
+    augment the WHOLE corpus in one call (mixing train and test), THEN split
+    the flat output afterwards by position, instead of splitting the original
+    indices first and augmenting each split separately.
+
+    Train and test are interleaved here ([0, 2, 4] / [1, 3, 5]), matching how
+    a real split (``random_split``) actually looks -- train is not the first
+    contiguous block. A caller who forgot to split first and instead slices
+    the augmented list by the ORIGINAL train/test proportion (the natural
+    mistake: "train was half the corpus before, so take the first half now")
+    lands on a slice that includes an entire test polymer's group, because
+    that polymer's writings sit inside the "first half" of the interleaved
+    order. This must trip the same disjointness assertion the real guard
+    uses; if it does not, the assertion has no teeth.
     """
     examples = build_examples()
-    wrong_train = augment_indices(examples, range(len(examples)), n_writings=6, seed=5)
-    test_canonical = {canonical_of(examples[i].pselfies) for i in (3, 4, 5)}
+    train, test = [0, 2, 4], [1, 3, 5]
+
+    # The mistake: augment every index in one call, not just train's.
+    everything = augment_indices(examples, range(len(examples)), n_writings=6, seed=5)
+
+    # The mistake compounded: split the flat output by POSITION afterwards,
+    # using the original train/test proportion, instead of re-deriving the
+    # split from each item's `source_index`.
+    naive_train_fraction = len(train) / len(examples)
+    wrong_train = everything[: round(len(everything) * naive_train_fraction)]
+
+    test_canonical = {canonical_of(examples[i].pselfies) for i in test}
     wrong_canonical = {canonical_of(a.pselfies) for a in wrong_train}
     assert not wrong_canonical.isdisjoint(test_canonical), (
         "the leakage assertion must FAIL on an augment-then-split ordering, or it is "
@@ -139,3 +163,11 @@ def test_out_of_range_index_is_refused():
     examples = build_examples()
     with pytest.raises(IndexError):
         augment_indices(examples, [99], n_writings=2)
+
+
+def test_negative_index_is_refused_not_silently_wrapped():
+    """A bare ``examples[-1]`` would silently return the LAST example instead
+    of raising, attaching that polymer's writings to the wrong ``source_index``."""
+    examples = build_examples()
+    with pytest.raises(IndexError):
+        augment_indices(examples, [-1], n_writings=2)
