@@ -72,11 +72,16 @@ class InterleavedLoader:
         return 2 * max(n_prediction, n_generation)
 
     def __iter__(self) -> Iterator[Batch]:
-        """Yield prediction, generation, prediction, generation, ..."""
-        if self.generation is None:
+        """Yield prediction, generation, prediction, generation, ...
+
+        Mirrors :meth:`__len__`: an EMPTY generation loader (``[]``) degrades
+        to the same pass-through as ``generation=None``, rather than reaching
+        ``next()`` on an exhausted ``cycle([])`` and raising ``RuntimeError``.
+        """
+        n_prediction, n_generation = self._lengths()
+        if n_generation == 0:
             yield from self.prediction
             return
-        n_prediction, n_generation = self._lengths()
         rounds = max(n_prediction, n_generation)
         predictions = cycle(self.prediction) if n_prediction < rounds else iter(self.prediction)
         generations = cycle(self.generation) if n_generation < rounds else iter(self.generation)
@@ -167,9 +172,14 @@ class GroupATrainer(Trainer):
 
         with torch.amp.autocast(device_type, dtype=self.amp_dtype, enabled=self.amp_enabled):
             if task == GENERATION_TASK:
-                return self.model.forward_generation(
+                generation_output = self.model.forward_generation(
                     batch["input_ids"], batch["attention_mask"], batch["labels"]
-                ).loss
+                )
+                if generation_output.loss is None:
+                    raise RuntimeError(
+                        "forward_generation returned no loss; labels were not supplied"
+                    )
+                return generation_output.loss
             if task != PREDICTION_TASK:
                 raise ValueError(f"unknown task id {task}")
 
@@ -189,7 +199,10 @@ class GroupATrainer(Trainer):
                     descriptor_targets=descriptors,
                     weights=weights,
                 )
-            assert output.loss is not None  # targets were supplied
+            if output.loss is None:
+                raise RuntimeError(
+                    "the prediction-path forward returned no loss; targets were not supplied"
+                )
             loss = output.loss
             if self.cycle_loss is not None:
                 loss = loss + self.group_a.cycle_weight * self.cycle_loss(batch["tg_targets"])

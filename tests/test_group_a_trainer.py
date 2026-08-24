@@ -29,7 +29,16 @@ def build_model(**kwargs) -> PolyT5MultiTask:
     )
 
 
-def make_batch(task_id: int, *, n: int = 2, n_descriptors: int = 0, text: bool = True):
+def make_batch(
+    task_id: int, *, n: int = 2, n_descriptors: int = 0, text: bool = True, tag: int = 0
+):
+    """Build a batch.
+
+    ``tag`` is a plain int carried through, unused by any forward path -- it
+    exists so loader-ordering tests can tell WHICH batch was yielded, not just
+    how many: every batch of a given ``task_id`` is otherwise byte-identical
+    (the generator is seeded from ``task_id`` alone).
+    """
     generator = torch.Generator().manual_seed(17 + task_id)
     return {
         "input_ids": torch.randint(2, 458, (n, 5), generator=generator),
@@ -43,6 +52,7 @@ def make_batch(task_id: int, *, n: int = 2, n_descriptors: int = 0, text: bool =
         "descriptor_targets": torch.zeros(n, n_descriptors, dtype=torch.float32),
         "weights": torch.ones(n, dtype=torch.float32),
         "task_id": torch.full((n,), task_id, dtype=torch.long),
+        "tag": tag,
     }
 
 
@@ -67,40 +77,84 @@ def test_base_trainer_batch_weight_still_counts_label_tokens():
 
 # --------------------------------------------------------------- interleaving
 def test_interleaved_loader_alternates_prediction_and_generation():
-    prediction = [make_batch(PREDICTION_TASK) for _ in range(3)]
-    generation = [make_batch(GENERATION_TASK) for _ in range(3)]
-    tasks = [
-        int(batch["task_id"][0]) for batch in InterleavedLoader(prediction, generation)
+    prediction = [make_batch(PREDICTION_TASK, tag=i) for i in range(3)]
+    generation = [make_batch(GENERATION_TASK, tag=i) for i in range(3)]
+    emitted = [
+        (int(batch["task_id"][0]), int(batch["tag"]))
+        for batch in InterleavedLoader(prediction, generation)
     ]
-    assert tasks == [PREDICTION_TASK, GENERATION_TASK] * 3
+    # Not just the task-id sequence: WHICH prediction/generation batch lands
+    # at each position, so a loader that repeats or drops an item is caught.
+    assert emitted == [
+        (PREDICTION_TASK, 0), (GENERATION_TASK, 0),
+        (PREDICTION_TASK, 1), (GENERATION_TASK, 1),
+        (PREDICTION_TASK, 2), (GENERATION_TASK, 2),
+    ]
     assert len(InterleavedLoader(prediction, generation)) == 6
 
 
 def test_interleaved_loader_without_generation_is_a_passthrough():
-    prediction = [make_batch(PREDICTION_TASK) for _ in range(4)]
+    prediction = [make_batch(PREDICTION_TASK, tag=i) for i in range(4)]
     loader = InterleavedLoader(prediction, None)
     assert len(loader) == 4
-    assert all(int(b["task_id"][0]) == PREDICTION_TASK for b in loader)
+    assert [int(b["tag"]) for b in loader] == [0, 1, 2, 3]
+
+
+def test_interleaved_loader_empty_generation_list_is_also_a_passthrough():
+    """An empty (not None) generation loader must degrade the same way.
+
+    Regression for a real bug: __len__ special-cased ``n_generation == 0``
+    but __iter__ did not, so InterleavedLoader(pred, []) reported a length of
+    ``2 * len(pred)`` and then raised RuntimeError on the first ``next()`` of
+    an exhausted ``cycle([])``.
+    """
+    prediction = [make_batch(PREDICTION_TASK, tag=i) for i in range(3)]
+    loader = InterleavedLoader(prediction, [])
+    assert len(loader) == 3
+    assert [int(b["tag"]) for b in loader] == [0, 1, 2]
 
 
 def test_interleaved_loader_cycles_the_shorter_side():
-    prediction = [make_batch(PREDICTION_TASK) for _ in range(4)]
-    generation = [make_batch(GENERATION_TASK)]
-    assert len(list(InterleavedLoader(prediction, generation))) == 8
+    prediction = [make_batch(PREDICTION_TASK, tag=i) for i in range(4)]
+    generation = [make_batch(GENERATION_TASK, tag=i) for i in range(2)]
+    batches = list(InterleavedLoader(prediction, generation))
+    assert len(batches) == 8
+    prediction_tags = [int(b["tag"]) for b in batches if int(b["task_id"][0]) == PREDICTION_TASK]
+    generation_tags = [int(b["tag"]) for b in batches if int(b["task_id"][0]) == GENERATION_TASK]
+    # The longer side (4 items) is consumed once, in order; the shorter side
+    # (2 items) genuinely CYCLES -- [0, 1, 0, 1] -- rather than truncating to
+    # its own length or repeating a single item four times.
+    assert prediction_tags == [0, 1, 2, 3]
+    assert generation_tags == [0, 1, 0, 1]
 
 
 def test_interleaved_loader_is_reiterable():
-    loader = InterleavedLoader([make_batch(PREDICTION_TASK)], [make_batch(GENERATION_TASK)])
-    assert [int(b["task_id"][0]) for b in loader] == [int(b["task_id"][0]) for b in loader]
+    loader = InterleavedLoader(
+        [make_batch(PREDICTION_TASK, tag=0)], [make_batch(GENERATION_TASK, tag=0)]
+    )
+    expected = [PREDICTION_TASK, GENERATION_TASK]
+    assert [int(b["task_id"][0]) for b in loader] == expected
+    assert [int(b["task_id"][0]) for b in loader] == expected
 
 
 # ------------------------------------------------------------- the loss router
 def test_regression_arm_uses_the_scalar_head():
+    """A1 must route through forward_regression, not merely produce a finite loss.
+
+    ``requires_grad``/``isfinite`` alone would also hold if the switch were
+    ignored and the text head ran instead -- pin against the scalar head's own
+    loss instead, the way the B0 and generation tests pin against the backbone.
+    """
     model = build_model(use_regression_head=True)
+    model.eval()
     trainer = GroupATrainer(model, [], trainer_config(), group_a=arm_config("A1"))
-    loss = trainer._forward_loss(make_batch(PREDICTION_TASK, text=False))
+    batch = make_batch(PREDICTION_TASK, text=False)
+    reference = model.forward_regression(
+        batch["input_ids"], batch["attention_mask"], tg_targets=batch["tg_targets"]
+    ).loss
+    loss = trainer._forward_loss(batch)
     assert loss.requires_grad
-    assert torch.isfinite(loss)
+    assert float(loss) == pytest.approx(float(reference), abs=1e-6)
 
 
 def test_text_arm_matches_the_backbone_loss_exactly():
@@ -142,9 +196,18 @@ def test_descriptor_arm_adds_a_term_to_the_text_loss():
 
 
 def test_batch_weight_counts_examples_not_tokens():
+    """Must count the batch axis, not the sequence axis.
+
+    ``n`` is deliberately different from ``make_batch``'s hard-coded source
+    length (5): with ``n=5`` a ``shape[0]`` vs ``shape[1]`` bug is invisible
+    because both axes are 5. Pinning ``n=3`` against seq-len 5 means a
+    ``shape[1]`` mutant returns 5, not 3, and the assertion below catches it.
+    """
     model = build_model(use_regression_head=True)
     trainer = GroupATrainer(model, [], trainer_config(), group_a=arm_config("A1"))
-    assert trainer._batch_weight(make_batch(PREDICTION_TASK, n=5, text=False)) == 5
+    batch = make_batch(PREDICTION_TASK, n=3, text=False)
+    assert batch["input_ids"].shape[0] != batch["input_ids"].shape[1]  # axes must differ
+    assert trainer._batch_weight(batch) == 3
 
 
 def test_to_device_tolerates_a_non_tensor_value():
