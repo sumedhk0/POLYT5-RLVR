@@ -33,13 +33,55 @@ def test_the_five_single_change_arms_cover_all_five_switches():
     assert covered == set(SWITCH_NAMES)
 
 
-def test_a6_is_exactly_the_union_of_a1_through_a5():
-    """'all five combined' is a property, not a convention someone maintains."""
+#: The exact attribution the ablation depends on: which named switch each
+#: single-change arm flips. "Exactly one switch per arm" plus "all five
+#: switches covered" both hold even under a pairwise swap (e.g. A1 and A2
+#: trading switches) -- only pinning the specific mapping catches that, and a
+#: swap is exactly the failure mode that would mislabel every conclusion in
+#: the ablation.
+_EXPECTED_SINGLE_ARM_SWITCH: dict[str, str] = {
+    "A1": "regression_head",
+    "A2": "descriptors",
+    "A3": "augment",
+    "A4": "reliability_weighting",
+    "A5": "multitask",
+}
+
+
+def test_each_arm_maps_to_its_specific_named_switch():
+    """Attribution needs the exact mapping, not just aggregate cardinality/coverage."""
+    for arm, expected_switch in _EXPECTED_SINGLE_ARM_SWITCH.items():
+        on = [name for name, value in arm_config(arm).switches().items() if value]
+        assert on == [expected_switch], (
+            f"{arm} should flip only {expected_switch!r}, flips {on}"
+        )
+
+
+def test_a6_switches_equal_the_union_of_a1_through_a5():
+    """'all five combined' is a property, not a convention someone maintains.
+
+    Kept separate from the coverage check below: this assertion alone answers
+    "is A6 the union?" -- a mutation to the derivation formula itself trips
+    this without touching coverage.
+    """
     union = {name: False for name in SWITCH_NAMES}
     for arm in ("A1", "A2", "A3", "A4", "A5"):
         for name, value in arm_config(arm).switches().items():
             union[name] = union[name] or value
     assert arm_config("A6").switches() == union
+
+
+def test_a1_through_a5_together_cover_every_switch_for_the_union():
+    """The union the previous test compares against must itself be complete.
+
+    Kept separate from the union-equality check above: a data-level mutation
+    (e.g. an arm losing its switch) trips this without needing A6 to disagree
+    with an equally-broken union.
+    """
+    union = {name: False for name in SWITCH_NAMES}
+    for arm in ("A1", "A2", "A3", "A4", "A5"):
+        for name, value in arm_config(arm).switches().items():
+            union[name] = union[name] or value
     assert all(union.values())
 
 
