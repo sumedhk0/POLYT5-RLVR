@@ -5,10 +5,24 @@ configuration touching the shared encoder is sampled at ARM B's sampling point
 (temperature 0.7, top_p 0.95 -- a different point makes the comparison
 meaningless) and scored with the same cascade the frozen numbers came from.
 
+TP (target-property rate) needs a property predictor, and whole-branch review
+finding 3 is about WHICH one. The frozen Arm B TP of 58.78% was produced by
+``scripts/evaluate_generations.py`` with EXTERNAL predictor checkpoints
+(``--predictor-checkpoint``); using an arm's OWN regression head (when it has
+one, e.g. A6) to score its OWN generations is the generator grading its own
+output with the very component under test, a different instrument from the
+one that produced 58.78% -- not a measurement of generation quality. So TP is
+NEVER scored by the arm's own head here: pass ``--predictor-checkpoint`` (the
+same external checkpoints used for the frozen number, repeatable for an
+ensemble) to get a TP verdict at all; without it, TP is ``None`` for every
+arm -- A5 and A6 alike -- and the script says so loudly rather than silently
+falling back to a circular instrument.
+
 Usage:
     python scripts/check_group_a_generation.py \
-        --checkpoint results/group_a/A5/split_0/checkpoints/best.pt \
-        --arm A5 --n-samples 1000
+        --checkpoint results/group_a/A5/split_0_<fingerprint>/checkpoints/best.pt \
+        --arm A5 --n-samples 1000 \
+        --predictor-checkpoint results/finetune_tg_prediction/checkpoints/best.pt
 """
 
 from __future__ import annotations
@@ -31,7 +45,7 @@ from polyt5.evaluation.generation_regression import (  # noqa: E402
     load_arm_b_generation_baseline,
 )
 from polyt5.generation import GenerationConfig, generate  # noqa: E402
-from polyt5.inference.regression_predictor import RegressionPropertyPredictor  # noqa: E402
+from polyt5.inference import EnsemblePropertyPredictor  # noqa: E402
 from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration  # noqa: E402
 from polyt5.model.multitask import MultiTaskConfig, PolyT5MultiTask  # noqa: E402
 from polyt5.tokenization import PolyT5Tokenizer  # noqa: E402
@@ -48,6 +62,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--arm", required=True)
+    parser.add_argument("--predictor-checkpoint", type=Path, action="append", default=None,
+                        metavar="PATH",
+                        help="External Tg-prediction checkpoint -- the SAME instrument "
+                             "that produced the frozen Arm B TP of 58.78%%. Repeat for an "
+                             "ensemble. Without this, TP is never computed: an arm's OWN "
+                             "regression head (e.g. A6) is refused as a TP instrument, "
+                             "since a checkpoint grading its own generations is circular.")
     parser.add_argument("--tokenizer", type=Path,
                         default=REPO_ROOT / "artifacts" / "tokenizer" / "polyt5_vocab.json")
     parser.add_argument("--frozen-baseline", type=Path,
@@ -108,11 +129,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         logger.info("sampled %d/%d", len(generated), args.n_samples)
 
-    predictor = (
-        RegressionPropertyPredictor(model, tokenizer, device=device, property_name="Tg")
-        if model.tg_head is not None
-        else None
-    )
+    predictor = None
+    if args.predictor_checkpoint:
+        predictor = EnsemblePropertyPredictor.from_checkpoints(
+            args.predictor_checkpoint, device=device,
+        )
+    elif model.tg_head is not None:
+        logger.warning(
+            "arm %s has its own regression head, but no --predictor-checkpoint was given: "
+            "TP will NOT be scored by the arm's own head -- that would be the generator "
+            "grading its own output, a different instrument from the external predictor "
+            "that produced the frozen Arm B TP of 58.78%%. Re-run with "
+            "--predictor-checkpoint for a TP verdict.",
+            args.arm,
+        )
     report = evaluate_generation(
         generated,
         target_property=args.target_property,
@@ -128,8 +158,14 @@ def main(argv: list[str] | None = None) -> int:
     destination = args.out or args.checkpoint.parent.parent / "generation_check.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
-        json.dumps({"check": check.to_dict(), "generation": report.to_dict()},
-                   indent=2, default=str) + "\n",
+        json.dumps({
+            "check": check.to_dict(),
+            "generation": report.to_dict(),
+            # Provenance: which instrument (if any) scored TP, so a reader
+            # never has to guess whether this row is comparable to the
+            # frozen 58.78% or was left as None on purpose.
+            "predictor_checkpoints": [str(path) for path in (args.predictor_checkpoint or [])],
+        }, indent=2, default=str) + "\n",
         encoding="utf-8",
     )
     logger.info("%s: PV %.4f (baseline %.4f), TP %s (baseline %.4f) -> %s",

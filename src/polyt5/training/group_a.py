@@ -78,8 +78,21 @@ class GroupAConfig:
         descriptors: Add the auxiliary descriptor heads,
             ``L = L_Tg + descriptor_lambda * L_descriptors``.
         augment: Train on several PSELFIES writings per polymer.
-        reliability_weighting: Weight examples by ``1 / max(std, std_floor)``
-            and drop ``reliability == red``.
+        reliability_weighting: Weight examples by ``1 / max(std, std_floor)``.
+            The ``reliability == red`` drop this switch was once documented
+            as also controlling runs UNCONDITIONALLY for every arm, including
+            B0 -- ``polyt5.data.multitask._drop_red_for_split`` is called
+            regardless of this flag, and
+            ``test_red_rows_leave_train_but_the_test_split_is_untouched``
+            pins that as deliberate. So A4 measures only the weighting half
+            of spec Sec 4.4's "weight by 1/max(std,floor) AND drop red" change;
+            the drop itself is common to every arm's train/val pool and is
+            not part of what distinguishes A4 from B0. Whole-branch review
+            finding 6: impact is 2-3 train rows and 1 val row per split out
+            of ~5,295, so this is a documentation correction, not a behaviour
+            change -- gating the drop on this switch was considered and
+            rejected, since it would perturb B0's in-harness rerun (and every
+            other arm) for a negligible-magnitude, already-tested design.
         multitask: Train prediction and generation together on the shared
             encoder, alternating batches.
         cycle_consistency: OFF on every arm; see the module docstring.

@@ -23,7 +23,11 @@ training loop.
 3. Reliability weights are computed on train rows before augmentation; each
    writing inherits its source polymer's weight.
 4. Only TRAIN is augmented. Val selects checkpoints; test is the measurement.
-5. Generation items come from train polymers only, and only when asked.
+5. Generation items come from train polymers only, and only when asked, and
+   from the SAME augmented writings as the prediction items -- so when
+   augmentation and multi-task are both on (arm A6), the two streams' sizes
+   scale together instead of one being replayed via ``InterleavedLoader``
+   cycling to match the other's inflated length.
 
 This module imports torch and is therefore NOT re-exported from
 ``polyt5.data.__init__`` -- same rule as ``polyt5.data.datasets``.
@@ -385,18 +389,32 @@ def assemble_split(
 
     generation_items: list[TaskItem] = []
     if build_generation:
+        # Built from the SAME `writings` as train_items, not from kept_train
+        # directly. When augmentation is ALSO on (arm A6), this keeps the two
+        # streams' sizes scaling together: with augmentation off (n_writings
+        # == 1) `writings` reproduces kept_train verbatim (see
+        # augment_indices), so this is a no-op for every arm but A6. With
+        # augmentation on, generation now gets all n_writings per polymer
+        # too, so InterleavedLoader never has to CYCLE the generation side
+        # back up to match an augmented (larger) prediction side -- A6 gets
+        # one natural pass over generation per epoch, not the same handful
+        # of batches replayed ~n_writings times. That is what makes A6 a
+        # genuine union of A3 and A5 in TRAINING BEHAVIOUR, not only in the
+        # switches recorded in its GroupAConfig.
         generation_items = [
             TaskItem(
                 input_ids=_encode(
-                    tokenizer, format_property_value(example.row.tg), max_source_length
+                    tokenizer,
+                    format_property_value(kept_train[writing.source_index].row.tg),
+                    max_source_length,
                 ),
-                label_ids=_encode(tokenizer, example.pselfies, max_target_length),
-                tg_standardised=scalar(example),
+                label_ids=_encode(tokenizer, writing.pselfies, max_target_length),
+                tg_standardised=scalar(kept_train[writing.source_index]),
                 descriptors=(),
                 weight=1.0,
                 task_id=GENERATION_TASK,
             )
-            for example in kept_train
+            for writing in writings
         ]
 
     return SplitTensors(

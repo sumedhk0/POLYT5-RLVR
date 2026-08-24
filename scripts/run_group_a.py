@@ -15,6 +15,13 @@ not cover every index.
 Nothing here touches the frozen artifacts or any existing results directory.
 Output goes under ``--out`` (default ``results/group_a``).
 
+Every arm's optimizer-step budget is capped at what B0 alone would take over the
+configured epoch count (:func:`_reference_step_budget`), not just its epoch count:
+augmentation and the interleaved generation stream both multiply the batch count per
+epoch while leaving ``epochs`` fixed, so without this cap A3/A5/A6 would train for
+several times B0's total gradient updates on the same data and a gain there could not
+be attributed to the switch under test rather than the extra compute.
+
 Usage:
     python scripts/run_group_a.py --init-checkpoint <pretrained.pt>
     python scripts/run_group_a.py --arm A3 --set group_a.n_writings=8
@@ -25,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 import time
 from collections.abc import Sequence
@@ -43,6 +51,7 @@ from polyt5.data.multitask import TaskCollator, TaskDataset, assemble_split  # n
 from polyt5.data.splits import load_splits  # noqa: E402
 from polyt5.data.tg_metadata import prepare_labeled_rows, read_lamalab_rows  # noqa: E402
 from polyt5.evaluation import (  # noqa: E402
+    BASELINE_ARM,
     ArmResult,
     RegressionReport,
     build_ablation_matrix,
@@ -90,25 +99,80 @@ def _resolve(path_str: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def _config_fingerprint(group_a: GroupAConfig) -> str:
-    """Short, deterministic fingerprint of an arm's full configuration.
+def _config_fingerprint(
+    group_a: GroupAConfig, *, max_steps: int | None = None, only_split: int | None = None
+) -> str:
+    """Short, deterministic fingerprint of an arm's configuration AND debug knobs.
 
     Folded into the run-directory name so a hyperparameter override (e.g. the
     brief's own ``--arm A3 --set group_a.n_writings=8`` example) cannot
     collide with -- and silently reuse or overwrite -- a cached
     ``results.json`` written under a different configuration of the SAME arm.
-    Two :class:`GroupAConfig` values that compare equal field-for-field
-    always produce the same fingerprint (so a resumed run still finds its own
-    cache); any field that differs changes it.
+    Two calls with identical arguments always produce the same fingerprint
+    (so a resumed run still finds its own cache); anything that differs
+    changes it.
+
+    ``max_steps`` and ``only_split`` are folded in on top of
+    ``group_a.to_dict()`` for the same reason (whole-branch review finding 2):
+    neither lives inside :class:`GroupAConfig`, so a smoke run --
+    ``--arm B0 --only-split 0 --max-steps 20`` -- would otherwise write a
+    ``results.json`` at EXACTLY the path a subsequent full run looks for,
+    which would then log "already done -- skipping" and silently fold a
+    20-step MAE into the reported five-split mean.
 
     Args:
         group_a: The arm's fully-resolved switches and hyperparameters.
+        max_steps: The CLI ``--max-steps`` value for this invocation (``None``
+            when not set -- a real run).
+        only_split: The CLI ``--only-split`` value for this invocation.
 
     Returns:
-        A 12-hex-character digest of ``group_a.to_dict()``.
+        A 12-hex-character digest.
     """
-    payload = json.dumps(group_a.to_dict(), sort_keys=True)
+    payload = json.dumps(
+        {"group_a": group_a.to_dict(), "max_steps": max_steps, "only_split": only_split},
+        sort_keys=True,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _reference_step_budget(
+    n_train_polymers: int, *, batch_size: int, gradient_accumulation_steps: int, epochs: int
+) -> int:
+    """Optimizer-step budget every arm is capped at, computed from B0's shape.
+
+    Whole-branch review finding 5: augmentation and multi-task both multiply
+    the batch count per epoch while ``epochs`` stayed fixed, so A3 (~4x),
+    A5 (~2x) and A6 (~8x) trained for that many more optimizer steps than B0
+    on the SAME 5,293-ish polymers -- any gain on those three arms was
+    confounded with "more gradient updates", not attributable to the switch
+    under test. Holding the epoch count fixed but capping every arm's TOTAL
+    steps at what B0 alone would take over ``epochs`` fixes this: arms with
+    more batches per epoch (from augmentation and/or the interleaved
+    generation stream) simply see fewer PASSES over that data to reach the
+    same step count.
+
+    B0 -- no augmentation, no multi-task -- takes exactly one micro-batch per
+    ``batch_size`` train polymers per epoch. Because the reliability-based red
+    drop runs unconditionally for every arm (see :data:`GroupAConfig
+    .reliability_weighting`'s docstring), ``n_train_polymers`` is identical
+    for every arm on a given split, so this reference is the same number
+    whichever arm's :class:`~polyt5.data.multitask.SplitTensors` supplies it
+    -- no separate "run B0 first" bookkeeping is needed.
+
+    Args:
+        n_train_polymers: Post-red-drop train row count for this split
+            (``SplitTensors.n_train_polymers``; arm-invariant per split).
+        batch_size: Physical batch size.
+        gradient_accumulation_steps: Micro-batches per optimizer step.
+        epochs: The configured epoch count (30, PAPER).
+
+    Returns:
+        The total optimizer-step budget every arm is capped at on this split.
+    """
+    micro_batches_per_epoch = math.ceil(n_train_polymers / batch_size)
+    steps_per_epoch = math.ceil(micro_batches_per_epoch / gradient_accumulation_steps)
+    return steps_per_epoch * epochs
 
 
 def load_frozen_splits(path: str | Path, *, n_examples: int) -> list[FrozenSplit]:
@@ -160,6 +224,47 @@ def load_frozen_splits(path: str | Path, *, n_examples: int) -> list[FrozenSplit
             FrozenSplit(index=int(entry["index"]), train=train, val=val, test=test)
         )
     return out
+
+
+def _b0_vs_frozen(
+    arm_results: Sequence[ArmResult], baseline_mean: float, baseline_std: float
+) -> dict[str, Any]:
+    """Compare B0's in-harness rerun to the frozen number it is a threshold for.
+
+    Task 13 finding 9, routed to the whole-branch review: every arm's verdict
+    is measured against the FROZEN baseline, while
+    :func:`~polyt5.evaluation.format_ablation_matrix`'s printed header labels
+    that frozen number "baseline B0" -- easy to misread as the in-harness B0
+    rerun sitting one row above it in the same table. Without this
+    comparison, a harness shift (data loading, seeding, evaluation path) that
+    moved B0's rerun away from the frozen number would silently move all six
+    A-arm verdicts with it, the evidence unremarked.
+
+    Args:
+        arm_results: Completed :class:`ArmResult` rows, in any order.
+        baseline_mean: Frozen five-split mean MAE (K).
+        baseline_std: Its standard deviation (K).
+
+    Returns:
+        ``{"status", "b0_mae_mean", "delta", "diverges"}``. ``status`` is
+        ``"not_run"`` (no B0 row -- ``--arm`` excluded it),
+        ``"no_evaluable_split"`` (B0 ran but every split failed to score), or
+        ``"compared"`` (the normal case). ``delta``/``diverges`` are ``None``
+        unless ``status == "compared"``.
+    """
+    b0_result = next((result for result in arm_results if result.arm == BASELINE_ARM), None)
+    if b0_result is None:
+        return {"status": "not_run", "b0_mae_mean": None, "delta": None, "diverges": None}
+    if b0_result.mae_mean is None:
+        return {
+            "status": "no_evaluable_split", "b0_mae_mean": None, "delta": None,
+            "diverges": None,
+        }
+    delta = b0_result.mae_mean - baseline_mean
+    return {
+        "status": "compared", "b0_mae_mean": b0_result.mae_mean, "delta": delta,
+        "diverges": abs(delta) > baseline_std,
+    }
 
 
 def resolve_arms(requested: Sequence[str] | None, **overrides: Any) -> list[GroupAConfig]:
@@ -400,7 +505,9 @@ def main(argv: list[str] | None = None) -> int:
         for split in splits:
             if args.only_split is not None and split.index != args.only_split:
                 continue
-            fingerprint = _config_fingerprint(group_a)
+            fingerprint = _config_fingerprint(
+                group_a, max_steps=args.max_steps, only_split=args.only_split
+            )
             run_dir = RunDirectory.create(
                 out_root, f"{group_a.arm}/split_{split.index}_{fingerprint}"
             )
@@ -445,11 +552,27 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             batch_size = int(train_cfg.get("batch_size", 16))  # [PAPER] 16
+            gradient_accumulation_steps = int(
+                train_cfg.get("gradient_accumulation_steps", 1)
+            )
+            configured_epochs = int(train_cfg.get("epochs", 30))  # [PAPER] 30
+            # Whole-branch review finding 5: equalise TOTAL optimizer steps
+            # across arms rather than epoch count. tensors.n_train_polymers is
+            # this arm's own post-red-drop train size, which -- because the
+            # red drop is unconditional across every arm -- is exactly what
+            # B0 would also see on this split, so this is B0's own step
+            # budget even for an arm that is not B0. --max-steps, when
+            # explicitly given, is a deliberate debug override and wins.
+            step_budget = _reference_step_budget(
+                tensors.n_train_polymers, batch_size=batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                epochs=configured_epochs,
+            )
+            max_steps = args.max_steps if args.max_steps is not None else step_budget
             trainer_config = TrainerConfig(
-                max_epochs=int(train_cfg.get("epochs", 30)),   # [PAPER] 30
+                max_epochs=configured_epochs,
                 physical_batch_size=batch_size,
-                gradient_accumulation_steps=int(train_cfg.get(
-                    "gradient_accumulation_steps", 1)),
+                gradient_accumulation_steps=gradient_accumulation_steps,
                 learning_rate=float(train_cfg.get("learning_rate", 3e-4)),  # [PAPER]
                 weight_decay=float(train_cfg.get("weight_decay", 0.01)),    # [PAPER]
                 scheduler=str(train_cfg.get("scheduler", "constant")),
@@ -459,10 +582,18 @@ def main(argv: list[str] | None = None) -> int:
                 # the TrainerConfig default of 3 would keep ~12.6 GB of
                 # checkpoints across the 35 arm/split runs instead of ~6.3 GB.
                 keep_last_checkpoints=int(train_cfg.get("keep_last_checkpoints", 1)),
-                max_steps=args.max_steps,
+                max_steps=max_steps,
                 seed=seed + split.index,
                 device=device,
                 num_workers=int(train_cfg.get("num_workers", 0)),
+            )
+            logger.info(
+                "%s split %d: optimizer_step_budget=%d (reference steps/epoch=%d x "
+                "%d epochs)%s", group_a.arm, split.index, step_budget,
+                math.ceil(math.ceil(tensors.n_train_polymers / batch_size)
+                          / gradient_accumulation_steps),
+                configured_epochs,
+                "" if args.max_steps is None else f" -- overridden to {args.max_steps}",
             )
             prediction_loader = DataLoader(
                 TaskDataset(tensors.train), batch_size=batch_size, shuffle=True,
@@ -540,6 +671,14 @@ def main(argv: list[str] | None = None) -> int:
                 "config_fingerprint": fingerprint,
                 "pretrained": pretrained,
                 "train_seconds": train_seconds,
+                # Whole-branch review finding 5: the equality this run's
+                # attribution depends on -- every arm capped at the SAME
+                # optimizer-step budget -- is checkable here after the fact,
+                # not merely assumed. optimizer_steps_realised is train_metrics
+                # ["global_step"] again, surfaced under an explicit name next
+                # to the budget it was capped against.
+                "optimizer_step_budget": step_budget,
+                "optimizer_steps_realised": train_metrics.get("global_step"),
                 "training": train_metrics,
                 "evaluation": report.to_dict(),
                 "checkpoint": str(checkpoint_path),
@@ -561,6 +700,28 @@ def main(argv: list[str] | None = None) -> int:
 
         arm_results.append(
             ArmResult.from_reports(group_a.arm, group_a.switches(), reports)
+        )
+
+    comparison = _b0_vs_frozen(arm_results, baseline_mean, baseline_std)
+    if comparison["status"] == "not_run":
+        logger.info(
+            "B0 was not run this invocation (excluded by --arm); every verdict below is "
+            "measured against the FROZEN %.4f +/- %.4f K only, with no in-harness B0 "
+            "rerun to check it against", baseline_mean, baseline_std,
+        )
+    elif comparison["status"] == "no_evaluable_split":
+        logger.info(
+            "B0 ran but produced no evaluable split (mae_mean is None); the frozen "
+            "%.4f +/- %.4f K cannot be checked against an in-harness rerun this run",
+            baseline_mean, baseline_std,
+        )
+    else:
+        logger.info(
+            "B0 in-harness rerun: MAE=%.4f K vs FROZEN baseline %.4f +/- %.4f K "
+            "(delta=%+.4f K) -- %s",
+            comparison["b0_mae_mean"], baseline_mean, baseline_std, comparison["delta"],
+            "DIVERGES beyond the frozen std, a harness shift" if comparison["diverges"]
+            else "within the frozen std, harness matches",
         )
 
     matrix = build_ablation_matrix(

@@ -37,6 +37,19 @@ Group A attacks the second of those.
 **In:** five changes to the fine-tuning stage, all cheap. One Tg fine-tune costs
 6.7 minutes, so the whole ablation is roughly 3.5 hours.
 
+**[CORRECTION 2026-08-24, whole-branch review finding 5]** This estimate implicitly
+assumes every arm trains for the same number of OPTIMIZER STEPS as B0. Fixed epochs
+alone does not give that: augmentation multiplies the batch count per epoch (~4x for
+A3/A6) and the interleaved generation stream does too (~2x for A5, and -- before a
+companion fix, finding 4 -- effectively ~4x more for A6 on top of that), so at a fixed
+epoch count A3/A5/A6 would train for roughly 4x/2x/8x B0's steps, an 8-10 hour run, not
+3.5. `scripts/run_group_a.py` now caps every arm's total optimizer steps at B0's
+30-epoch budget (`_reference_step_budget`), which restores the original ~3.5-4 hour
+order of magnitude — arms with more batches per epoch simply take fewer PASSES over
+the data to reach the same step count. Per-arm wall-clock still varies a little
+(A6 alternates two forward-pass shapes; A1/A6's regression path skips the decoder), so
+treat 3.5-4 hours as the right order of magnitude, not an exact figure.
+
 **Out, deliberately, each becoming its own spec:**
 
 - **Group B — conformal prediction intervals.** Post-hoc calibration, needs a trained
@@ -151,6 +164,19 @@ set, and every Group A number is compared against a frozen 28.6733 K measured on
 full test split — a different denominator would make the comparison meaningless while
 looking like an improvement. `n_red_in_test` is reported so the residual stays visible.
 
+**[CORRECTION 2026-08-24, whole-branch review finding 6] The drop runs for EVERY arm,
+not just A4.** `polyt5.data.multitask._drop_red_for_split` is called unconditionally in
+`assemble_split`, so B0's in-harness rerun and A1/A2/A3/A5/A6 all drop the same ~2-3
+train rows and ~1 val row per split that A4 does — only the *weighting* half of this
+section is gated on the `reliability_weighting` switch. So A4 tests "weight by
+1/max(std,floor)" alone, not the conjunction this section originally implied; the drop
+is common corpus hygiene applied to every configuration, the way the red flag itself is
+a property of the row rather than of any one arm. Impact is negligible (roughly 0.05%
+of train rows per split) and was left as-is rather than gated, since gating would
+perturb every arm's train/val pool for a change already covered by
+`test_red_rows_leave_train_but_the_test_split_is_untouched`, which pins the
+unconditional behaviour as deliberate.
+
 ### 4.5 Multi-task fine-tuning
 
 Train prediction and generation together on the shared encoder, alternating batches.
@@ -178,7 +204,10 @@ every number is directly comparable to 28.67 ± 0.76 K.
 | A5 | + multi-task shared encoder |
 | A6 | all five combined |
 
-Seven configurations × five splits × 6.7 min ≈ **3.5 hours**.
+Seven configurations × five splits × 6.7 min ≈ **3.5 hours**, valid once every arm's
+optimizer-step budget is equalised to B0's -- see the finding-5 correction in Sec 2;
+without it the real cost is closer to 8-10 hours because A3/A5/A6 otherwise train for
+several times B0's step count on the same data.
 
 **[CORRECTION 2026-08-23] B0 is rerun, not carried over.** The table originally
 annotated it "already measured: 28.67 K" while this same section required all

@@ -17,7 +17,8 @@ from polyt5.data.multitask import (
     TaskItem,
     assemble_split,
 )
-from polyt5.data.tg_metadata import TgExample, TgRow
+from polyt5.data.standardize import Standardizer
+from polyt5.data.tg_metadata import TgExample, TgRow, descriptor_matrix
 
 
 class FakeTokenizer:
@@ -117,6 +118,34 @@ def test_descriptor_columns_that_are_constant_on_train_are_dropped_and_named():
     assert all(len(item.descriptors) == 2 for item in out.train)
 
 
+def test_val_descriptors_are_standardised_with_train_statistics_not_vals_own():
+    """Whole-branch review finding 8: the one train-only-fitting property
+    with no guard. A mutation that instead fit the descriptor standardizer on
+    VAL rows (``Standardizer.fit(descriptor_matrix(kept_val), names)``) left
+    every existing descriptor test green, because none of them inspect a val
+    item's actual standardised VALUES -- only presence/width and what gets
+    dropped as constant. Train's "varies" column is [0..5] (mean 2.5); val's
+    is [6, 7] -- deliberately a different range, so fitting on val instead of
+    train produces very different numbers, not a coincidental match.
+    """
+    out = build(use_descriptors=True)
+    train_matrix = descriptor_matrix([make(i) for i in range(6)])
+    standardizer = Standardizer.fit(train_matrix, NAMES)
+    val_matrix = descriptor_matrix([make(6), make(7)])
+    expected = standardizer.transform(val_matrix)
+
+    actual = [item.descriptors for item in out.val]
+    assert len(actual) == 2
+    for row, expected_row in zip(actual, expected, strict=True):
+        assert row == pytest.approx(tuple(expected_row))
+
+    # And explicitly not what fitting on val's OWN (very different) range
+    # would give -- guards against a coincidental match rather than merely
+    # asserting "close to the train-fitted number".
+    wrong = Standardizer.fit(val_matrix, NAMES).transform(val_matrix)
+    assert actual[0] != pytest.approx(tuple(wrong[0]))
+
+
 def test_descriptors_are_empty_when_the_switch_is_off():
     out = build(use_descriptors=False)
     assert out.descriptor_standardizer is None
@@ -193,6 +222,31 @@ def test_generation_items_are_built_only_when_asked_and_only_from_train():
     assert len(on.train_generation) == 6
     assert {item.task_id for item in on.train_generation} == {GENERATION_TASK}
     assert {item.task_id for item in on.train} == {PREDICTION_TASK}
+
+
+def test_generation_items_scale_with_augmentation_like_train_items_do():
+    """Whole-branch review finding 4: A6 = augment + multitask combined.
+
+    Before this fix, train_generation was always built from unaugmented
+    kept_train regardless of n_writings, so with prediction augmented x4
+    (arm A6) InterleavedLoader had to CYCLE the much-shorter generation
+    side ~4x per epoch just to match lengths -- replaying the SAME handful
+    of batches repeatedly instead of giving A6 the "one natural pass per
+    epoch" exposure A5 gets. Generation items must now come from the SAME
+    `writings` as train items, so the two streams scale together and no
+    cycling is needed.
+    """
+    unaugmented = build(build_generation=True, n_writings=1)
+    augmented = build(build_generation=True, n_writings=4)
+    assert len(unaugmented.train_generation) == len(unaugmented.train) == 6
+    # The bug this pins: with the old code this stayed 6 even though train
+    # grew to 24 -- i.e. generation silently did NOT track augmentation.
+    assert len(augmented.train_generation) == len(augmented.train) == 24
+    # Not just a count match: every train polymer's 4 writings must actually
+    # show up on the generation side (same source_index coverage), not 24
+    # copies of a single writing.
+    generation_targets = Counter(item.tg_standardised for item in augmented.train_generation)
+    assert set(generation_targets.values()) == {4}, "every polymer's 4 writings must appear"
 
 
 def test_collator_emits_only_tensors_with_the_expected_keys():

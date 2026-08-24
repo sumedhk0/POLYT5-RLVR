@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from polyt5.data.multitask import GENERATION_TASK, PREDICTION_TASK
-from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration
+from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration, weighted_lm_loss
 from polyt5.model.multitask import MultiTaskConfig, PolyT5MultiTask
 from polyt5.training import Trainer, TrainerConfig
 from polyt5.training.group_a import arm_config
@@ -180,6 +180,40 @@ def test_generation_batches_route_to_the_decoder():
         labels=batch["labels"],
     ).loss
     assert float(trainer._forward_loss(batch)) == pytest.approx(float(reference), abs=1e-6)
+
+
+def test_reliability_weighted_arm_routes_through_weighted_lm_loss():
+    """Whole-branch review finding 1: A4 had zero test coverage.
+
+    No test exercised ``GroupATrainer._forward_loss`` with ``arm_config("A4")``,
+    so ``weights = batch["weights"] if self.group_a.reliability_weighting else
+    None`` (multitask_trainer.py) could be replaced with an unconditional
+    ``weights = None`` and every existing test would still pass: A4 would then
+    silently report "no effect" for a change that was never applied -- the
+    same shape of false finding the Task 7 MAJOR described. The sibling switch
+    (descriptors) already had `test_descriptor_arm_adds_a_term_to_the_text_loss`;
+    this is A4's equivalent, pinned against the exact formula
+    (`weighted_lm_loss`), not merely "differs from something".
+    """
+    model = build_model()
+    model.eval()
+    batch = make_batch(PREDICTION_TASK, n=3)
+    weights = torch.tensor([0.25, 1.0, 3.0])
+    batch["weights"] = weights
+
+    trainer = GroupATrainer(model, [], trainer_config(), group_a=arm_config("A4"))
+    output = model.backbone(
+        input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+        labels=batch["labels"],
+    )
+    reference = weighted_lm_loss(output.logits, batch["labels"], weights=weights)
+
+    loss = trainer._forward_loss(batch)
+    assert float(loss) == pytest.approx(float(reference), abs=1e-6)
+    # Must not just be the unweighted backbone loss -- the mutation this test
+    # exists to kill (`weights = None`) would otherwise still pass if the two
+    # happened to coincide.
+    assert float(loss) != pytest.approx(float(output.loss), abs=1e-6)
 
 
 def test_descriptor_arm_adds_a_term_to_the_text_loss():

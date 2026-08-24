@@ -12,6 +12,9 @@ import pytest
 import torch
 import yaml
 
+from polyt5.data.multitask import assemble_split
+from polyt5.data.tg_metadata import TgExample, TgRow
+from polyt5.evaluation import ArmResult
 from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration
 from polyt5.tokenization import PolyT5Tokenizer
 from polyt5.training import save_checkpoint
@@ -57,6 +60,43 @@ def _tiny_model_yaml(path: Path) -> Path:
     }
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     return path
+
+
+class _FakeTokenizer:
+    """Character-level stand-in for ``assemble_split``, not a real tokenizer.
+
+    Mirrors ``tests/test_group_a_batches.py``'s fixture: ``polyt5.data``
+    never constructs one itself.
+    """
+
+    pad_id = 0
+    eos_id = 1
+
+    def encode(self, text, *, add_eos=True, max_length=None, truncation=True):
+        ids = [2 + (ord(ch) % 60) for ch in str(text)]
+        if add_eos:
+            ids.append(self.eos_id)
+        if truncation and max_length is not None:
+            ids = ids[:max_length]
+        return ids
+
+
+_DESCRIPTOR_NAMES = ["varies", "doubles"]
+
+
+def _synthetic_example(index: int) -> TgExample:
+    return TgExample(
+        pselfies=f"[At][C]{'[C]' * index}[At]",
+        row=TgRow(
+            psmiles="[*]CCO[*]" if index % 2 else "[*]CC(C)[*]",
+            tg=300.0 + 10.0 * index,
+            std=0.0,
+            num_of_points=1,
+            reliability="black",
+            polymer_class="test",
+            descriptors=(float(index), float(index) * 2.0),
+        ),
+    )
 
 
 def write_splits(path: Path, *, n: int = 10, n_splits: int = 2) -> Path:
@@ -385,3 +425,147 @@ def test_score_split_text_head_arm_scores_via_beam_search(tmp_path):
     )
     assert len(predictions) == 2
     assert report.n_total == 2
+
+
+# --------------------------------------------------------------------------
+# Whole-branch review round: findings 5 and 2. Neither runs any training --
+# _reference_step_budget is a pure function, and n_train_polymers-invariance
+# is checked via real (fast, tiny) assemble_split calls, not a live run.
+# --------------------------------------------------------------------------
+
+
+def test_reference_step_budget_is_a_pure_function_of_its_inputs():
+    """Direct unit test of the formula: ceil(polymers/batch) steps/epoch,
+    times the epoch count -- no arm identity enters the computation at all,
+    which is exactly why it produces the same number for every arm sharing
+    a split's n_train_polymers.
+    """
+    # 5293 polymers / batch 16 = 330.8125 -> 331 micro-batches/epoch (ceil),
+    # grad_accum 1 -> 331 steps/epoch, x 30 epochs.
+    assert run_group_a._reference_step_budget(
+        5293, batch_size=16, gradient_accumulation_steps=1, epochs=30
+    ) == 331 * 30
+    # gradient accumulation divides the micro-batch count again.
+    assert run_group_a._reference_step_budget(
+        5293, batch_size=16, gradient_accumulation_steps=2, epochs=30
+    ) == 166 * 30
+
+
+def test_step_budget_is_equal_across_b0_a3_a5_a6_on_the_same_split():
+    """Finding 5 verification, end to end from the same building blocks
+    main() uses -- no training, no model, just assemble_split + the pure
+    budget formula.
+
+    tensors.n_train_polymers is the ONLY per-arm input to the step budget
+    besides the shared batch_size/grad_accum/epochs, and it is arm-invariant
+    (the red drop in assemble_split runs unconditionally for every arm). So
+    if n_train_polymers matches across B0/A3/A5/A6, their step budgets are
+    equal BY CONSTRUCTION -- this test demonstrates that invariant on real
+    (tiny, synthetic) data rather than asserting it as a given.
+    """
+    examples = [_synthetic_example(i) for i in range(8)]
+    tokenizer = _FakeTokenizer()
+    arms = {arm: run_group_a.arm_config(arm) for arm in ("B0", "A3", "A5", "A6")}
+
+    n_train_polymers: dict[str, int] = {}
+    for name, group_a in arms.items():
+        tensors = assemble_split(
+            examples, _DESCRIPTOR_NAMES,
+            train_indices=[0, 1, 2, 3, 4, 5], val_indices=[6], test_indices=[7],
+            tokenizer=tokenizer,
+            use_regression_head=group_a.regression_head,
+            use_descriptors=group_a.descriptors,
+            n_writings=group_a.effective_n_writings(),
+            use_reliability_weighting=group_a.reliability_weighting,
+            std_floor=group_a.std_floor,
+            build_generation=group_a.multitask,
+            seed=0,
+        )
+        n_train_polymers[name] = tensors.n_train_polymers
+
+    assert len(set(n_train_polymers.values())) == 1, (
+        f"n_train_polymers must be arm-invariant per split, got {n_train_polymers}"
+    )
+
+    budgets = {
+        name: run_group_a._reference_step_budget(
+            count, batch_size=2, gradient_accumulation_steps=1, epochs=30
+        )
+        for name, count in n_train_polymers.items()
+    }
+    assert len(set(budgets.values())) == 1, f"step budgets must be equal, got {budgets}"
+    assert budgets["B0"] == budgets["A3"] == budgets["A5"] == budgets["A6"]
+
+
+def test_config_fingerprint_folds_in_max_steps_and_only_split():
+    """Finding 2: a --max-steps smoke run must not share a cache key with a
+    real run of the same arm. Both --max-steps and --only-split are OUTSIDE
+    GroupAConfig, so they cannot be caught by the round-1 fix that folded
+    group_a.to_dict() into the fingerprint -- they need their own inputs.
+    """
+    group_a = run_group_a.arm_config("B0")
+    real_run = run_group_a._config_fingerprint(group_a, max_steps=None, only_split=None)
+    smoke_run = run_group_a._config_fingerprint(group_a, max_steps=20, only_split=0)
+    different_smoke_cap = run_group_a._config_fingerprint(
+        group_a, max_steps=50, only_split=0
+    )
+    only_split_alone = run_group_a._config_fingerprint(
+        group_a, max_steps=None, only_split=0
+    )
+
+    assert real_run != smoke_run
+    assert smoke_run != different_smoke_cap
+    assert real_run != only_split_alone
+    # Determinism: identical arguments still reproduce the identical
+    # fingerprint, or a genuine resume of a real run could never find its
+    # own cache.
+    assert real_run == run_group_a._config_fingerprint(
+        group_a, max_steps=None, only_split=None
+    )
+
+
+# --------------------------------------------------------------------------
+# Task 13 finding 9 (routed to the whole-branch review): compare B0's
+# in-harness rerun to the frozen number, instead of only labelling the
+# frozen number "baseline B0" and never checking it against the real rerun.
+# --------------------------------------------------------------------------
+
+
+def _arm_result(arm: str, mae_mean: float | None, *, n_splits: int = 5) -> ArmResult:
+    return ArmResult(
+        arm=arm, switches={}, n_splits=n_splits, mae_mean=mae_mean, mae_std=0.1,
+        rmse_mean=None, rmse_std=None, r2_mean=None, r2_std=None,
+        non_numeric_rate_mean=0.0,
+    )
+
+
+def test_b0_vs_frozen_reports_not_run_when_b0_is_excluded():
+    results = [_arm_result("A3", 27.0)]
+    comparison = run_group_a._b0_vs_frozen(results, baseline_mean=28.6733, baseline_std=0.7591)
+    assert comparison["status"] == "not_run"
+    assert comparison["delta"] is None
+
+
+def test_b0_vs_frozen_reports_no_evaluable_split_when_b0_never_scored():
+    results = [_arm_result("B0", None, n_splits=0)]
+    comparison = run_group_a._b0_vs_frozen(results, baseline_mean=28.6733, baseline_std=0.7591)
+    assert comparison["status"] == "no_evaluable_split"
+
+
+def test_b0_vs_frozen_flags_a_harness_divergence():
+    """A B0 rerun landing outside the frozen std must be flagged, not merged
+    silently into "the baseline" the way format_ablation_matrix's header
+    text alone would read.
+    """
+    within = run_group_a._b0_vs_frozen(
+        [_arm_result("B0", 29.0)], baseline_mean=28.6733, baseline_std=0.7591
+    )
+    assert within["status"] == "compared"
+    assert within["diverges"] is False
+
+    outside = run_group_a._b0_vs_frozen(
+        [_arm_result("B0", 35.0)], baseline_mean=28.6733, baseline_std=0.7591
+    )
+    assert outside["status"] == "compared"
+    assert outside["diverges"] is True
+    assert outside["delta"] == pytest.approx(35.0 - 28.6733)
