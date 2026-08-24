@@ -1,0 +1,114 @@
+# Phase 3 results — round 1, seed 0
+
+**Our RLVR extension obtains** the numbers below. They are not the paper's, and they are not
+our Phase 1–2 reproduction's. Three claims never merge — see
+[`reproduction.md`](reproduction.md) §9. polyT5 (Sahu et al., npj AI 2026) contains no
+reinforcement learning; everything here is ours.
+
+Produced by `scripts/compare_arms.py` on 2026-08-24 against
+`artifacts/baseline/frozen_baseline.json`. Protocol: targets 300/400/500 K, n=500 each
+(1,500 samples per arm), T=0.70 top_p=0.95 matching Arm B, tolerance 50 K.
+**One seed (0).**
+
+## The matrix
+
+| | Arm A | Arm B | control | **validity** | **accuracy** |
+|---|---|---|---|---|---|
+| | baseline | baseline | random reward | PV cascade | Tg closeness |
+| **PV rate** | 0.521 | 0.526 | 0.515 | **0.901** | 0.284 |
+| SV rate | 0.999 | 1.000 | 0.999 | 1.000 | 0.999 |
+| duplicate rate | 0.092 | 0.121 | 0.129 | 0.069 | **0.635** |
+| SR rate | 0.376 | 0.451 | 0.452 | 0.779 | 0.763 |
+| novelty rate | 0.569 | 0.597 | 0.594 | **0.963** | 0.599 |
+| near-copy fraction | 0.223 | 0.229 | 0.235 | **0.585** | 0.456 |
+| mean length | 63.0 | 63.2 | 62.9 | **130.7** | 59.2 |
+| auditor Tg MAE (K) | 34.7 | 36.6 | 36.3 | **150.4** | **21.8** |
+| auditor TP rate | 0.716 | 0.693 | 0.693 | **0.047** | **0.869** |
+
+## Pre-registered verdicts
+
+| arm | metric | Δ vs Arm B | 95% CI | success |
+|---|---|---|---|---|
+| validity | `pv_rate` | **+0.375** | [0.347, 0.401] | **yes** |
+| accuracy | `accuracy_score` | **+0.342** | [0.324, 0.362] | **yes** |
+| control | — | — | — | `None` |
+
+Both cleared their pre-registered margin. `control` correctly reports `success=None` — it
+optimised nothing, so it cannot win or lose.
+
+Validity's audit column reads **"N/A — structural metric, no predictor involved"**: PV is
+RDKit chemistry, and there is no model opinion to audit. Accuracy's gain *was* audit-confirmed
+— Δ_auditor +0.363, CI [0.337, 0.388] — by split 4, which never entered any reward path.
+
+## What the control establishes
+
+`control` — a uniform random, candidate-independent reward — landed at PV 0.515 against
+Arm B's 0.526, duplicate rate 0.129 vs 0.121, length 62.9 vs 63.2, auditor MAE 36.3 vs 36.6.
+**Flat on every axis.**
+
+That was not guaranteed. GRPO could plausibly have moved these metrics on its own through KL
+drift, entropy change, or a sampling shift unrelated to any reward. It did not. So every
+movement in the other two arms is attributable to their reward rather than to the algorithm.
+
+Without this arm, nothing below would be a finding.
+
+## The result: both arms won, and both broke something else
+
+**Validity** bought a verified +37.5-point PV gain and paid for it on every axis its reward
+did not price:
+
+- auditor Tg MAE **36.6 → 150.4 K**, four times worse
+- auditor TP rate **0.693 → 0.047**
+- mean length **63 → 131**
+- near-copy fraction **0.229 → 0.585**
+
+It learned to write long, near-duplicate, chemically-valid strings. Every one of those PV
+passes is real and checkable by anyone with RDKit. The polymers are far worse.
+
+**Accuracy** is the mirror image. Auditor MAE **36.6 → 21.8 K** — a 40% improvement confirmed
+by a model that never saw its reward — while PV **collapsed 0.526 → 0.284** and the duplicate
+rate hit **0.635**.
+
+Neither arm is a failure of its objective. Both are failures of everything else, and the
+off-diagonal is what makes that visible.
+
+## Two things the metrics themselves revealed
+
+**Novelty-as-exact-match is not novelty.** Validity's `novelty_rate` rose to **0.963** while its
+`near_copy_fraction` rose to **0.585**. The hash index says 96% of its output is novel; ECFP6
+Tanimoto says 58% are near-copies of training polymers. Both numbers are correct — novelty is
+defined as exact canonical non-membership, so a one-atom edit counts as new chemistry. This
+limitation was documented before the run and is now measured.
+
+**SR improved in both arms without being rewarded.** SELFIES round-trip fidelity went
+0.451 → 0.779 (validity) and 0.763 (accuracy), against a flat control at 0.452. Neither reward
+mentions SR. This is a genuine off-diagonal *gain*, and unexplained.
+
+## Caveats that bound these numbers
+
+**One seed.** `n_seeds=1`, so `across_seed_unanimous=yes` is vacuous — a single run cannot
+disagree with itself. The matrix prints `spread=[1 seed]` rather than a fabricated 0, but the
+across-seed criterion is not meaningfully exercised. Nothing here is protected against
+seed-to-seed variance.
+
+**Tg numbers are model-scored, and the auditor is a sibling.** Split 4 never entered a reward
+path, but it shares roughly 80% of its training data with each reward model. It detects
+ensemble-specific error well and corpus-wide error barely. See
+[`instrument_audit.md`](instrument_audit.md).
+
+**Validity's length inflation is a confound, not a footnote.** Longer sequences have more ways
+to satisfy the cascade. The PV gain is verified; whether it reflects better chemistry or more
+of it is not settled by these numbers.
+
+## Reproducing
+
+```bash
+python scripts/compare_arms.py --arms accuracy validity control
+```
+
+Outputs `results/arm_comparison/{matrix.csv,matrix.md,summary.json,manifest.json}`. The
+manifest records checkpoint SHA-256s, the novelty index hash, and every reward config hash, so
+a row can be traced to the exact artifacts that produced it.
+
+**Four arms — `novelty`, `synthesisability`, `composite`, `constraint` — have not been trained.
+This document reports three.**
