@@ -70,10 +70,18 @@ from polyt5.data.tg_metadata import (
     prepare_labeled_rows,
     read_lamalab_rows,
 )
+from polyt5.data.weighting import (
+    DEFAULT_STD_FLOOR,
+    RED_RELIABILITY,
+    drop_red_reliability,
+    reliability_weights,
+)
 
 __all__ = [
     "DEFAULT_CONFIG",
+    "DEFAULT_STD_FLOOR",
     "LABEL_IGNORE_ID",
+    "RED_RELIABILITY",
     "SOURCES",
     "ConfirmationRequiredError",
     "DataSource",
@@ -95,6 +103,7 @@ __all__ = [
     "descriptor_group",
     "descriptor_matrix",
     "download",
+    "drop_red_reliability",
     "fit_target_standardizer",
     "format_property_value",
     "load_splits",
@@ -109,6 +118,7 @@ __all__ = [
     "read_lamalab_rows",
     "read_lamalab_tg",
     "read_pi1m",
+    "reliability_weights",
     "save_splits",
     "span_corrupt",
 ]
