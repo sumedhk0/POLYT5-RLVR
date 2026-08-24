@@ -79,17 +79,17 @@ from polyt5.data.weighting import (
 )
 
 __all__ = [
-    "DEFAULT_CONFIG",
-    "DEFAULT_STD_FLOOR",
-    "LABEL_IGNORE_ID",
-    "RED_RELIABILITY",
-    "SOURCES",
     "AugmentedExample",
     "ConfirmationRequiredError",
+    "DEFAULT_CONFIG",
+    "DEFAULT_STD_FLOOR",
+    "DESCRIPTOR_PREFIXES",
     "DataSource",
     "DownloadRecord",
-    "DESCRIPTOR_PREFIXES",
+    "LABEL_IGNORE_ID",
     "PreparationStats",
+    "RED_RELIABILITY",
+    "SOURCES",
     "Seq2SeqCollator",
     "SpanCorruptionCollator",
     "SpanCorruptionConfig",
