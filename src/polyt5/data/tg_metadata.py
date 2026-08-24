@@ -59,6 +59,22 @@ DESCRIPTOR_PREFIXES: dict[str, str] = {
 PSMILES_COLUMN = "PSMILES"
 TG_COLUMN = "labels.Exp_Tg(K)"
 
+#: Non-descriptor columns every later Group A task assumes are present.
+_REQUIRED_COLUMNS: tuple[str, ...] = (
+    PSMILES_COLUMN,
+    TG_COLUMN,
+    "meta.std",
+    "meta.num_of_points",
+    "meta.reliability",
+)
+
+#: The descriptor composition the frozen split indices were computed against.
+_EXPECTED_DESCRIPTOR_COUNTS: dict[str, int] = {
+    "backbone": 30,
+    "sidechain": 42,
+    "fullpolymer": 28,
+}
+
 
 @dataclass(frozen=True)
 class TgRow:
@@ -123,6 +139,47 @@ def descriptor_columns(header: Sequence[str]) -> list[str]:
     return [column for column in header if descriptor_group(column) is not None]
 
 
+def _validate_schema(header: Sequence[str]) -> list[str]:
+    """Check a CSV header against the schema every later Group A task assumes.
+
+    A renamed or removed column must stop the load, not silently yield fewer
+    descriptor features (same length across rows, so nothing else would
+    crash) or silently drop every row into the "no Tg" bucket. Both are the
+    exact failure mode the frozen 7,354-row alignment cannot tolerate.
+
+    Args:
+        header: The CSV's field names.
+
+    Returns:
+        The descriptor column names, as :func:`descriptor_columns` would return.
+
+    Raises:
+        ValueError: If a required column (:data:`PSMILES_COLUMN`,
+            :data:`TG_COLUMN`, or one of the ``meta.*`` provenance columns) is
+            absent from ``header``, or if the descriptor columns do not total
+            exactly 30 ``backbone`` + 42 ``sidechain`` + 28 ``fullpolymer`` = 100.
+    """
+    header = list(header)
+    missing = [name for name in _REQUIRED_COLUMNS if name not in header]
+    if missing:
+        raise ValueError(
+            f"LamaLab Tg CSV is missing required column(s) {missing}; expected all "
+            f"of {list(_REQUIRED_COLUMNS)} but the header has {len(header)} columns: {header}"
+        )
+
+    columns = descriptor_columns(header)
+    counts = dict.fromkeys(DESCRIPTOR_PREFIXES, 0)
+    for column in columns:
+        counts[descriptor_group(column)] += 1
+    if counts != _EXPECTED_DESCRIPTOR_COUNTS:
+        raise ValueError(
+            f"LamaLab Tg CSV descriptor columns do not match the expected composition: "
+            f"expected {_EXPECTED_DESCRIPTOR_COUNTS} (100 total), found {counts} "
+            f"({len(columns)} total)."
+        )
+    return columns
+
+
 def _to_float(value: object, default: float = math.nan) -> float:
     """Parse a CSV cell to a finite float, or return ``default``."""
     try:
@@ -147,13 +204,18 @@ def read_lamalab_rows(
 
     Returns:
         ``(rows, descriptor_column_names)``.
+
+    Raises:
+        ValueError: If the CSV header fails :func:`_validate_schema` -- a
+            required column is missing, or the descriptor columns are not
+            exactly the expected 30/42/28 = 100.
     """
     path = Path(path)
     rows: list[TgRow] = []
     n_dropped = 0
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        columns = descriptor_columns(reader.fieldnames or [])
+        columns = _validate_schema(reader.fieldnames or [])
         for record in reader:
             if limit is not None and len(rows) >= limit:
                 break
