@@ -25,6 +25,11 @@ have 44% more Tg labels. The gap between our RMSE 44.45 K and the paper's 40.82 
 therefore unlikely to be label quantity. It is more plausibly the substitute
 pretraining corpus, or how we use the labels we have.
 
+**[CORRECTION 2026-08-23]** 7,367 is the *label count* in the CSV. The frozen
+`splits.json` indexes **7,354 prepared examples** — 13 are lost to parse failures,
+terminus rules, length limits and deduplication. 7,354 is the number that governs split
+reuse, and the loader asserts it rather than trusting the CSV row count.
+
 Group A attacks the second of those.
 
 ## 2. Scope
@@ -140,6 +145,12 @@ Weight each example by `1 / max(std, floor)` and drop `reliability == red`. Free
 accuracy from data already on disk. The floor prevents a single-measurement polymer
 (std = 0) from acquiring infinite weight.
 
+**[CORRECTION 2026-08-23] The drop applies to train and val ONLY, never to test.**
+The original wording did not say. Dropping rows from test would change the evaluation
+set, and every Group A number is compared against a frozen 28.6733 K measured on the
+full test split — a different denominator would make the comparison meaningless while
+looking like an improvement. `n_red_in_test` is reported so the residual stays visible.
+
 ### 4.5 Multi-task fine-tuning
 
 Train prediction and generation together on the shared encoder, alternating batches.
@@ -159,7 +170,7 @@ every number is directly comparable to 28.67 ± 0.76 K.
 
 | id | configuration |
 |---|---|
-| B0 | baseline — current text head, single task (already measured: 28.67 K) |
+| B0 | baseline — current text head, single task (**rerun in-harness**, see below) |
 | A1 | + regression head |
 | A2 | + descriptor auxiliaries |
 | A3 | + invariance augmentation |
@@ -167,7 +178,14 @@ every number is directly comparable to 28.67 ± 0.76 K.
 | A5 | + multi-task shared encoder |
 | A6 | all five combined |
 
-Six new configurations × five splits × 6.7 min ≈ **3.5 hours**.
+Seven configurations × five splits × 6.7 min ≈ **3.5 hours**.
+
+**[CORRECTION 2026-08-23] B0 is rerun, not carried over.** The table originally
+annotated it "already measured: 28.67 K" while this same section required all
+configurations to run on the same five splits. Those contradict. Reusing the frozen
+number would leave any harness difference — data loading, seeding, evaluation path —
+silently attributed to whichever change was under test. The frozen artifact remains the
+source of the 27.91 K *threshold*; B0's rerun is what the other six are compared against.
 
 Individual ablations run **as well as** the combination, not instead of it. A combined
 gain with no per-change attribution cannot tell you which idea to keep, and the runs are
