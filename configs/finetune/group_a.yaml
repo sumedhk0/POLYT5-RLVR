@@ -32,6 +32,12 @@ baseline:
 
 model:
   config: configs/model/polyt5_medium.yaml
+  # The SAME pretrained checkpoint the frozen five-split run used to produce the
+  # 28.6733 K baseline (frozen_baseline.json -> artifacts.pretrain_medium_92m).
+  # Every arm warm-starts from it. Training from random weights instead would make
+  # the ablation measure "pretrained vs random" rather than the five switches, and
+  # B0's in-harness rerun could never approach the frozen number.
+  init_checkpoint: results/pretrain_medium_polyone_92m/checkpoints/best.pt
 
 group_a:
   descriptor_lambda: 0.1    # OURS  [AMBIGUITY] sensitivity is reported, not assumed

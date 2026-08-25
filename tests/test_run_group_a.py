@@ -569,3 +569,52 @@ def test_b0_vs_frozen_flags_a_harness_divergence():
     assert outside["status"] == "compared"
     assert outside["diverges"] is True
     assert outside["delta"] == pytest.approx(35.0 - 28.6733)
+
+
+# ---------------------------------------------------------------- init checkpoint
+
+
+def test_config_supplies_the_init_checkpoint_when_the_flag_is_absent():
+    """Forgetting --init-checkpoint must NOT silently train from random weights.
+
+    This regression exists because it happened: the runner sourced the checkpoint
+    from the CLI flag alone, so a run launched without it warm-started nothing.
+    Every arm would have trained from scratch, making the ablation measure
+    "pretrained versus random initialisation" rather than the five switches, with
+    B0's rerun unable to approach the frozen 28.6733 K and all seven arms wrong
+    together.
+    """
+    cfg = {"model": {"init_checkpoint": "results/pretrain/best.pt"}}
+    assert run_group_a.resolve_init_checkpoint(None, cfg) == Path("results/pretrain/best.pt")
+
+
+def test_the_cli_flag_overrides_the_configured_init_checkpoint():
+    cfg = {"model": {"init_checkpoint": "results/pretrain/best.pt"}}
+    override = Path("results/other/best.pt")
+    assert run_group_a.resolve_init_checkpoint(override, cfg) == override
+
+
+def test_no_checkpoint_from_either_source_resolves_to_none():
+    """None is a legitimate answer -- a deliberate from-scratch ablation -- so this
+    returns None rather than raising. main() warns loudly instead."""
+    assert run_group_a.resolve_init_checkpoint(None, {"model": {}}) is None
+    assert run_group_a.resolve_init_checkpoint(None, {}) is None
+
+
+def test_the_shipped_config_names_the_frozen_baselines_pretrained_checkpoint():
+    """The config's checkpoint must be the SAME one the frozen five-split run used.
+
+    A different checkpoint would still warm-start, and every number would still look
+    plausible, while no longer being comparable to the 28.6733 K every arm is judged
+    against.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    cfg = yaml.safe_load(
+        (repo / "configs" / "finetune" / "group_a.yaml").read_text(encoding="utf-8")
+    )
+    configured = Path(cfg["model"]["init_checkpoint"])
+    frozen = json.loads(
+        (repo / "artifacts" / "baseline" / "frozen_baseline.json").read_text(encoding="utf-8")
+    )
+    expected = Path(frozen["artifacts"]["pretrain_medium_92m"]["path"].replace("\\", "/"))
+    assert configured == expected, f"config points at {configured}, frozen record says {expected}"

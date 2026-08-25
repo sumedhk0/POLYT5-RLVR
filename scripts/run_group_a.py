@@ -267,6 +267,30 @@ def _b0_vs_frozen(
     }
 
 
+def resolve_init_checkpoint(cli_value: Path | None, cfg: dict) -> Path | None:
+    """Resolve the pretrained checkpoint: CLI overrides config, config is the default.
+
+    The checkpoint is a RUN-DEFINING parameter. Sourcing it from ``--init-checkpoint``
+    alone meant that forgetting the flag silently trained every arm from random
+    weights -- the ablation would then measure "pretrained versus random
+    initialisation" rather than the five switches under test, B0's in-harness rerun
+    could never approach the frozen 28.6733 K, and all seven arms would be wrong
+    together: internally consistent and externally meaningless. Putting it in the
+    config makes it versioned, diffable, and recorded in the run manifest.
+
+    Args:
+        cli_value: ``--init-checkpoint``, or ``None`` when not passed.
+        cfg: The loaded run config; ``model.init_checkpoint`` supplies the default.
+
+    Returns:
+        The checkpoint path, or ``None`` when neither source provides one.
+    """
+    if cli_value is not None:
+        return cli_value
+    configured = cfg.get("model", {}).get("init_checkpoint")
+    return Path(configured) if configured else None
+
+
 def resolve_arms(requested: Sequence[str] | None, **overrides: Any) -> list[GroupAConfig]:
     """Build the configurations to run, in :data:`ARM_IDS` order.
 
@@ -463,6 +487,14 @@ def main(argv: list[str] | None = None) -> int:
     device = select_device(train_cfg.get("device", "auto"))
     logger.info("device=%s", describe_device(device).to_dict())
 
+    init_checkpoint = resolve_init_checkpoint(args.init_checkpoint, cfg)
+    if init_checkpoint is None:
+        logger.warning(
+            "no init_checkpoint from --init-checkpoint or model.init_checkpoint: every "
+            "arm will train from RANDOM weights, which is NOT comparable to the frozen "
+            "baseline. Pass one unless you intend a from-scratch ablation."
+        )
+
     tokenizer_path = _resolve(
         cfg.get("tokenizer", {}).get("path", "artifacts/tokenizer/polyt5_vocab.json")
     )
@@ -543,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
             model, head_config, pretrained = build_arm_model(
                 group_a, n_descriptors,
                 model_config_path=_resolve(require(cfg, "model.config")),
-                init_checkpoint=args.init_checkpoint,
+                init_checkpoint=init_checkpoint,
                 tokenizer=tokenizer, logger=logger, device=device,
             )
             model.set_target_scaling(
