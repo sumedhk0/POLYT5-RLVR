@@ -42,6 +42,13 @@ Example:
 
 from __future__ import annotations
 
+from polyt5.evaluation.conformal import (
+    ConformalRegressor,
+    CoverageReport,
+    conformal_quantile,
+    split_calibration,
+)
+
 from .ablation import (
     BASELINE_ARM,
     CLAIM_CATEGORY,
@@ -120,10 +127,14 @@ from .sweep import (
 
 __all__ = [
     "BASELINE_ARM",
+    "ConformalRegressor",
+    "CoverageReport",
     "CLAIM_CATEGORY",
     "CLAIM_NOTE",
     "DEFAULT_REGRESSION_TOLERANCE",
     "EFFECT_HELPS",
+    "conformal_quantile",
+    "split_calibration",
     "EFFECT_HURTS",
     "EFFECT_NOT_RUN",
     "EFFECT_NO_EFFECT",

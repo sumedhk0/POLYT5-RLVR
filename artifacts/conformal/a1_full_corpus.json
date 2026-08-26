@@ -1,0 +1,109 @@
+{
+ "source_predictions": "results\\a1_full_corpus\\A1\\split_0_83a52e78a420\\predictions.jsonl",
+ "n_held_out": 400,
+ "n_calibration": 200,
+ "n_validation": 200,
+ "n_non_numeric_dropped": 0,
+ "seed": 20260825,
+ "note": "Split conformal. Coverage is measured on a DISJOINT half; on the calibration half it would be the tautology rank/n. The guarantee is valid at any n, but with this n the coverage ESTIMATE is imprecise -- read the CI, not the point estimate.",
+ "levels": [
+  {
+   "alpha": 0.05,
+   "target_coverage": 0.95,
+   "half_width_k": 63.950000000000045,
+   "interval_width_k": 127.90000000000009,
+   "measured_coverage": 0.9,
+   "coverage_ci95": [
+    0.8584221212662311,
+    0.941577878733769
+   ],
+   "n_validation": 200,
+   "covers_target": false
+  },
+  {
+   "alpha": 0.1,
+   "target_coverage": 0.9,
+   "half_width_k": 52.150000000000034,
+   "interval_width_k": 104.30000000000007,
+   "measured_coverage": 0.87,
+   "coverage_ci95": [
+    0.823390721953671,
+    0.916609278046329
+   ],
+   "n_validation": 200,
+   "covers_target": true
+  },
+  {
+   "alpha": 0.2,
+   "target_coverage": 0.8,
+   "half_width_k": 37.85000000000002,
+   "interval_width_k": 75.70000000000005,
+   "measured_coverage": 0.8,
+   "coverage_ci95": [
+    0.7445628283549747,
+    0.8554371716450254
+   ],
+   "n_validation": 200,
+   "covers_target": true
+  }
+ ],
+ "repeated_split": {
+  "n_repeats": 200,
+  "note": "Mean realised coverage over independent calibration/validation partitions of the same held-out set. Addresses the noise in a single split; does NOT address the underlying held-out set being small.",
+  "levels": [
+   {
+    "alpha": 0.05,
+    "target_coverage": 0.95,
+    "mean_coverage": 0.949275,
+    "mean_half_width_k": 79.07325,
+    "coverage_p05": 0.91,
+    "coverage_p95": 0.98,
+    "shortfall": 0.0007249999999999757
+   },
+   {
+    "alpha": 0.1,
+    "target_coverage": 0.9,
+    "mean_coverage": 0.900325,
+    "mean_half_width_k": 55.729500000000016,
+    "coverage_p05": 0.85,
+    "coverage_p95": 0.945,
+    "shortfall": -0.0003250000000000197
+   },
+   {
+    "alpha": 0.2,
+    "target_coverage": 0.8,
+    "mean_coverage": 0.79875,
+    "mean_half_width_k": 38.557750000000006,
+    "coverage_p05": 0.73,
+    "coverage_p95": 0.86,
+    "shortfall": 0.0012500000000000844
+   }
+  ]
+ },
+ "shipped": {
+  "note": "Half-widths calibrated on ALL 400 held-out polymers -- the standard two-stage practice: the repeated-split experiment above VALIDATES the method's coverage at n=200, then the shipped constant uses every calibration point available for the tightest honest interval. These half-widths have no independent coverage measurement of their own; the evidence they are correct is the repeated-split result, which used strictly LESS calibration data and so is conservative for them.",
+  "levels": [
+   {
+    "alpha": 0.05,
+    "target_coverage": 0.95,
+    "half_width_k": 79.25,
+    "n_calibration": 400,
+    "validated_mean_coverage_at_n200": 0.949275
+   },
+   {
+    "alpha": 0.1,
+    "target_coverage": 0.9,
+    "half_width_k": 54.35000000000002,
+    "n_calibration": 400,
+    "validated_mean_coverage_at_n200": 0.900325
+   },
+   {
+    "alpha": 0.2,
+    "target_coverage": 0.8,
+    "half_width_k": 37.85000000000002,
+    "n_calibration": 400,
+    "validated_mean_coverage_at_n200": 0.79875
+   }
+  ]
+ }
+}
