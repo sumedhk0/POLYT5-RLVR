@@ -101,8 +101,14 @@ cross-script comparison that manufactures a gain; arms are compared to the contr
 | arm | PV | vs control | TP | vs control |
 |---|---|---|---|---|
 | control (frozen generator) | 0.6100 | — | 0.6164 | — |
-| A5 | 0.6153 | +0.005 | 0.4561 | **−0.160** |
-| A6 | 0.5893 | −0.021 | 0.4457 | **−0.171** |
+| seed 0 A5 | 0.6153 | +0.005 | 0.4561 | **−0.160** |
+| seed 0 A6 | 0.5893 | −0.021 | 0.4457 | **−0.171** |
+| seed 1 A5 | 0.5707 | −0.039 | 0.4346 | **−0.182** |
+| seed 1 A6 | 0.5807 | −0.029 | 0.4856 | **−0.131** |
+
+Four measurements across two seeds, all four below the control on both axes. TP is down
+13–18 points every time. PV's single positive — seed 0's A5 at +0.005 — is contradicted by
+seed 1's −0.039, so it was noise.
 
 **PV flat, TP down ~16–17 points.** Not a validity-for-conditioning trade — the shared encoder
 costs conditioning accuracy and buys nothing. With prediction also down 1.04–1.89 K, A5 and A6
@@ -132,8 +138,9 @@ one able to break it.
 against effects of similar size. Calling them "no effect" overstates what five splits per seed
 can resolve.
 
-**Generation is split 0 only.** A5/A6 generation used each arm's split-0 checkpoint, one
-sampling seed. The TP gap is large and consistent across all three targets, but it is one draw.
+**Generation is split 0 only.** A5/A6 generation used each arm's split-0 checkpoint on both
+seeds, one sampling seed each. The TP gap is large and consistent across all three targets and
+both training seeds, but the split-0 restriction stands.
 
 **A2's switch did fire.** 99 of the 100 descriptor columns survived into training in every A2
 and A6 split (one dropped as degenerate), so A2's "no effect" is a real null about descriptor
