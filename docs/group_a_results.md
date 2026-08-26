@@ -1,4 +1,4 @@
-# Phase 4 Group A results — Tg prediction ablation, seed 0
+# Phase 4 Group A results — Tg prediction ablation, seeds 0 and 1
 
 **Our extension obtains** the numbers below. They are improvements to OUR OWN reproduction,
 not to the paper's Tg figures, which are a different quantity (5,130 withheld labels) on a
@@ -7,7 +7,9 @@ polyT5 (Sahu et al., npj AI 2026) contains none of this.
 
 Produced by `scripts/run_group_a.py` on 2026-08-25 over the frozen five splits
 (`results/tg_prediction_5splits_medium92m/splits.json`). Seven arms warm-started from the
-same 92.3M checkpoint, each held to an identical 9,930 optimizer steps. **One seed (0).**
+same 92.3M checkpoint, each held to an identical 9,930 optimizer steps. **Two seeds (0, 1)**,
+70 training runs. Splits stay frozen across seeds, so only initialisation and batch order
+change.
 
 ## The harness reproduces the baseline
 
@@ -17,25 +19,51 @@ other row readable. Outlier-corrected, it lands at **28.67 K** against the froze
 
 ## The matrix
 
-| arm | switch | MAE (K) | Δ vs 28.6733 | per-split s0…s4 | verdict |
-|---|---|---|---|---|---|
-| B0 | — (control) | 29.18 / **28.67** corrected | +0.51 / 0.00 | 27.85 32.51 28.56 29.83 27.17 | no effect |
-| **A1** | **regression head** | **27.17** | **−1.50** | 25.30 27.72 27.48 29.15 26.20 | **helps** |
-| A2 | descriptor auxiliaries | 29.19 | +0.52 | 30.75 30.04 28.58 29.44 27.17 | no effect |
-| A3 | invariance augmentation | 29.38 | +0.70 | 29.38 30.50 29.10 29.89 28.03 | no effect |
-| A4 | reliability weighting | 28.79 | +0.11 | 28.35 29.80 28.85 29.54 27.40 | no effect |
-| A5 | multi-task shared encoder | 30.56 | +1.89 | 30.13 30.72 30.36 31.76 29.84 | hurts |
-| A6 | all five combined | 29.71 | +1.04 | 28.99 31.64 30.01 29.77 28.13 | hurts |
+MAE in K, outlier-corrected, averaged over the five frozen splits.
 
-Pre-registered threshold for `helps`: 27.9142 K, one baseline standard deviation below
-28.6733. **A1 is the only arm that clears it**, and it beats B0 on all five splits
-individually — not an average rescued by one lucky split.
+| arm | switch | seed 0 | seed 1 | mean | spread | clears 27.9142 on both? | splits beating own B0 |
+|---|---|---|---|---|---|---|---|
+| B0 | — (control) | 28.67 | 28.53 | 28.60 | 0.14 | no | 0/10 |
+| **A1** | **regression head** | **27.17** | **27.05** | **27.11** | **0.12** | **yes** | **10/10** |
+| A2 | descriptor auxiliaries | 29.19 | 28.29 | 28.74 | 0.90 | no | 5/10 |
+| A3 | invariance augmentation | 29.38 | 29.99 | 29.68 | 0.61 | no | 0/10 |
+| A4 | reliability weighting | 28.79 | 28.35 | 28.57 | 0.44 | no | 4/10 |
+| A5 | multi-task shared encoder | 30.56 | 29.63 | 30.10 | 0.94 | no | 1/10 |
+| A6 | all five combined | 29.71 | 30.74 | 30.23 | 1.03 | no | 2/10 |
+
+## A1 meets the pre-registered criterion
+
+The criterion was across-seed unanimity plus a minimum margin: the arm must sit below
+27.9142 K — one baseline standard deviation under the frozen 28.6733 K — on **every** seed.
+With one seed that criterion was vacuous, since a single run cannot disagree with itself.
+
+**A1 clears it on both seeds** (27.17 and 27.05), with a 0.12 K across-seed spread, and beats
+its own B0 on **all ten** arm/split pairs. No other arm clears it on either seed.
+
+**No other arm survives.** A3, A5 and A6 land above baseline on both seeds. A2 and A4 are
+nulls whose across-seed spread — 0.90 K and 0.44 K — is as large as or larger than the effect
+they would need to show, and each beats B0 on roughly half its splits (5/10 and 4/10, a coin
+flip). A2's sign even reverses between seeds: +0.52 K against the frozen baseline on seed 0,
+−0.38 K on seed 1. **A switch whose sign flips between seeds has not been measured.**
+
+That is a weaker and more honest claim than the seed-0 write-up's "no effect". At n=5 splits
+per seed these two switches are indistinguishable from noise; they are not shown to be inert.
+
+## The baseline held, and so did the environment
+
+B0 landed at 28.67 and 28.53 against the frozen 28.6733 K. Seed 1 also ran under a different
+interpreter — Windows Smart App Control began blocking the project venv's `python.exe`
+mid-study, so seed 1 used the uv-managed CPython 3.12.13 that the venv was built from, with
+the same site-packages and the same torch 2.9.0+cu129. B0 moving 0.14 K across that change
+confirms it is inert, which is the only reason seed 1's numbers may sit in the same table as
+seed 0's.
 
 ## What A1 actually fixed
 
-Across the whole run there was exactly **one** catastrophic prediction: B0 split 1 emitted
-**4293.10 K** where the truth was 481.15 K. One extra digit. That single token took split 1's
-r² from 0.828 to 0.051 and its RMSE from 46.75 to 109.83.
+Across both seeds there was exactly **one** catastrophic prediction: seed 0's B0 split 1
+emitted **4293.10 K** where the truth was 481.15 K. One extra digit. That single token took
+split 1's r² from 0.828 to 0.051 and its RMSE from 46.75 to 109.83. Seed 1 produced none, in
+any arm.
 
 | B0 split 1 | MAE | RMSE | r² |
 |---|---|---|---|
@@ -44,9 +72,13 @@ r² from 0.828 to 0.051 and its RMSE from 46.75 to 109.83.
 | frozen split_1 | 29.10 | 45.90 | 0.834 |
 
 Not a harness bug: the frozen run used the same protocol and simply did not roll that slip.
-It is the free-form-text regression failure mode, and A1 removes it by construction — a float
-head cannot emit an extra digit. **A1 produced zero outliers.** Its RMSE is 41.32 against
-B0's 56.33 for the same reason.
+It is the free-form-text regression failure mode, and A1 cannot exhibit it **by construction** —
+a float head has no digit to add. That mechanism is the claim; the empirical support for it is
+thin, since the event fired once in ten B0 runs, so A1's zero across ten runs is what a rate
+that low predicts anyway. The argument rests on the mechanism, not on the count.
+
+The RMSE gap is the same story with more data behind it: A1 averages 40.69–41.32 against B0's
+43.46–56.33, and the seed-0 spread in that B0 figure is one decode.
 
 This also means B0's RMSE and r² are hostage to single decodes and should carry no weight in
 any comparison. MAE is the pre-registered metric and is robust: the outlier moved one split by
@@ -92,9 +124,13 @@ reconstruct from the raw check files.
 
 ## Caveats
 
-**One seed.** `seed: 0` throughout. The across-seed unanimity criterion is not exercised, and
-A1's −1.50 K is not protected against seed-to-seed variance. It wins on 5/5 splits, which is
-evidence, but splits are not seeds.
+**Two seeds, not more.** A1 clears the criterion as written, on 0 and 1. Two is the minimum
+that makes unanimity meaningful, not a comfortable margin — a third seed would be the first
+one able to break it.
+
+**The nulls are underpowered, not disproven.** A2 and A4 move 0.90 K and 0.44 K between seeds
+against effects of similar size. Calling them "no effect" overstates what five splits per seed
+can resolve.
 
 **Generation is split 0 only.** A5/A6 generation used each arm's split-0 checkpoint, one
 sampling seed. The TP gap is large and consistent across all three targets, but it is one draw.
