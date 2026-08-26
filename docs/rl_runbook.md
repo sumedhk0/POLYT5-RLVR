@@ -138,6 +138,73 @@ negative result (reward-scored error 52.5 -> 31.4 K while `unique_fraction` fell
 0.535). No arm has been through `compare_arms.py`, so this repository reports no final RLVR
 result.**
 
+## Windows Smart App Control can block the toolchain mid-study
+
+On the development machine (Windows 11, Smart App Control ENFORCING,
+`VerifiedAndReputablePolicyState = 1`) SAC began blocking parts of the toolchain
+partway through Phase 4, having run the same code for days beforehand. It blocks by
+per-file REPUTATION, so it can start refusing a file nothing about which has changed.
+
+Two distinct failures, needing two different fixes:
+
+**1. A blocked interpreter.** `python.exe` fails to launch:
+
+    Program 'python.exe' failed to run: An Application Control policy has blocked this file
+
+Every venv `python.exe` is affected, including a freshly created one -- uv's 45 KB
+trampoline is unsigned. Recreating the venv does NOT help. The fix is to run the
+uv-managed CPython the venv was built from (`pyvenv.cfg`'s `home =`), with the venv's
+site-packages on `PYTHONPATH`:
+
+```bash
+export PYTHONPATH="C:\Users\<you>\.venvs\polyt5-rlvr\Lib\site-packages;<repo>\src"
+"C:/Users/<you>/AppData/Roaming/uv/python/cpython-3.12-windows-x86_64-none/python.exe" -u scripts/...
+```
+
+Same interpreter, same packages, ABI-identical. Verified inert: B0 moved 0.14 K across
+the change (`docs/group_a_results.md`).
+
+**2. A blocked native library.** A package imports but its bundled DLL is refused:
+
+    ImportError: DLL load failed while importing rdchem:
+    An Application Control policy has blocked this file.
+
+The interpreter workaround does NOT extend to this -- the load is refused whoever asks.
+Find the actual file first, since it is usually a vendored dependency rather than the
+module named in the traceback:
+
+```powershell
+Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 30 |
+  Where-Object { $_.Id -in 3077,3033 } | Select-Object -First 3 | Format-List TimeCreated, Message
+```
+
+For us the blocked file was `rdkit.libs\RDKitSmilesParse-<hash>.dll`, not `rdchem.pyd`.
+
+**The fix is a neighbouring release, because reputation is per binary:**
+
+| rdkit | status |
+|---|---|
+| 2026.03.5 | blocked (days old, no reputation) |
+| 2025.03.6 | **works** -- what this repo now runs |
+| 2024.09.6 | blocked |
+| 2024.03.6 | works |
+
+Not a version cutoff: 2024.09.6 is older than 2025.03.6 and still blocked. Try
+neighbouring releases rather than concluding the package is unusable. Reinstalling the
+SAME version does not help -- a fresh copy of an unsigned binary gets the same verdict.
+
+`pyproject.toml` is deliberately NOT pinned to 2025.03.6. The block is one machine's
+security policy, not a property of the package, and constraining every user of this repo
+to work around it would be the wrong scope. Anyone hitting this picks a working
+neighbour; `rdkit>=2024.3` already permits it.
+
+**Always re-run the suite after such a swap.** Every reward in the study runs through
+RDKit, so a canonicalization or fingerprint change would corrupt a multi-day run
+silently. 2026.03.5 -> 2025.03.6 gave an identical 1302 passed.
+
+None of this weakens the policy: SAC stays enforcing, and the binaries used are ones it
+already trusts.
+
 ## Commit provenance note
 
 `51cd00f` carries a destroyed commit message — the literal text `$(cat <<'EOF'` —
