@@ -771,6 +771,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger = get_logger("polyt5.train_grpo", log_file=run_dir.logs / "train_grpo.log")
     logger.info("arm=%s config=%s run_dir=%s", args.arm, config_path, run_dir.root)
+    if args.resume is None:
+        # A fresh run must not append to a dead run's metrics: run_round1.py reads
+        # max(step) from metrics.csv to decide an arm is finished, so leftover rows
+        # from a killed run would make it skip this arm entirely.
+        for archived in run_dir.archive_previous_metrics():
+            logger.info("archived previous run's metrics to %s", archived.name)
     if reward_override_record:
         logger.warning(
             "reward parameter override(s) active for this run -- differs from the canonical "
