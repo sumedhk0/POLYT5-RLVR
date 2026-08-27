@@ -110,5 +110,51 @@ Outputs `results/arm_comparison/{matrix.csv,matrix.md,summary.json,manifest.json
 manifest records checkpoint SHA-256s, the novelty index hash, and every reward config hash, so
 a row can be traced to the exact artifacts that produced it.
 
-**Four arms — `novelty`, `synthesisability`, `composite`, `constraint` — have not been trained.
-This document reports three.**
+## Round 2, arm `novelty` — trained to completion 2026-08-27
+
+Reward: mean ECFP6 Tanimoto DISTANCE from the training corpus (5,275 reference
+fingerprints). Fully verifiable, no learned model anywhere in the reward path.
+
+The reward went up and the population collapsed:
+
+| step | reward | unique_fraction | zero_variance_groups | KL |
+|---|---|---|---|---|
+| 10 | 0.578 | 0.949 | 0.000 | 7.2e-06 |
+| 250 | 0.721 | 0.949 | 0.000 | 0.0053 |
+| 500 | 0.744 | 0.727 | 0.094 | 0.0220 |
+| 1000 | 0.879 | 0.609 | 0.313 | 0.0639 |
+| 1500 | 0.908 | 0.564 | 0.469 | 0.0776 |
+| **2000** | **0.949** | **0.516** | **0.594** | 0.0968 |
+
+`reward_mean` 0.578 -> 0.949 while `unique_fraction` 0.949 -> 0.516. That final
+diversity figure is within noise of the retired `accuracy` arm's 0.535, which was
+disqualified for exactly this behaviour.
+
+**The mechanism is in the reward's definition, not in GRPO.** Novelty is measured as
+distance from the TRAINING CORPUS, never as diversity within the sampled batch. A
+thousand copies of one novel polymer therefore score perfectly. Nothing in the objective
+prefers a varied population over a single lucky motif repeated, so the optimiser is doing
+precisely what it was asked, and what it was asked is not what was wanted.
+
+`zero_variance_group_fraction` reaching 0.594 makes the cost concrete: in 59% of groups
+all 16 samples scored identically at the end. GRPO's advantage is
+``(r - mean(r)) / std(r)`` within a group, so those groups contribute NO gradient. By
+step 2000 the majority of the compute was buying nothing.
+
+`clip_fraction` stayed at 0.0 throughout and KL rose smoothly to 0.097. The optimiser was
+healthy the whole way; there is no training bug to find here. This is the reward working.
+
+**Third arm, same shape.** `accuracy` (retired) drove reward-scored error 52.5 -> 31.4 K
+while `unique_fraction` fell 0.951 -> 0.535. `validity` reached PV 0.901 while its
+near-copy fraction rose to 0.585 and its auditor Tg MAE went 36.6 -> 150.4 K. Now
+`novelty`. The pattern across all three: **a verifiable reward optimises exactly what it
+measures and silently damages whatever it does not.** The verifiability is real; it buys
+correctness of the measurement, not completeness of the objective.
+
+This is why `composite` carries an explicit diversity term. If `composite` holds
+`unique_fraction` where `novelty` did not, that is a controlled comparison rather than an
+anecdote, and it is the most useful thing round 2 can produce.
+
+Full per-step trajectory: `results/grpo_novelty/trajectory_summary.json`.
+
+**Three arms — `synthesisability`, `composite`, `constraint` — have not been trained.**
