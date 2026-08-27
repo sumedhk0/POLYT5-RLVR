@@ -222,3 +222,30 @@ against that SHA remains valid.
 The message was not repaired by rewriting history: doing so would have meant
 rebasing twelve reviewed commits immediately before a long GPU run, risking real work
 to fix a cosmetic defect in a commit whose content is sound.
+
+### Update 2026-08-27: torch was blocked next
+
+The escalation continued: `python.exe`, then rdkit, then `torch\lib\c10.dll`
+(`OSError: [WinError 4551]`). Same per-file-reputation cause, same
+neighbouring-release fix.
+
+| torch | status |
+|---|---|
+| 2.9.0+cu129 | blocked |
+| **2.8.0+cu128** | **works** -- what this repo now runs |
+
+A torch swap is riskier than the rdkit one and needs more than a green suite to
+justify. rdkit semantics are deterministic, so an identical 1,307 passed settled it.
+Torch is the numerics layer under the frozen 28.6733 K baseline, all 70 Group A runs,
+and the completed `novelty` arm -- all produced on 2.9.0+cu129, and the CUDA build moved
+too (cu129 -> cu128). The suite was identical at 1,307 passed, which rules out gross
+breakage but NOT a small numeric drift that no test asserts on.
+
+**Consequence to state in any write-up:** arms trained after 2026-08-27 ran on
+2.8.0+cu128; `validity`, `control`, `accuracy` and `novelty` ran on 2.9.0+cu129. If a
+later comparison hinges on a small margin between arms from either side of that line,
+re-run the earlier arm rather than trusting the cross-stack difference.
+
+Three components blocked in two days, each after working fine. There is no version of
+this where the environment becomes more stable; for long runs, prefer a machine whose
+toolchain is not being progressively distrusted.
