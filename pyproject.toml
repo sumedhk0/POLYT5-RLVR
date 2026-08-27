@@ -24,6 +24,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "mypy>=1.11"]
 track = ["tensorboard>=2.17"]
+# polyt5.app imports these at module scope, so tests/test_app.py fails to COLLECT
+# without them -- which aborts the whole suite, not just the app tests. They were
+# undeclared until 2026-08-27 and only worked because they happened to be installed
+# in the development environment; a fresh clone could not run the suite at all.
+app = ["fastapi>=0.115", "uvicorn>=0.30", "jinja2>=3.1", "python-multipart>=0.0.9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
