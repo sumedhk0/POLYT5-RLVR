@@ -484,8 +484,20 @@ SCORED_ARM_NAMES: tuple[str, ...] = ("accuracy", "novelty", "synthesisability", 
 
 
 def _resolve(path: str | Path) -> Path:
-    """Resolve ``path`` relative to the repo root unless it is already absolute."""
-    path = Path(path)
+    """Resolve ``path`` relative to the repo root unless it is already absolute.
+
+    Backslashes are normalised to forward slashes first. ``frozen_baseline.json``
+    was written on Windows, where ``str(Path)`` yields
+    ``artifacts\tokenizer\polyt5_vocab.json``; POSIX treats those backslashes as
+    ordinary filename characters, so the recorded artifact paths resolve to a single
+    nonexistent file rather than a directory traversal. The baseline is frozen and
+    must not be rewritten to fix a caller, so the normalisation belongs here.
+
+    A genuine POSIX filename containing a backslash would be mangled by this, which
+    is a trade this repo can make: it records checkpoint paths, never adversarial
+    filenames.
+    """
+    path = Path(str(path).replace("\\", "/"))
     return path if path.is_absolute() else REPO_ROOT / path
 
 

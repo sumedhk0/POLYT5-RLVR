@@ -1425,3 +1425,40 @@ def test_main_aborts_before_loading_any_checkpoint_when_novelty_index_missing(
     assert "novelty index" in captured.err.lower()
     assert "--allow-missing-novelty-index" in captured.err
     assert not (tmp_path / "out" / "matrix.csv").exists()
+
+
+def test_windows_recorded_artifact_paths_resolve_on_posix():
+    """frozen_baseline.json was written on Windows; the repo must run on Linux.
+
+    ``str(Path)`` on Windows produced a backslash-separated artifact path.
+    On POSIX a backslash is an ordinary filename character, so without
+    normalisation this resolves to ONE nonexistent file and every artifact lookup
+    fails -- which is what happened when the study moved to WSL2.
+
+    NOTE: this test is VACUOUS ON WINDOWS. ``Path`` splits on backslash there, so it
+    passes with or without the normalisation; removing the fix and running this file
+    on Windows still reports all green. It discriminates only on POSIX, which is
+    where the defect exists. Mutation-verified under WSL2, not under Windows.
+    """
+    resolved = compare_arms._resolve(r"artifacts\tokenizer\polyt5_vocab.json")
+    assert resolved.name == "polyt5_vocab.json"
+    assert resolved.parent.name == "tokenizer"
+    assert chr(92) not in resolved.name
+
+
+def test_posix_paths_are_unchanged_by_the_normalisation():
+    resolved = compare_arms._resolve("artifacts/tokenizer/polyt5_vocab.json")
+    assert resolved.name == "polyt5_vocab.json"
+    assert resolved.parent.name == "tokenizer"
+
+
+def test_the_frozen_baselines_own_recorded_paths_all_resolve():
+    """Every artifact the frozen baseline names must be reachable on this platform."""
+    import json as _json
+
+    frozen = _json.loads(
+        (REPO_ROOT / "artifacts" / "baseline" / "frozen_baseline.json").read_text(encoding="utf-8")
+    )
+    for key, meta in frozen["artifacts"].items():
+        resolved = compare_arms._resolve(meta["path"])
+        assert "\\" not in resolved.name, f"{key} kept a backslash: {resolved}"
