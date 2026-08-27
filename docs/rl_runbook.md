@@ -241,10 +241,31 @@ and the completed `novelty` arm -- all produced on 2.9.0+cu129, and the CUDA bui
 too (cu129 -> cu128). The suite was identical at 1,307 passed, which rules out gross
 breakage but NOT a small numeric drift that no test asserts on.
 
-**Consequence to state in any write-up:** arms trained after 2026-08-27 ran on
-2.8.0+cu128; `validity`, `control`, `accuracy` and `novelty` ran on 2.9.0+cu129. If a
-later comparison hinges on a small margin between arms from either side of that line,
-re-run the earlier arm rather than trusting the cross-stack difference.
+**RESOLVED 2026-08-27 by moving to WSL2 -- no arm was ever trained on 2.8.0+cu128.**
+Smart App Control governs Windows binaries only, so Linux restored torch 2.9.0+cu129
+and rdkit 2026.3.5, the versions the first four arms used. `synthesisability` was
+stopped at step 50 under 2.8.0+cu128 and discarded; nothing on that stack survives.
+
+The equivalence is measured, not assumed. Re-running the frozen five-split protocol in
+WSL2 reproduced the baseline **exactly**:
+
+| split | WSL2 | frozen | delta |
+|---|---|---|---|
+| 0 | 28.095989 | 28.095989 | 0 |
+| 1 | 29.101156 | 29.101156 | 0 |
+| 2 | 28.790347 | 28.790347 | 0 |
+| 3 | 29.631271 | 29.631271 | 0 |
+| 4 | 27.747587 | 27.747587 | 0 |
+| mean | 28.6733 +/- 0.7591 | 28.6733 +/- 0.7591 | -3e-05 |
+
+Bit-for-bit on every split, not merely inside the +/-0.76 K spread. The -3e-05 on the
+mean is rounding in the stored summary. The splits were also checked to regenerate
+byte-identically first, since a differing partition would have made the MAE comparison
+meaningless while still looking plausible.
+
+Freshly computed, not copied: results written 18:09 against the copied frozen file's
+17:42, a manifest recording `torch 2.9.0+cu129 / cuda 12.9`, and a log showing real
+training (`split 4: trained in 324.6s`, 3473 tokens/sec).
 
 Three components blocked in two days, each after working fine. There is no version of
 this where the environment becomes more stable; for long runs, prefer a machine whose
