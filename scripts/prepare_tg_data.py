@@ -38,13 +38,12 @@ from polyt5.data.prepare import (  # noqa: E402
     read_lamalab_tg,
 )
 from polyt5.data.splits import make_kfold_random_splits, random_split, save_splits  # noqa: E402
-from polyt5.utils import load_config, require, seed_everything  # noqa: E402
+from polyt5.utils import load_config, require, resolve_under, seed_everything  # noqa: E402
 
 
 def _resolve(path_str: str) -> Path:
     """Resolve a config path relative to the repo root unless absolute."""
-    path = Path(path_str)
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path_str)
 
 
 def _write_jsonl(path: Path, examples: list[tuple[str, str]]) -> None:

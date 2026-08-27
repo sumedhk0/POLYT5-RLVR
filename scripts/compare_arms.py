@@ -226,7 +226,13 @@ from polyt5.inference import PolyT5PropertyPredictor  # noqa: E402
 from polyt5.rl import DriftMonitor  # noqa: E402
 from polyt5.rl.drift import DEFAULT_MAX_REFERENCE  # noqa: E402
 from polyt5.training import load_checkpoint  # noqa: E402
-from polyt5.utils import RunDirectory, get_logger, load_config, select_device  # noqa: E402
+from polyt5.utils import (  # noqa: E402
+    RunDirectory,
+    get_logger,
+    load_config,
+    resolve_under,
+    select_device,
+)
 from train_grpo import (  # noqa: E402
     DEFAULT_DRIFT_REFERENCE,
     build_reward_arm,
@@ -498,7 +504,7 @@ def _resolve(path: str | Path) -> Path:
     filenames.
     """
     path = Path(str(path).replace("\\", "/"))
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path)
 
 
 #: The arms whose reward IS scored by an :class:`ArmScorers` object here --

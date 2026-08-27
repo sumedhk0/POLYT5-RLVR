@@ -81,7 +81,7 @@ from polyt5.inference import (  # noqa: E402
     looks_like_pselfies,
 )
 from polyt5.training import load_checkpoint  # noqa: E402
-from polyt5.utils import load_config  # noqa: E402
+from polyt5.utils import load_config, resolve_under  # noqa: E402
 
 EVALUATION_FILENAME = "evaluation.json"
 
@@ -173,7 +173,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _resolve(path: Path) -> Path:
     """Resolve a path relative to the repo root unless it is absolute."""
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

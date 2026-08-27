@@ -96,10 +96,12 @@ from polyt5.rl.rollout import ROLLOUT_CHUNK_SIZE  # noqa: E402
 from polyt5.tokenization import PolyT5Tokenizer  # noqa: E402
 from polyt5.training import load_checkpoint  # noqa: E402
 from polyt5.utils import (  # noqa: E402
+    # noqa: E402,
     RunDirectory,
     get_logger,
     load_config,
     parse_dotted_overrides,
+    resolve_under,
     save_config,
     seed_everything,
     select_device,
@@ -151,8 +153,7 @@ DEFAULT_DRIFT_REFERENCE = REPO_ROOT / "data" / "processed" / "tg" / "generation"
 
 def _resolve(path: str | Path) -> Path:
     """Resolve ``path`` relative to the repo root unless it is already absolute."""
-    path = Path(path)
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path)
 
 
 def run_experiment_name(base_name: str, seed: int) -> str:

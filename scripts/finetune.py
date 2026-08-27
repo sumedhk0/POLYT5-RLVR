@@ -54,11 +54,13 @@ from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration  # noqa: E
 from polyt5.tokenization import PolyT5Tokenizer  # noqa: E402
 from polyt5.training import Trainer, TrainerConfig, load_checkpoint  # noqa: E402
 from polyt5.utils import (  # noqa: E402
+    # noqa: E402,
     RunDirectory,
     describe_device,
     get_logger,
     load_config,
     parse_dotted_overrides,
+    resolve_under,
     save_config,
     seed_everything,
     select_device,
@@ -66,8 +68,7 @@ from polyt5.utils import (  # noqa: E402
 
 
 def _resolve(path_str: str | Path) -> Path:
-    path = Path(path_str)
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path_str)
 
 
 def _read_jsonl(path: Path) -> list[tuple[str, str]]:

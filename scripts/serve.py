@@ -28,7 +28,7 @@ if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from polyt5.app.server import create_app  # noqa: E402
-from polyt5.utils import get_logger  # noqa: E402
+from polyt5.utils import get_logger, resolve_under  # noqa: E402
 
 #: Defaults, relative to the repository root.
 DEFAULT_GENERATION = "results/finetune_tg_generation/checkpoints/best.pt"
@@ -51,8 +51,7 @@ def _resolve(path: str | None) -> Path | None:
     """
     if not path:
         return None
-    candidate = Path(path)
-    return candidate if candidate.is_absolute() else (REPO_ROOT / candidate)
+    return resolve_under(REPO_ROOT, path)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

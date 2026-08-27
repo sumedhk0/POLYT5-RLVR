@@ -66,12 +66,14 @@ from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration  # noqa: E
 from polyt5.tokenization import PolyT5Tokenizer  # noqa: E402
 from polyt5.training import Trainer, TrainerConfig, load_checkpoint  # noqa: E402
 from polyt5.utils import (  # noqa: E402
+    # noqa: E402,
     RunDirectory,
     describe_device,
     get_logger,
     load_config,
     parse_dotted_overrides,
     require,
+    resolve_under,
     save_config,
     seed_everything,
     select_device,
@@ -175,8 +177,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _resolve(path_str: str | Path) -> Path:
     """Resolve a path relative to the repo root unless it is absolute."""
-    path = Path(path_str)
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path_str)
 
 
 def _build_model(

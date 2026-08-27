@@ -9,9 +9,11 @@ from polyt5.utils.device import (
     select_device,
 )
 from polyt5.utils.logging_utils import RunDirectory, get_logger
+from polyt5.utils.paths import resolve_under
 from polyt5.utils.seeding import RngState, get_rng_state, seed_everything, set_rng_state
 
 __all__ = [
+    "resolve_under",
     "DeviceInfo",
     "RngState",
     "RunDirectory",

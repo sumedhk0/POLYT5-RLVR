@@ -25,13 +25,12 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from polyt5.data.prepare import prepare_pselfies_corpus, read_pi1m  # noqa: E402
 from polyt5.data.splits import make_pretraining_splits, save_splits  # noqa: E402
-from polyt5.utils import load_config, require, seed_everything  # noqa: E402
+from polyt5.utils import load_config, require, resolve_under, seed_everything  # noqa: E402
 
 
 def _resolve(path_str: str) -> Path:
     """Resolve a config path relative to the repo root unless absolute."""
-    path = Path(path_str)
-    return path if path.is_absolute() else REPO_ROOT / path
+    return resolve_under(REPO_ROOT, path_str)
 
 
 def main(argv: list[str] | None = None) -> int:
