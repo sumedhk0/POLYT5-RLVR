@@ -162,7 +162,10 @@ def test_train_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
 
 def test_main_defaults_to_seed_zero_only_matching_pre_multiseed_behaviour(monkeypatch):
     calls = []
-    monkeypatch.setattr(run_round1, "train", lambda arm, seed=0: calls.append((arm, seed)) or True)
+    monkeypatch.setattr(
+        run_round1, "train",
+        lambda arm, seed=0, **_kw: calls.append((arm, seed)) or True,
+    )
     monkeypatch.setattr(sys, "argv", ["run_round1.py", "--then", "validity", "composite"])
 
     assert run_round1.main() == 0
@@ -174,7 +177,10 @@ def test_main_chains_seed_outer_arm_inner(monkeypatch):
     every arm finishes a seed before the next seed starts.
     """
     calls = []
-    monkeypatch.setattr(run_round1, "train", lambda arm, seed=0: calls.append((arm, seed)) or True)
+    monkeypatch.setattr(
+        run_round1, "train",
+        lambda arm, seed=0, **_kw: calls.append((arm, seed)) or True,
+    )
     monkeypatch.setattr(
         sys, "argv",
         ["run_round1.py", "--then", "accuracy", "composite", "--seeds", "0", "1"],
@@ -189,7 +195,7 @@ def test_main_chains_seed_outer_arm_inner(monkeypatch):
 def test_main_stops_the_whole_chain_on_a_failed_arm(monkeypatch):
     calls = []
 
-    def fake_train(arm, seed=0):
+    def fake_train(arm, seed=0, **_kw):
         calls.append((arm, seed))
         return arm != "composite"
 
@@ -201,3 +207,44 @@ def test_main_stops_the_whole_chain_on_a_failed_arm(monkeypatch):
 
     assert run_round1.main() == 1
     assert calls == [("accuracy", 0), ("composite", 0)]
+
+
+def test_resume_target_returns_none_when_the_arm_never_started(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_round1, "REPO", tmp_path)
+    assert run_round1.resume_target("composite") is None
+
+
+def test_resume_target_returns_none_without_checkpoints(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_round1, "REPO", tmp_path)
+    (tmp_path / "results" / "grpo_composite" / "checkpoints").mkdir(parents=True)
+    assert run_round1.resume_target("composite") is None
+
+
+def test_resume_target_points_at_a_partial_arms_checkpoints(tmp_path, monkeypatch):
+    """The case that has cost this study a partial arm three times."""
+    monkeypatch.setattr(run_round1, "REPO", tmp_path)
+    run = tmp_path / "results" / "grpo_composite"
+    (run / "checkpoints").mkdir(parents=True)
+    (run / "checkpoints" / "step_000100.pt").write_bytes(b"x")
+    (run / "metrics.csv").write_text("step,reward_mean\n100,0.5\n", encoding="utf-8")
+    assert run_round1.resume_target("composite") == run / "checkpoints"
+
+
+def test_a_finished_arm_is_never_reopened(tmp_path, monkeypatch):
+    """Resuming a complete arm would re-run it and overwrite a finished result."""
+    monkeypatch.setattr(run_round1, "REPO", tmp_path)
+    run = tmp_path / "results" / "grpo_composite"
+    (run / "checkpoints").mkdir(parents=True)
+    (run / "checkpoints" / "step_002000.pt").write_bytes(b"x")
+    (run / "metrics.csv").write_text("step,reward_mean\n2000,0.9\n", encoding="utf-8")
+    assert run_round1.resume_target("composite") is None
+
+
+def test_target_steps_is_honoured_when_deciding_completeness(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_round1, "REPO", tmp_path)
+    run = tmp_path / "results" / "grpo_composite"
+    (run / "checkpoints").mkdir(parents=True)
+    (run / "checkpoints" / "step_000500.pt").write_bytes(b"x")
+    (run / "metrics.csv").write_text("step,reward_mean\n500,0.5\n", encoding="utf-8")
+    assert run_round1.resume_target("composite", target_steps=500) is None
+    assert run_round1.resume_target("composite", target_steps=2000) is not None

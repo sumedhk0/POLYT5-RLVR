@@ -58,6 +58,10 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 
+#: Steps an arm must reach to count as finished. Mirrors every
+#: ``configs/rl/*.yaml``'s ``train.max_steps``; ``--target-steps`` overrides it.
+TARGET_STEPS = 2000
+
 
 def _experiment_name_for(arm: str) -> str:
     """The base run-directory name ``train_grpo.py`` uses for ``arm`` at seed 0.
@@ -194,7 +198,34 @@ def wait_for(arm: str, *, target_steps: int, stall_seconds: float, poll: float) 
         return False
 
 
-def train(arm: str, seed: int = 0) -> bool:
+def resume_target(arm: str, seed: int = 0, *, target_steps: int = TARGET_STEPS) -> Path | None:
+    """The checkpoint directory to resume ``arm`` from, or None to start fresh.
+
+    An interrupted arm is the common case on a laptop, not the exception: this
+    study has lost a partial arm to a shutdown three times. Without this the
+    driver restarts from step 0 and discards every completed step, which at
+    ~47 s/step is half a day for an arm interrupted near the end.
+
+    Resuming is not a different experiment. ``train_grpo.py --resume`` restores
+    policy weights, optimizer state AND the step count, and a step's RNG is
+    seeded from ``(config.seed, step_index)`` alone -- so a resumed step samples
+    exactly what an uninterrupted run would have sampled at that index.
+
+    Returns None when the arm has no checkpoints, or when it already reached
+    ``target_steps`` (a finished arm must not be reopened).
+    """
+    checkpoints = run_dir_for(arm, seed) / "checkpoints"
+    if not checkpoints.is_dir():
+        return None
+    if not any(checkpoints.glob("step_*.pt")):
+        return None
+    done = last_step(arm, seed)
+    if done is not None and done >= target_steps:
+        return None
+    return checkpoints
+
+
+def train(arm: str, seed: int = 0, *, resume: bool = True) -> bool:
     """Run one arm, at one seed, to completion. False on a non-zero exit.
 
     ``seed == 0`` (the default) issues EXACTLY the command line and log file
@@ -210,6 +241,11 @@ def train(arm: str, seed: int = 0) -> bool:
     cmd = [PYTHON, "-u", str(REPO / "scripts" / "train_grpo.py"), "--arm", arm]
     if seed != 0:
         cmd += ["--set", f"seed={seed}"]
+    resume_from = resume_target(arm, seed) if resume else None
+    if resume_from is not None:
+        cmd += ["--resume", str(resume_from)]
+        print(f"[driver] arm={label} has partial progress at step {last_step(arm, seed)}; "
+              f"resuming from {resume_from}", flush=True)
     print(f"[driver] starting arm={label} -> {log_path}", flush=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -229,7 +265,10 @@ def main() -> int:
     parser.add_argument("--wait-for", default=None,
                         help="Arm already running; chain starts once it completes.")
     parser.add_argument("--then", nargs="+", required=True, help="Arms to run, in order.")
-    parser.add_argument("--target-steps", type=int, default=2000,
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Restart a partially-trained arm from step 0 instead of "
+                             "resuming from its newest checkpoint.")
+    parser.add_argument("--target-steps", type=int, default=TARGET_STEPS,
                         help="Step count that marks the waited-for arm complete.")
     parser.add_argument("--stall-minutes", type=float, default=45.0,
                         help="Treat the waited-for arm as dead after this long with no new step.")
@@ -252,7 +291,7 @@ def main() -> int:
 
     for seed in args.seeds:
         for arm in args.then:
-            if not train(arm, seed):
+            if not train(arm, seed, resume=not args.no_resume):
                 return 1
 
     print(f"[driver] round 1 complete: {', '.join(args.then)} across seeds {args.seeds}",
