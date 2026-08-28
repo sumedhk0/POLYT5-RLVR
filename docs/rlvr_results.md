@@ -157,4 +157,52 @@ anecdote, and it is the most useful thing round 2 can produce.
 
 Full per-step trajectory: `results/grpo_novelty/trajectory_summary.json`.
 
-**Three arms — `synthesisability`, `composite`, `constraint` — have not been trained.**
+## Round 2, arm `synthesisability` — trained to completion 2026-08-28
+
+Reward: SA score (synthetic accessibility). Fully verifiable, no learned model.
+
+| step | reward | unique_fraction | zero_variance_groups | KL |
+|---|---|---|---|---|
+| 10 | 0.633 | 0.951 | 0.094 | 5.2e-06 |
+| 500 | 0.828 | 0.854 | 0.375 | 0.0114 |
+| 1000 | 0.941 | 0.467 | 0.563 | 0.0709 |
+| 1500 | 0.988 | 0.289 | 0.844 | 0.1382 |
+| **2000** | **0.982** | **0.221** | **0.781** | 0.1548 |
+
+**The worst collapse of the four arms.** `unique_fraction` 0.951 -> 0.221, against
+`novelty`'s 0.516 and the retired `accuracy` arm's 0.535. Reward saturated near 0.99 by
+step 1500 and stopped improving; diversity kept falling after that.
+
+`zero_variance_group_fraction` peaked at 0.844: in 84% of groups all 16 samples scored
+identically, and GRPO's advantage is ``(r - mean(r)) / std(r)`` within a group, so those
+steps contributed NO gradient. Most of the second half of this run bought nothing.
+`clip_fraction` held at 0.0 throughout and KL rose smoothly to 0.155 -- no training bug,
+just the reward doing exactly what it was told.
+
+**An intermediate reading was wrong and is worth recording.** At step 420 this arm sat at
+`unique_fraction` 0.875 where `novelty` had already fallen to ~0.61, and that was read as
+"holding, not collapsing." It was not holding; it collapsed later and further. Diversity
+trajectories are not comparable at a fixed step, and a mid-run snapshot is not evidence
+of a trend.
+
+## Four arms, one pattern
+
+| arm | its own metric | diversity cost |
+|---|---|---|
+| `accuracy` (retired) | reward-scored error 52.5 -> 31.4 K | `unique_fraction` 0.951 -> 0.535 |
+| `validity` | PV 0.526 -> 0.901 | near-copy fraction 0.229 -> 0.585 |
+| `novelty` | reward 0.578 -> 0.949 | `unique_fraction` 0.949 -> 0.516 |
+| `synthesisability` | reward 0.633 -> 0.982 | `unique_fraction` 0.951 -> **0.221** |
+
+Every verifiable reward tested optimised precisely what it measured and destroyed an axis
+it did not measure. Verifiability buys a correct measurement, not a complete objective.
+Four arms make this a finding rather than an anecdote.
+
+**`composite` is now the study's most informative arm.** It is the only one carrying an
+explicit diversity term. If it holds `unique_fraction` where four others did not, the
+collapse is a reward-design failure and is fixable; if it collapses too, the problem is
+deeper than any single reward's definition.
+
+Trajectory: `results/grpo_synthesisability/trajectory_summary.json`.
+
+**Two arms — `composite`, `constraint` — have not been trained.**
