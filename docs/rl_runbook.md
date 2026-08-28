@@ -270,3 +270,31 @@ training (`split 4: trained in 324.6s`, 3473 tokens/sec).
 Three components blocked in two days, each after working fine. There is no version of
 this where the environment becomes more stable; for long runs, prefer a machine whose
 toolchain is not being progressively distrusted.
+
+### Git in WSL2
+
+`git push` from WSL hangs silently without a credential helper: there is no TTY for
+the prompt, so it waits forever rather than failing. Point it at the Windows Git
+Credential Manager, which already holds the GitHub credentials:
+
+```bash
+git config --global credential.helper \
+  "/mnt/c/Users/<you>/AppData/Local/Programs/Git/mingw64/bin/git-credential-manager.exe"
+git config --global credential.https://github.com.provider github
+git config --global user.name "<you>" && git config --global user.email "<you@example.com>"
+git config --global core.autocrlf input
+```
+
+Note the Git install is under `AppData\Local\Programs\Git`, not `Program Files\Git`.
+
+`core.autocrlf input` matters here: combined with `.gitattributes`' `artifacts/** -text`
+it keeps artifact bytes identical across platforms, which is what
+`frozen_baseline.json`'s recorded SHA-256s depend on.
+
+Until this is configured, a WSL commit can still be pushed by bridging through the
+Windows clone, which has working credentials:
+
+```bash
+git fetch "//wsl.localhost/Ubuntu/home/<you>/POLYT5-RLVR" master
+git merge --ff-only FETCH_HEAD && git push origin master
+```
