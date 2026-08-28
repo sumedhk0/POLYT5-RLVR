@@ -273,9 +273,24 @@ toolchain is not being progressively distrusted.
 
 ### Git in WSL2
 
-`git push` from WSL hangs silently without a credential helper: there is no TTY for
-the prompt, so it waits forever rather than failing. Point it at the Windows Git
-Credential Manager, which already holds the GitHub credentials:
+`git push` from WSL hangs SILENTLY without working auth: there is no TTY for the
+prompt, so it waits forever rather than failing. Two pushes stalled this way before the
+cause was obvious -- the symptom is a command that never returns, not an error.
+
+**The Windows Git Credential Manager does NOT work from WSL.** Pointing
+`credential.helper` at `git-credential-manager.exe` under `/mnt/c/...` looks right, runs
+without complaint, and still hangs. Use SSH instead:
+
+```bash
+ssh-keygen -t ed25519 -C "you@example.com (wsl2)" -f ~/.ssh/id_ed25519 -N ""
+cat ~/.ssh/id_ed25519.pub          # add at https://github.com/settings/keys
+git remote set-url origin git@github.com:<user>/<repo>.git
+ssh -T git@github.com              # expect "Hi <user>! You've successfully authenticated"
+```
+
+Also set `core.askPass /bin/false` so any future auth gap fails fast instead of hanging.
+
+The superseded approach, kept only to say it does not work:
 
 ```bash
 git config --global credential.helper \
