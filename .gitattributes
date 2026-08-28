@@ -1,0 +1,6 @@
+# Artifacts are hashed by sha256 and those hashes are recorded in
+# artifacts/baseline/frozen_baseline.json. Git's end-of-line conversion would
+# change the bytes per platform and therefore change the hash: a clone on Linux
+# got LF and hashed 691030e2..., while the frozen record says 48983573... (CRLF),
+# so scripts/train_grpo.py's verification REFUSED to train. Never convert these.
+artifacts/** -text
