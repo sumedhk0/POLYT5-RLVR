@@ -205,4 +205,66 @@ deeper than any single reward's definition.
 
 Trajectory: `results/grpo_synthesisability/trajectory_summary.json`.
 
-**Two arms — `composite`, `constraint` — have not been trained.**
+## Round 2, arm `composite` — trained to completion 2026-08-29
+
+Reward: equal-weighted sum of four verifiable structural terms — PV, novelty, SA-pass,
+and **within-batch diversity**. No term reads a model prediction. This is the only arm
+that prices diversity, and it is the controlled test of whether the collapse the other
+four showed is a reward-design failure or something inherent to GRPO.
+
+**It is a reward-design failure. Pricing diversity fixes it.**
+
+| arm | reward | `unique_fraction` |
+|---|---|---|
+| `accuracy` | 0.214 -> 0.459 | 0.951 -> 0.535 |
+| `novelty` | 0.578 -> 0.949 | 0.949 -> 0.516 |
+| `synthesisability` | 0.633 -> 0.982 | 0.951 -> **0.221** |
+| **`composite`** | 0.625 -> **0.948** | 0.949 -> **0.980** |
+
+`composite` reached the same reward level as `novelty` (0.948 vs 0.949) while ending
+with HIGHER diversity than it started. Same algorithm, same frozen generator, same 2000
+steps, same group size; only the reward differs.
+
+### Where the reward gain came from
+
+| column | start -> end |
+|---|---|
+| `gated_fraction` | 0.328 -> **0.035** |
+| `novelty_mean` | 0.858 -> 0.986 |
+| `synthesisable_rate` | 0.939 -> 0.964 |
+| `unique_fraction` | 0.949 -> 0.980 |
+| `mean_length` | 72.6 -> 84.5 |
+
+Almost all of the +0.323 came from the **gate**: the share of candidates failing the
+SV/PV chemistry screen fell from 33% to 3.5%. Gated candidates receive a floor reward,
+so rescuing 29% of the batch dominates the total. Novelty and SA improved modestly and
+had little room -- they started at 0.86 and 0.94.
+
+Length inflated 16% (72.6 -> 84.5), far less than `validity`'s 63 -> 131.
+
+### The limitation: reward saturation, not collapse
+
+`zero_variance_group_fraction` still reached **0.344**, and its mirror
+`nonzero_advantage_fraction` fell 1.000 -> 0.656. By the end a third of groups produce
+NO gradient, because GRPO's advantage is ``(r - mean(r)) / std(r)`` within a group and
+those members score identically.
+
+This is NOT diversity collapse -- `unique_fraction` is 0.980. It is the reward running
+out of headroom: once nearly every candidate clears the gate, is novel and is
+synthesisable, there is nothing left to discriminate on. `reward_std` falling
+0.449 -> 0.192 says the same thing. The diversity term slows concentration; it does not
+give the reward more to say.
+
+### What is NOT yet known
+
+Everything above is training-time diagnostics on rollout batches. Whether `composite` is
+a BETTER GENERATOR -- PV rate, target-property rate and auditor Tg MAE under the frozen
+1,500-sample protocol -- needs `compare_arms.py`, which has not run on it.
+
+That distinction matters: `validity` also looked excellent on its own metric, then turned
+out to have destroyed conditioning (TP 0.693 -> 0.047). `composite`'s reward never reads
+a Tg prediction, so the honest expectation is that it HOLDS TP rather than improving it.
+
+Trajectory: `results/grpo_composite/trajectory_summary.json`.
+
+**One arm — `constraint` — has not been trained.**
