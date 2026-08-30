@@ -267,4 +267,49 @@ a Tg prediction, so the honest expectation is that it HOLDS TP rather than impro
 
 Trajectory: `results/grpo_composite/trajectory_summary.json`.
 
-**One arm — `constraint` — has not been trained.**
+## Round 2, arm `constraint` — trained to completion 2026-08-30
+
+Reward: a Tg-free multi-criterion CONJUNCTION -- a candidate must satisfy several
+verifiable requirements at once. No diversity term.
+
+It collapsed, and that is the point.
+
+| | start -> end |
+|---|---|
+| `reward_mean` | 0.537 -> 0.955 |
+| **`unique_fraction`** | 0.949 -> **0.539** |
+| `gated_fraction` | 0.328 -> 0.027 |
+| `novel_rate` | 0.858 -> 0.998 |
+| `zero_variance_group_fraction` | 0.000 -> **0.656** |
+| `mean_length` | 72.6 -> **62.6** |
+
+Two thirds of groups end with no gradient at all, and diversity landed beside
+`accuracy` (0.535) and `novelty` (0.516).
+
+## Round 1 complete: five arms, one controlled variable
+
+| arm | diversity term? | reward | `unique_fraction` |
+|---|---|---|---|
+| `accuracy` | no | 0.214 -> 0.459 | 0.951 -> 0.535 |
+| `novelty` | no | 0.578 -> 0.949 | 0.949 -> 0.516 |
+| `synthesisability` | no | 0.633 -> 0.982 | 0.951 -> 0.221 |
+| `constraint` | no | 0.537 -> 0.955 | 0.949 -> 0.539 |
+| **`composite`** | **yes** | 0.625 -> 0.948 | 0.949 -> **0.980** |
+
+**Four arms without a diversity term collapsed; the one with it did not.**
+
+`constraint` is the strongest single piece of evidence, because it is a multi-criterion
+conjunction rather than a single objective. If breadth of requirements were what
+protected `composite`, this arm should have held too. It did not, which isolates the
+diversity term specifically rather than "more terms" generally.
+
+Length is likewise reward-specific and not a universal artifact: `constraint` got
+SHORTER (72.6 -> 62.6) where `composite` inflated to 84.5 and `validity` to 131.
+
+The collapse is therefore not inherent to GRPO, and not inherent to verifiable rewards.
+It is what a reward does when it does not price diversity, and one term fixes it.
+
+Trajectory: `results/grpo_constraint/trajectory_summary.json`.
+
+**All seven arms are trained. None has yet been scored by `compare_arms.py`
+except `validity`, `control` and the retired `accuracy`.**
