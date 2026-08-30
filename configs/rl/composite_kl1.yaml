@@ -1,0 +1,70 @@
+# kl_coef SWEEP ARM (0.10) -- NOT part of round 1.
+#
+# Round 1 scored every Tg-free reward as destroying conditioning: composite ended
+# at TP 0.112 against the baseline's 0.693, with the per-target slope down to
+# 0.274 from 0.904. kl_coef is the ONLY force preserving conditioning during RL,
+# and at round 1's 0.02 the KL still drifted to 0.073 over 2000 steps.
+#
+# This sweep asks whether a stronger anchor to the reference policy retains
+# conditioning while keeping composite's structural gain. It changes NO reward
+# term, so it costs nothing in verifiability -- unlike re-adding a Tg term.
+#
+# Compare against composite's own frontier in docs/rlvr_results.md, not against
+# the frozen Arm B alone: the question is where on the PV/TP frontier this lands.
+# Arm C3 - REDEFINED 2026-08-23: reward is a weighted sum of four fully
+# verifiable, structural terms -- PV pass, novelty, SA pass, and within-batch
+# diversity. Tg was dropped from every RLVR reward on this date -- see
+# src/polyt5/rewards/composite.py's module docstring and this same date's
+# amendment in artifacts/baseline/frozen_baseline.json. This arm has NEVER
+# been trained -- no data exists for it under any weighting; the redefinition
+# is a pre-registration made before any observation of its results.
+# Phase 3. NOT part of the published polyT5 method - see docs/rlvr_plan.md.
+experiment_name: grpo_composite_kl1
+arm: composite
+seed: 0
+
+baseline: artifacts/baseline/frozen_baseline.json   # checkpoints + SHA-256 come from here
+
+reward:
+  tolerance: 100.0        # unused by this arm; kept so configs stay comparable
+  sigma0: 17.0            # unused by this arm; kept so configs stay comparable
+  sigma_unknown: 45.2     # unused by this arm; kept so configs stay comparable
+  min_coverage: 0.5       # unused by this arm; kept so configs stay comparable
+  sa_max: 6.0             # maximum acceptable RDKit SA score for the sa term
+  window_tolerance: 50.0  # unused by this arm; kept so configs stay comparable
+  novelty_index: artifacts/novelty/tg_generation_train  # required: novelty term needs it
+  weights:                # CompositeArm.weights; DEFAULT_COMPOSITE_WEIGHTS -- pv/novelty/sa/diversity, NOT tg/pv/novelty
+    pv: 0.25
+    novelty: 0.25
+    sa: 0.25
+    diversity: 0.25
+
+train:
+  group_size: 16          # candidates per prompt; the GRPO baseline
+  prompts_per_step: 32    # 512 candidates per step
+  max_steps: 2000
+  max_length: 200         # [PAPER] the paper's sequence limit
+  target_min: 250.0       # uniform sampling forces genuine conditioning
+  target_max: 600.0
+  temperature: 0.7        # arm B's tuned operating point
+  top_p: 0.95
+  learning_rate: 1.0e-6
+  clip_eps: 0.2
+  kl_coef: 0.10           # primary knob; KL is logged every step
+  max_grad_norm: 1.0
+  rollout_batch_size: 128 # measured optimum; 512 is 3.5x slower
+  log_every: 10
+  save_every: 100
+  device: auto
+
+# Spec 4.4 drift monitoring. LOGGING ONLY: the auditor loaded here is handed to
+# polyt5.rl.DriftMonitor and is never passed to the reward arm (see
+# scripts/train_grpo.py's module docstring). --no-drift-monitor overrides this.
+drift:
+  enabled: true
+  every: 50                                         # steps between measurements; step 0 always measured
+  reference: data/processed/tg/generation/train.jsonl  # labelled Tg set for max-Tanimoto
+  max_reference: 20000
+
+output:
+  results_root: results

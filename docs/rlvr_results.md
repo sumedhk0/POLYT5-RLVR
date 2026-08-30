@@ -311,5 +311,97 @@ It is what a reward does when it does not price diversity, and one term fixes it
 
 Trajectory: `results/grpo_constraint/trajectory_summary.json`.
 
-**All seven arms are trained. None has yet been scored by `compare_arms.py`
-except `validity`, `control` and the retired `accuracy`.**
+## Round 1 scored: every Tg-free reward destroys conditioning
+
+`compare_arms.py` over all seven arms, frozen protocol (targets 300/400/500 K, 500
+samples each, tolerance 50 K, auditor `split4` held out of every reward path).
+
+**All six scored arms cleared their own pre-registered criterion.** Every one also
+wrecked the metric it did not price.
+
+| arm | its metric | TP rate | auditor MAE | mean Tg produced |
+|---|---|---|---|---|
+| baseline (Arm B) | — | **0.693** | **36.6 K** | 376 K |
+| `accuracy` (retired) | Tg closeness | **0.869** | **21.8 K** | 437 K |
+| `synthesisability` | SA pass 0.998 | 0.489 | 67.8 K | 282 K |
+| `composite` | composite 0.916 | 0.112 | 149.8 K | 251 K |
+| `novelty` | novelty 0.969 | 0.072 | 152.6 K | 273 K |
+| `constraint` | constraint 0.985 | 0.060 | 153.1 K | 256 K |
+| `validity` | PV 0.901 | 0.047 | 150.4 K | 248 K |
+| `control` | none | 0.693 | 36.3 K | 375 K |
+
+Targets averaged 400 K. Every Tg-free arm produced 248-282 K regardless of what was
+asked. `control` stayed flat on everything, so this is the rewards, not GRPO.
+
+The only arm that IMPROVED conditioning optimised a Tg term -- the arm retired as
+unverifiable.
+
+### It is attenuation, not indifference
+
+An aggregate TP cannot distinguish "distribution shifted" from "target ignored". Sampling
+each target separately (`scripts/conditioning_frontier.py`) separates them:
+
+| model | Tg @300 | @400 | @500 | slope |
+|---|---|---|---|---|
+| baseline | 309.6 | 375.8 | 490.4 | **0.904** |
+| `composite` | 231.5 | 252.1 | 285.2 | **0.268** |
+| `validity` | 214.8 | 246.8 | 282.5 | 0.339 |
+
+Slope 1.0 is perfect tracking, 0.0 total indifference. The arms still respond; they
+respond weakly and from far too low a baseline.
+
+### Two failure modes, on different schedules
+
+Scoring `composite`'s intermediate checkpoints:
+
+| checkpoint | PV | slope | Tg@400 | TP |
+|---|---|---|---|---|
+| baseline | 0.658 | 0.896 | 375.2 | 0.740 |
+| step 200 | 0.736 | 0.891 | 348.9 | 0.671 |
+| step 400 | **0.802** | **0.914** | 324.4 | 0.551 |
+| step 800 | 0.860 | 0.842 | 297.0 | 0.296 |
+| step 1200 | 0.862 | 0.535 | 283.1 | 0.191 |
+| step 2000 | 0.933 | 0.274 | 250.2 | 0.144 |
+
+**Offset drift starts immediately; slope collapse only begins around step 800.** At step
+400 the slope is 0.914 -- better than baseline -- while PV has already gained 14 points.
+The model still knows what the target means; it is simply 51 K low.
+
+### Calibration recovers some of it, and shows why the rest cannot be recovered
+
+An affine distortion with an intact slope should be invertible by prompting, so
+`scripts/conditioning_calibration.py` fits the map on held-out targets (280/350/420/470)
+and tests on the protocol's 300/400/500. It helps and does not rescue:
+
+    pooled TP  raw 0.555   calibrated 0.608   baseline 0.740
+    pooled PV  calibrated 0.693              baseline 0.658
+
+Three reasons it falls short, and the third is the finding:
+
+1. The response is not affine. Fitting on 280-470 gives slope 0.687; measuring across
+   300-500 gives 0.914. A linear inverse overshoots the middle -- prompting 499.8 for
+   400 K returned 461 K.
+2. The fit used a separate target set from the evaluation, so this is an honest test
+   rather than a fit to its own scoreboard.
+3. **Asking for higher Tg costs validity.** At target 500, prompting the raw 500 gave
+   PV 0.685; prompting the calibrated 645 gave PV **0.510**, below baseline.
+
+Point 3 is direct evidence that the structural rewards are chemically ANTI-CORRELATED
+with high Tg: high-Tg polymers are rigid aromatics, harder to emit validly and worse on
+synthetic accessibility. The rewards do not merely neglect Tg, they pull against it. The
+frontier is chemical, not an artifact of training length.
+
+### What this leaves
+
+- **Early stopping is a genuine, free Pareto gain.** Step 200 trades TP 0.740 -> 0.671
+  for PV 0.658 -> 0.736, and the checkpoint already exists.
+- **No operating point keeps baseline TP and the full +27-point PV gain.**
+- **`kl_coef` is untested.** At 0.02 it is the only force preserving conditioning, and KL
+  still drifted to 0.073. It is the one knob that buys retention at no cost in
+  verifiability -- swept next, see `configs/rl/composite_kl*.yaml`.
+- **A verifiable Tg term remains the principled fix.** Bicerano group contribution is a
+  published empirical correlation rather than a learned model, so it stays inside the
+  study's verifiability tier -- see
+  `docs/superpowers/specs/2026-08-21-bicerano-oracle-design.md`, still unbuilt.
+
+**Round 1 is complete and scored. The `kl_coef` sweep is round 2.**
