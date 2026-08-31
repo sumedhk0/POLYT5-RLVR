@@ -27,7 +27,12 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-ARMS = [
+
+#: Round-1 arms, in the order they were run. Anything else found on disk (the round-2
+#: kl_coef sweep, and whatever comes after) is discovered rather than listed here --
+#: a hardcoded list silently omits new runs, which is how the sweep's first launch
+#: went unmonitored.
+ROUND_1 = [
     "validity",
     "control",
     "accuracy",
@@ -51,6 +56,41 @@ C = {
 }
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     C = dict.fromkeys(C, "")
+
+
+def discover() -> list[str]:
+    """Every run on disk: round-1 arms in order, then anything else alphabetically.
+
+    Discovered rather than listed so a new experiment appears without editing this
+    file. The round-2 kl_coef sweep writes to ``results/grpo_composite_kl05`` and
+    friends, which a hardcoded list would silently omit.
+    """
+    found = {
+        p.name[len("grpo_"):]
+        for p in (REPO / "results").glob("grpo_*")
+        if p.is_dir() and (p / "metrics.csv").is_file()
+    }
+    ordered = [a for a in ROUND_1 if a in found]
+    return ordered + sorted(found - set(ordered))
+
+
+def kl_coef(arm: str) -> float | None:
+    """The run's kl_coef, shown when it differs from round 1's 0.02.
+
+    It is the swept variable in round 2, so a progress line without it cannot be
+    told apart from its neighbours.
+    """
+    path = REPO / "results" / f"grpo_{arm}" / "config.yaml"
+    if not path.is_file():
+        return None
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        value = (loaded.get("train") or {}).get("kl_coef")
+        return float(value) if value is not None else None
+    except Exception:
+        return None
 
 
 def read_rows(arm: str) -> list[dict]:
@@ -187,12 +227,16 @@ def frame() -> str:
     live = live_arm()
     lines = [f"{C['bold']}{C['blue']}┌{' polyT5 · GRPO round 1 ':─^{width - 2}}┐{C['reset']}"]
 
-    started = False
-    for arm in ARMS:
+    arms = discover()
+    width_name = max((len(a) for a in arms), default=16) + 1
+    seen_extra = False
+    for arm in arms:
         rows = read_rows(arm)
         if not rows:
             continue
-        started = True
+        if arm not in ROUND_1 and not seen_extra:
+            seen_extra = True
+            lines.append(f"{C['grey']}   round 2 · kl_coef sweep{C['reset']}")
         step = max(int(r["step"]) for r in rows)
         is_live = arm == live
         complete = step >= MAX_STEPS
@@ -204,18 +248,20 @@ def frame() -> str:
             else f"{C['grey']}○{C['reset']}"
         )
         name = f"{C['bold']}{arm}{C['reset']}" if is_live else arm
-        pad = " " * (16 - len(arm))
+        pad = " " * (width_name - len(arm))
+        coef = kl_coef(arm)
+        tag = f"{C['grey']}kl{coef:g}{C['reset']} " if coef is not None and coef != 0.02 else ""
         rate = recent_rate(rows)
         eta = "done" if complete else human((MAX_STEPS - step) * rate) if rate else "?"
         rate_text = f"{rate:.0f}s/step" if rate and not complete else "—"
         colour = C["green"] if is_live else C["blue"] if complete else C["grey"]
         lines.append(
-            f" {mark} {name}{pad} {colour}{bar(step / MAX_STEPS, 20)}{C['reset']} "
+            f" {mark} {name}{pad}{tag}{colour}{bar(step / MAX_STEPS, 18)}{C['reset']} "
             f"{step:>4}/{MAX_STEPS} {step / MAX_STEPS:>4.0%} {rate_text:>9} {eta:>6}"
         )
 
-    if not started:
-        lines.append(f"  {C['grey']}no arm has written metrics yet{C['reset']}")
+    if not arms:
+        lines.append(f"  {C['grey']}no run has written metrics yet{C['reset']}")
 
     rows = read_rows(live) if live else []
     if rows:
