@@ -194,13 +194,33 @@ def gpu_line() -> str:
 
 
 def live_arm() -> str | None:
-    """Which arm the trainer is on, read from the process table."""
+    """Which RUN the trainer is on, read from the process table.
+
+    ``--arm`` alone is not the answer. The round-2 sweep invokes
+    ``--arm composite --config configs/rl/composite_kl05.yaml``, so keying off
+    ``--arm`` reports ``composite`` and the dashboard then shows a FINISHED arm's
+    stale telemetry while labelling it live. When ``--config`` is present its
+    ``experiment_name`` names the actual run directory.
+    """
     try:
         result = subprocess.run(
             ["pgrep", "-af", "train_grpo.py"], capture_output=True, text=True, timeout=5
         )
         for line in result.stdout.splitlines():
             parts = line.split()
+            if "--config" in parts:
+                config = Path(parts[parts.index("--config") + 1])
+                if not config.is_absolute():
+                    config = REPO / config
+                try:
+                    import yaml
+
+                    loaded = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+                    name = str(loaded.get("experiment_name") or "")
+                    if name.startswith("grpo_"):
+                        return name[len("grpo_"):]
+                except Exception:
+                    pass
             if "--arm" in parts:
                 return parts[parts.index("--arm") + 1]
     except Exception:
