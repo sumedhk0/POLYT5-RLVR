@@ -404,4 +404,41 @@ frontier is chemical, not an artifact of training length.
   study's verifiability tier -- see
   `docs/superpowers/specs/2026-08-21-bicerano-oracle-design.md`, still unbuilt.
 
-**Round 1 is complete and scored. The `kl_coef` sweep is round 2.**
+## Round 2 verdict: `kl_coef` is not the lever
+
+`composite_kl05` trained to 2000 steps at `kl_coef: 0.05`, against round 1's 0.02.
+Everything else identical, verified by a test that the configs differ in exactly
+`{experiment_name, train.replay_coef}` — one variable.
+
+Measured with `scripts/conditioning_frontier.py`, not inferred from the KL column:
+
+| model | PV | slope | Tg@400 | TP |
+|---|---|---|---|---|
+| baseline | 0.665 | **0.904** | 375.8 | **0.738** |
+| `composite` (kl 0.02) | 0.915 | 0.268 | 252.1 | 0.138 |
+| `composite_kl05` (kl 0.05) | 0.918 | **0.295** | 257.6 | **0.192** |
+
+**A 2.5x stronger KL penalty recovered under 5% of the damage** — +0.027 slope against a
+0.636 gap, +0.054 TP against a 0.600 gap. The pre-registered bar for a usable arm is
+slope >= 0.70; this reaches 0.295.
+
+The KL column said the same thing more quietly: 0.0627 at step 2000 against `composite`'s
+0.0731, only 14% tighter for a 2.5x penalty. The policy pays the KL cost and drifts anyway.
+
+**`kl1` (0.10) and `kl2` (0.20) were not run.** Extrapolating this curve, neither is
+likely to approach slope 0.70, and establishing that would cost ~40 GPU-hours.
+`composite_kl1` stopped at step 140 and is resumable if the question is ever worth
+reopening.
+
+### Why it fails, and what that implies
+
+KL anchors the WHOLE distribution. It resists the structural gains the reward is buying
+just as much as it resists the conditioning loss, so raising it either does nothing (as
+here) or would cost the PV gain too. It cannot separate the two.
+
+The conditioning skill is not diffuse: it lives in 6,619 supervised `(target, polymer)`
+pairs, and nothing in the GRPO objective mentions it. That is a forgetting problem with a
+targeted fix — keep training on those pairs — which is round 3
+(`docs/superpowers/specs/2026-08-31-supervised-replay-design.md`).
+
+**Round 1 and round 2 are complete. Round 3 is supervised replay.**
