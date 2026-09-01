@@ -121,6 +121,13 @@ class UncertaintyPredictor(Protocol):
         ...
 
 
+#: Third element of the replay batch's RNG seed. A distinct stream tag keeps the
+#: replay draw from mirroring the rollout draw, which shares (seed, step_index) --
+#: the control arm learned that lesson when its reward correlated 1.000000 with the
+#: target because both used the same two-element seed.
+REPLAY_STREAM = 20260831
+
+
 @dataclass(frozen=True)
 class GRPOTrainerConfig:
     """Hyperparameters for :class:`GRPOTrainer`.
@@ -162,6 +169,14 @@ class GRPOTrainerConfig:
             hardware optimum documented on that module -- lowering this trades
             throughput (measured ~4x worse at 512) for peak memory; it does
             not change what gets generated, only how it is batched.
+        replay_coef: Weight on the supervised replay term (round 3, see
+            ``docs/superpowers/specs/2026-08-31-supervised-replay-design.md``).
+            ``0.0`` -- the default -- makes the step numerically identical to a
+            trainer without replay, which is what makes the feature safe to add
+            mid-study. Non-zero REQUIRES ``replay_dataset``; the trainer raises
+            rather than training without it, because a run that believes it is
+            doing replay and is not would read as evidence that replay fails.
+        replay_batch_size: Supervised pairs drawn per step when replay is on.
         drift_every: Run the spec section 4.4 drift monitor (see
             :class:`~polyt5.rl.drift.DriftMonitor`) on step indices divisible
             by this, when a monitor is attached. Step 0 is always measured, so
@@ -189,6 +204,8 @@ class GRPOTrainerConfig:
     save_every: int = 250
     rollout_batch_size: int = ROLLOUT_CHUNK_SIZE
     drift_every: int = 50
+    replay_coef: float = 0.0
+    replay_batch_size: int = 16
 
     def __post_init__(self) -> None:
         if self.drift_every < 1:
@@ -224,6 +241,7 @@ class GRPOTrainer:
         config: GRPOTrainerConfig,
         run_dir: RunDirectory | None = None,
         drift_monitor: DriftMonitor | None = None,
+        replay_dataset: Sequence[tuple[str, str]] | None = None,
     ) -> None:
         """Build the trainer.
 
@@ -281,6 +299,18 @@ class GRPOTrainer:
         # held-out auditor, which must never reach a reward path. Nothing in
         # this class passes one to the other.
         self.drift_monitor = drift_monitor
+        # A non-zero coefficient with no data must FAIL, never silently train
+        # without replay: such a run would look like evidence that replay does
+        # not work, which is the most expensive way for this to go wrong.
+        if config.replay_coef and not replay_dataset:
+            raise ValueError(
+                f"replay_coef={config.replay_coef} requires replay_dataset; got none. "
+                "Training without the supervised term would silently produce a run that "
+                "looks like replay and is not."
+            )
+        if config.replay_coef < 0:
+            raise ValueError(f"replay_coef must be non-negative, got {config.replay_coef}")
+        self.replay_dataset = list(replay_dataset) if replay_dataset else []
         # ReferencePolicy mutates `reference` in place (.eval(),
         # requires_grad_(False)) rather than copying it -- see its docstring.
         # `reference` must already be a model instance distinct from `policy`;
@@ -389,6 +419,13 @@ class GRPOTrainer:
             config=grpo_config,
         )
 
+        # Added BEFORE the single backward pass on purpose: a second
+        # optimizer.step() would double the effective learning rate on replay
+        # batches and desynchronise the step budget from every other arm.
+        replay = self._replay_loss(step_index)
+        if replay is not None:
+            loss = loss + cfg.replay_coef * replay
+
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
@@ -398,6 +435,10 @@ class GRPOTrainer:
         mean_length = float(batch.mask.sum(dim=1).float().mean().item())
 
         stats: dict[str, Any] = {
+            # Logged unconditionally. Without it a run where replay silently
+            # contributes nothing is indistinguishable from one where it works.
+            "replay_coef": cfg.replay_coef,
+            "replay_loss": (float(replay.item()) if replay is not None else None),
             "reward_mean": float(rewards.mean()),
             "reward_std": float(rewards.std()),
             # `closeness` is the confidence weight's OWN unweighted counterpart
@@ -531,6 +572,70 @@ class GRPOTrainer:
                 "these, but the trend is what matters.",
                 step_index, 100.0 * (partial + empty), partial, empty,
             )
+
+    def _replay_loss(self, step_index: int) -> Tensor | None:
+        """Teacher-forced cross-entropy on a batch of the ORIGINAL supervised pairs.
+
+        The conditioning skill lives entirely in those 6,619 ``(target, polymer)``
+        examples, and GRPO's objective never mentions the target -- so without this
+        term the skill is simply overwritten. See the round-3 spec.
+
+        The batch is drawn from a generator seeded by ``(config.seed, step_index)``,
+        the same rule the rollout uses, so a RESUMED step replays exactly the batch an
+        uninterrupted run would have drawn.
+
+        Args:
+            step_index: 0-based step index, mixed into the batch-sampling seed.
+
+        Returns:
+            Scalar mean token cross-entropy, or ``None`` when replay is disabled.
+        """
+        cfg = self.config
+        if not cfg.replay_coef or not self.replay_dataset:
+            return None
+        rng = np.random.default_rng([cfg.seed, step_index, REPLAY_STREAM])
+        n = min(cfg.replay_batch_size, len(self.replay_dataset))
+        picks = rng.choice(len(self.replay_dataset), size=n, replace=False)
+        sources = [self.replay_dataset[int(i)][0] for i in picks]
+        targets = [self.replay_dataset[int(i)][1] for i in picks]
+
+        src = self.tokenizer.batch_encode(
+            sources, add_eos=True, max_length=cfg.max_length, padding=True, truncation=True
+        )
+        tgt = self.tokenizer.batch_encode(
+            targets, add_eos=True, max_length=cfg.max_length, padding=True, truncation=True
+        )
+        input_ids = torch.tensor(src["input_ids"], device=self.device)
+        attention_mask = torch.tensor(src["attention_mask"], device=self.device)
+        labels = torch.tensor(tgt["input_ids"], device=self.device)
+        label_mask = torch.tensor(tgt["attention_mask"], device=self.device).bool()
+
+        start = torch.full(
+            (labels.size(0), 1), self.tokenizer.decoder_start_token_id, device=self.device
+        )
+        decoder_input_ids = torch.cat([start, labels[:, :-1]], dim=1)
+        # eval() explicitly, not inherited from the caller. Dropout would make this
+        # term nondeterministic, so a resumed step would compute a different replay
+        # loss from the same batch and resume would stop being bit-identical. Setting
+        # it here rather than relying on step() having done so also keeps the helper
+        # correct when called directly. eval() governs dropout, not autograd -- the
+        # gradient still flows.
+        was_training = self.policy.training
+        self.policy.eval()
+        try:
+            logits = self.policy(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+            ).logits
+        finally:
+            self.policy.train(was_training)
+        token_loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), labels.reshape(-1), reduction="none"
+        ).view(labels.shape)
+        # Mean over REAL tokens only; padding would otherwise dilute the loss by a
+        # factor that varies with batch composition.
+        return (token_loss * label_mask).sum() / label_mask.sum().clamp(min=1)
 
     def _policy_logprobs(
         self, sequences: Tensor, prompt_ids: Tensor, prompt_mask: Tensor

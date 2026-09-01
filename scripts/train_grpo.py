@@ -623,6 +623,35 @@ def summarize_reward_overrides(
     }
 
 
+def load_replay_dataset(path: Path) -> list[tuple[str, str]]:
+    """Load the supervised ``(target, polymer)`` pairs the replay term trains on.
+
+    These are the SAME pairs the generation fine-tune used -- measured labels, not a
+    model's predictions -- which is why replay costs nothing in verifiability.
+
+    Raises:
+        FileNotFoundError: If the file is missing. Replay must fail loudly rather
+            than train without the term it claims to apply.
+        ValueError: If the file yields no usable pairs.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"replay dataset not found: {path}. train.replay_coef > 0 requires it; "
+            "training without it would produce a run that looks like replay and is not."
+        )
+    pairs: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        source, target = row.get("source"), row.get("target")
+        if source and target:
+            pairs.append((str(source), str(target)))
+    if not pairs:
+        raise ValueError(f"replay dataset {path} contained no usable (source, target) pairs")
+    return pairs
+
+
 def build_trainer_config(cfg: dict[str, Any], *, seed: int,
                           device_override: str | None) -> GRPOTrainerConfig:
     """Build a :class:`GRPOTrainerConfig` from a resolved config's ``train`` block.
@@ -646,6 +675,8 @@ def build_trainer_config(cfg: dict[str, Any], *, seed: int,
         weight_decay=float(train_cfg.get("weight_decay", 0.0)),
         clip_eps=float(train_cfg.get("clip_eps", 0.2)),
         kl_coef=float(train_cfg.get("kl_coef", 0.02)),
+        replay_coef=float(train_cfg.get("replay_coef", 0.0)),
+        replay_batch_size=int(train_cfg.get("replay_batch_size", 16)),
         max_grad_norm=float(train_cfg.get("max_grad_norm", 1.0)),
         device=str(device_override or train_cfg.get("device", "auto")),
         seed=seed,
@@ -850,10 +881,21 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("drift monitor: disabled (spec 4.4 auditor gap and max-Tanimoto not logged)")
     logger.info("trainer config: %s", asdict(trainer_config))
 
+    replay_dataset = None
+    if trainer_config.replay_coef:
+        replay_path = _resolve(
+            cfg.get("train", {}).get("replay_dataset",
+                                     "data/processed/tg/generation/train.jsonl")
+        )
+        replay_dataset = load_replay_dataset(replay_path)
+        logger.info("replay: %d supervised pairs from %s (coef=%.3g, batch=%d)",
+                    len(replay_dataset), replay_path, trainer_config.replay_coef,
+                    trainer_config.replay_batch_size)
+
     trainer = GRPOTrainer(
         policy=policy, reference=reference, tokenizer=tokenizer, arm=arm,
         predictor=predictor, config=trainer_config, run_dir=run_dir,
-        drift_monitor=drift_monitor,
+        drift_monitor=drift_monitor, replay_dataset=replay_dataset,
     )
 
     start_step = 0
