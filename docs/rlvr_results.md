@@ -441,4 +441,52 @@ pairs, and nothing in the GRPO objective mentions it. That is a forgetting probl
 targeted fix — keep training on those pairs — which is round 3
 (`docs/superpowers/specs/2026-08-31-supervised-replay-design.md`).
 
-**Round 1 and round 2 are complete. Round 3 is supervised replay.**
+## Round 3 verdict: supervised replay preserves conditioning AND the structural gain
+
+`composite_replay05` trained to 2000 steps: the same `composite` reward, `kl_coef` back
+at round 1's 0.02, plus `loss += 0.5 * cross_entropy(batch of the 6,619 supervised
+pairs)`. No Tg predictor is read, so verifiability is untouched.
+
+| model | PV | slope | Tg@300 | Tg@400 | Tg@500 | TP |
+|---|---|---|---|---|---|---|
+| baseline | 0.665 | 0.904 | 309.6 | 375.8 | 490.4 | **0.738** |
+| `composite` (kl 0.02) | **0.915** | 0.268 | 231.5 | 252.1 | 285.2 | 0.138 |
+| `composite_kl05` (kl 0.05) | 0.918 | 0.295 | 241.2 | 257.6 | 300.2 | 0.192 |
+| **`composite_replay05`** | **0.790** | **0.973** | 286.8 | 322.8 | 481.4 | **0.582** |
+
+**Both pre-registered conditions cleared: slope 0.973 >= 0.70, PV 0.790 >= 0.75.**
+
+The slope is ABOVE the baseline's 0.904 — the conditioning response is not merely
+preserved but slightly sharper than the model started with. Against `composite`'s 0.268,
+replay recovered **99% of the lost slope**, where a 2.5x KL penalty recovered under 5%.
+
+And it kept a real structural gain: PV 0.790 against the baseline's 0.665, +12.5 points.
+
+### What the three rounds establish together
+
+1. Every Tg-free verifiable reward destroys conditioning (round 1, five arms, flat control).
+2. Anchoring harder with KL does not fix it — under 5% recovered for a 2.5x penalty (round 2).
+3. It is catastrophic forgetting, and replaying the supervised data fixes it (round 3).
+
+The mechanism is the one the round-3 spec predicted. KL restrains the WHOLE distribution,
+so the reward pays the penalty and drifts anyway; replay restrains the ONE skill being
+lost and leaves the rest free to improve.
+
+### What is NOT fixed
+
+**TP is 0.582 against the baseline's 0.738.** Far ahead of every other arm, and not full
+recovery. The residual damage is OFFSET, not slope: at target 400 the model produces
+322.8 K, about 53 K low, while tracking the target almost perfectly. Round 1 showed an
+offset with an intact slope is partly correctable by prompt calibration, and with slope
+0.973 that should work far better here than it did on `composite` (slope 0.268).
+
+**PV 0.790 is below `composite`'s 0.915.** Replay costs some structural gain. A real
+trade, and a far better one than any alternative measured.
+
+**One seed, one coefficient.** `replay01` (0.1) and `replay20` (2.0) are untested, so 0.5
+is shown to be SUFFICIENT, not optimal.
+
+Trajectory: `results/grpo_composite_replay05/`. Reproduce the table with
+`scripts/conditioning_frontier_rounds.py`.
+
+**Rounds 1-3 complete.**
