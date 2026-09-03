@@ -489,4 +489,39 @@ is shown to be SUFFICIENT, not optimal.
 Trajectory: `results/grpo_composite_replay05/`. Reproduce the table with
 `scripts/conditioning_frontier_rounds.py`.
 
+### Calibration does NOT close the residual gap — use replay05 raw
+
+`composite_replay05` tracks the target with slope 0.973 while sitting ~53 K low, which
+looks like an invertible affine distortion. It is not. Fitting the map on held-out
+targets (280/350/420/470) and testing on the protocol's 300/400/500:
+
+| target | mode | mean Tg | TP | PV |
+|---|---|---|---|---|
+| 300 | raw | 286.8 | **0.875** | 0.900 |
+| 300 | calibrated | 289.5 | 0.765 | 0.915 |
+| 400 | raw | 322.8 | 0.220 | 0.845 |
+| 400 | calibrated | 456.8 | 0.255 | 0.650 |
+| 500 | raw | 481.4 | **0.650** | 0.625 |
+| 500 | calibrated | 557.9 | 0.400 | 0.470 |
+
+    pooled TP   raw 0.582   calibrated 0.473   baseline 0.738
+    pooled PV   raw 0.790   calibrated 0.678   baseline 0.665
+
+**Calibration makes both metrics worse.** Two reasons:
+
+1. **The map is not affine.** The fit on 280-470 gives slope 0.753; the 300-500
+   measurement gives 0.973. A single global line does not describe it, so the inverse
+   overshoots the middle -- prompting 487.9 for 400 K returned 456.8 K.
+2. **Asking for higher Tg still costs validity**, the same anti-correlation round 1
+   found. Prompting 620.6 to reach 500 K dropped PV from 0.625 to 0.470.
+
+The reasoning that motivated the test was wrong in an instructive way: a slope near 1.0
+measured ACROSS the range does not imply the map is linear WITHIN it.
+
+**The raw model is already strong where it matters.** TP 0.875 at target 300 and 0.650
+at 500; essentially the whole deficit is a local dip at target 400 (TP 0.220, producing
+322.8 K), not a uniform offset. A global affine correction cannot fix a local dip.
+
+**Recommendation: use `composite_replay05` as-is** — TP 0.582, PV 0.790, slope 0.973.
+
 **Rounds 1-3 complete.**
