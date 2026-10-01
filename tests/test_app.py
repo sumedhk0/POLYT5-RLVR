@@ -725,3 +725,95 @@ def test_index_page_shows_provenance(client: TestClient) -> None:
     html = client.get("/").text
     assert "sha256" in html.lower()
     assert "checkpoint" in html.lower()
+
+
+# --- regression-head predictor + conformal intervals (serving replay05 + A1) ---
+
+
+def test_a_regression_checkpoint_is_detected_from_its_state_dict():
+    """Keyed on the payload, not a CLI flag a caller could set wrongly."""
+    from polyt5.app.server import _is_regression_checkpoint
+
+    assert _is_regression_checkpoint({"model_state": {"backbone.shared.weight": 1}})
+    assert not _is_regression_checkpoint({"model_state": {"shared.weight": 1}})
+    assert not _is_regression_checkpoint({})
+
+
+def test_conformal_returns_none_when_the_calibration_is_absent(tmp_path):
+    """An invented interval looks like a guarantee that was never measured."""
+    from polyt5.app.server import load_conformal
+
+    assert load_conformal(tmp_path / "nope.json") is None
+
+
+def test_conformal_returns_none_for_an_unavailable_coverage_level():
+    from polyt5.app.server import DEFAULT_CONFORMAL, load_conformal
+
+    if not DEFAULT_CONFORMAL.is_file():
+        pytest.skip("no calibration artifact in this checkout")
+    assert load_conformal(coverage=0.42) is None
+
+
+def test_the_shipped_calibration_supplies_the_ninety_percent_width():
+    from polyt5.app.server import DEFAULT_CONFORMAL, load_conformal
+
+    if not DEFAULT_CONFORMAL.is_file():
+        pytest.skip("no calibration artifact in this checkout")
+    width = load_conformal(coverage=0.90)
+    assert width is not None
+    assert 40.0 < width < 70.0, f"90% half-width {width} K is outside the plausible band"
+
+
+def test_a_malformed_calibration_file_degrades_rather_than_raising(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    from polyt5.app.server import load_conformal
+
+    assert load_conformal(bad) is None
+
+
+A1_CHECKPOINT = sorted(
+    Path(".").glob("results/a1_full_corpus/A1/split_0_*/checkpoints/best.pt")
+)
+
+
+@pytest.mark.skipif(not A1_CHECKPOINT, reason="A1 checkpoint not in this checkout")
+def test_the_regression_head_returns_kelvin_not_a_z_score():
+    """Guards the de-standardisation, which no other test could fail on.
+
+    HeadOutput carries both tg_standardised and tg_kelvin. Reading the wrong one
+    returns a z-score: PEO came back as -1.90 instead of ~203 K, and every existing
+    app test still passed. A plausibility band is the only thing that catches it.
+    """
+    from polyt5.app import server as S
+
+    resources = S.AppResources(
+        generation_checkpoint=None,
+        prediction_checkpoint=A1_CHECKPOINT[0],
+        tokenizer_path="artifacts/tokenizer/polyt5_vocab.json",
+        training_corpus=None,
+        device="cpu",
+    )
+    out = S._run_predict(resources, S.PredictRequest(structure="*CCO*", kind="psmiles"))
+    value = out["predicted_tg"]
+    assert value is not None
+    # Any real polymer Tg sits far above this floor; a standardised output is ~[-3, 3].
+    assert 100.0 < value < 900.0, f"{value} K is not a temperature -- de-standardisation lost?"
+
+
+@pytest.mark.skipif(not A1_CHECKPOINT, reason="A1 checkpoint not in this checkout")
+def test_the_interval_brackets_the_prediction_and_reports_its_coverage():
+    from polyt5.app import server as S
+
+    resources = S.AppResources(
+        generation_checkpoint=None,
+        prediction_checkpoint=A1_CHECKPOINT[0],
+        tokenizer_path="artifacts/tokenizer/polyt5_vocab.json",
+        training_corpus=None,
+        device="cpu",
+    )
+    out = S._run_predict(resources, S.PredictRequest(structure="*CCO*", kind="psmiles"))
+    low, high, cov = out["tg_interval_low"], out["tg_interval_high"], out["tg_interval_coverage"]
+    assert low is not None and high is not None
+    assert low < out["predicted_tg"] < high
+    assert cov == pytest.approx(0.90)

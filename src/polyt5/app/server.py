@@ -68,6 +68,7 @@ from polyt5.data.prepare import format_property_value, parse_property_value
 from polyt5.evaluation import apply_filter_cascade, has_valid_termini, target_property_rate
 from polyt5.generation import BeamSearchConfig, GenerationConfig, beam_search, generate
 from polyt5.model import PolyT5Config, PolyT5ForConditionalGeneration
+from polyt5.model.multitask import MultiTaskConfig, PolyT5MultiTask
 from polyt5.tokenization import PolyT5Tokenizer
 from polyt5.training import load_checkpoint
 from polyt5.utils import get_logger, select_device
@@ -254,6 +255,9 @@ class PredictResponse(BaseModel):
     n_termini: int
     passes_pv: bool
     predicted_tg: float | None
+    tg_interval_low: float | None = None
+    tg_interval_high: float | None = None
+    tg_interval_coverage: float | None = None
     raw_output: str
     sa_score: float | None
     svg: str | None
@@ -282,6 +286,40 @@ class ChatResponse(BaseModel):
 # --------------------------------------------------------------------------
 
 
+DEFAULT_CONFORMAL = Path("artifacts/conformal/a1_full_corpus.json")
+
+
+def load_conformal(path: Path | str = DEFAULT_CONFORMAL, coverage: float = 0.90):
+    """Half-width for a prediction interval at ``coverage``, or ``None``.
+
+    Returns ``None`` -- rather than guessing a width -- when the calibration file is
+    absent or carries no matching level. An interval invented from nothing is worse
+    than a bare point prediction, because it looks like a guarantee.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for level in (payload.get("shipped") or {}).get("levels", []):
+            if abs(float(level["target_coverage"]) - coverage) < 1e-9:
+                return float(level["half_width_k"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
+def _is_regression_checkpoint(state: dict[str, Any]) -> bool:
+    """Whether ``state`` holds a Group-A regression-head model.
+
+    Keyed on the state dict's own shape rather than on a CLI flag: a mislabelled
+    flag would load the wrong wrapper and fail with a wall of missing-key errors,
+    and the information is right there in the payload.
+    """
+    keys = state.get("model_state") or {}
+    return any(k.startswith("backbone.") for k in keys)
+
+
 class _ModelSlot:
     """One lazily loaded checkpoint (the generation or the prediction model)."""
 
@@ -293,6 +331,7 @@ class _ModelSlot:
             path: Checkpoint path, or ``None`` when the feature is disabled.
         """
         self.name = name
+        self.has_regression_head = False
         self.path: Path | None = Path(path) if path is not None else None
         self.model: PolyT5ForConditionalGeneration | None = None
         self.config: PolyT5Config | None = None
@@ -503,7 +542,19 @@ class AppResources:
 
             try:
                 config = PolyT5Config.from_dict(state["model_config"])
-                model = PolyT5ForConditionalGeneration(config)
+                # A Group-A regression-head checkpoint namespaces its weights under
+                # `backbone.` and carries a float head. Loading it into a plain
+                # PolyT5ForConditionalGeneration raises on every missing key, so the
+                # checkpoint's own shape -- not a flag the caller has to remember --
+                # decides which wrapper is built.
+                if _is_regression_checkpoint(state):
+                    heads = ((state.get("config") or {}).get("group_a") or {}).get("heads") or {}
+                    backbone = PolyT5ForConditionalGeneration(config)
+                    model = PolyT5MultiTask(backbone, MultiTaskConfig.from_dict(heads))
+                    slot.has_regression_head = True
+                else:
+                    model = PolyT5ForConditionalGeneration(config)
+                    slot.has_regression_head = False
                 model.load_state_dict(state["model_state"])
                 model.to(self.device)
                 model.eval()
@@ -792,6 +843,14 @@ def _predict_values(
         return []
     model, config = resources.model(resources.prediction)
     tokenizer = resources.tokenizer()
+
+    # A regression head emits one float per input, so there is nothing to decode and
+    # no way for the output to be non-numeric -- the failure mode beam search has,
+    # where one extra digit token turns 429 K into 4293 K, cannot occur here.
+    if resources.prediction.has_regression_head:
+        values = _predict_values_regression(resources, sources, model, config, tokenizer)
+        return [(f"{v:.1f}" if v is not None else "", v) for v in values]
+
     results: list[tuple[str, float | None]] = []
     for start in range(0, len(sources), PREDICTION_BATCH_SIZE):
         chunk = list(sources[start : start + PREDICTION_BATCH_SIZE])
@@ -813,6 +872,38 @@ def _predict_values(
         for text in tokenizer.batch_decode(output.sequences.tolist(), skip_special_tokens=True):
             results.append((text, parse_property_value(text)))
     return results
+
+
+def _predict_values_regression(
+    resources: AppResources,
+    sources: Sequence[str],
+    model: Any,
+    config: Any,
+    tokenizer: PolyT5Tokenizer,
+) -> list[float | None]:
+    """Score PSELFIES with the Group-A regression head.
+
+    Masked mean-pool over the encoder states, then the float head, then
+    de-standardise with the ``tg_mean``/``tg_std`` the checkpoint carries -- the head
+    was trained on standardised targets, so skipping that step returns a z-score
+    silently rather than a temperature.
+    """
+    out: list[float | None] = []
+    for start in range(0, len(sources), PREDICTION_BATCH_SIZE):
+        chunk = list(sources[start : start + PREDICTION_BATCH_SIZE])
+        input_ids, attention_mask = _encode(
+            tokenizer, chunk, max_length=config.n_positions, device=resources.device
+        )
+        with torch.no_grad():
+            head = model.forward_regression(
+                input_ids=input_ids, attention_mask=attention_mask
+            )
+        # tg_kelvin, not tg_standardised: the head is trained on standardised
+        # targets and HeadOutput carries both, so reading the wrong field returns a
+        # z-score that looks like a plausible temperature.
+        values = head.tg_kelvin.detach().float().flatten().cpu().tolist()
+        out.extend(float(v) for v in values)
+    return out
 
 
 def _safe_sa(psmiles: str | None) -> float | None:
@@ -986,6 +1077,7 @@ def _run_predict(resources: AppResources, request: PredictRequest) -> dict[str, 
     Returns:
         A dict matching :class:`PredictResponse`.
     """
+    _half_width = load_conformal()
     started = time.perf_counter()
     pselfies, psmiles = _resolve_structure(request.structure, request.kind)
 
@@ -1010,6 +1102,12 @@ def _run_predict(resources: AppResources, request: PredictRequest) -> dict[str, 
         "n_termini": termini,
         "passes_pv": passes_pv,
         "predicted_tg": value,
+        # Interval only when BOTH a prediction and a calibration exist. A one-sided
+        # interval, or one attached to a null prediction, reads as a guarantee that
+        # was never measured.
+        "tg_interval_low": (value - _half_width) if (value is not None and _half_width) else None,
+        "tg_interval_high": (value + _half_width) if (value is not None and _half_width) else None,
+        "tg_interval_coverage": 0.90 if (value is not None and _half_width) else None,
         "raw_output": raw_text,
         "sa_score": _safe_sa(canonical or psmiles),
         "svg": rendering.psmiles_to_svg(canonical or psmiles),
