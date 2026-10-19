@@ -1,6 +1,6 @@
 # polyT5-RLVR
 
-A clean-room reproduction of **polyT5** — an encoder–decoder chemical language model for generative
+A reproduction of **polyT5** — an encoder–decoder chemical language model for generative
 polymer design — plus an extension asking what happens when you post-train it with verifiable-reward
 reinforcement learning.
 
